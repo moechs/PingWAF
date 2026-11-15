@@ -873,7 +873,7 @@ function SummaryCard({
       ? 'bg-danger/12 text-fg-danger'
       : tone === 'success'
         ? 'bg-success/12 text-fg-success'
-        : 'bg-brand-soft text-brand'
+        : 'bg-brand-soft text-fg-brand-strong'
   return (
     <Card padded>
       <div className="flex items-center justify-between gap-3" title={hint}>

@@ -145,7 +145,7 @@ export function SiteDetailPage() {
       {/* Site header */}
       <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex min-w-0 items-center gap-3">
-          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-brand-soft text-brand">
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-brand-soft text-fg-brand-strong">
             <Globe weight="duotone" className="h-6 w-6" />
           </span>
           <div className="min-w-0">

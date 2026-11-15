@@ -383,7 +383,7 @@ export function LoginPage() {
                   className={
                     'rounded-md px-2.5 py-1 text-xs font-medium transition-colors ' +
                     (i18n.language?.startsWith(lng)
-                      ? 'bg-brand-soft text-brand'
+                      ? 'bg-brand-soft text-fg-brand-strong'
                       : 'text-fg-subtle hover:bg-recessed hover:text-fg')
                   }
                 >

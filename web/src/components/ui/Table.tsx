@@ -100,7 +100,7 @@ export function Table<T>({
 
   return (
     <div className={cn('w-full', className)}>
-      <div className="overflow-x-auto rounded-lg border border-line">
+      <div className="overflow-x-auto rounded-lg border border-line" tabIndex={0}>
         <table className="w-full border-collapse text-sm">
           <thead>
             <tr className="bg-recessed">

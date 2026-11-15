@@ -252,7 +252,7 @@ function AppearanceCard({
                   className={cn(
                     'flex flex-col items-center gap-2 rounded-lg border p-4 text-sm transition-all',
                     active
-                      ? 'border-brand bg-brand-soft text-brand'
+                      ? 'border-brand bg-brand-soft text-fg-brand-strong'
                       : 'border-line text-fg-subtle hover:border-fill hover:text-fg',
                   )}
                 >
@@ -279,7 +279,7 @@ function AppearanceCard({
                   className={cn(
                     'inline-flex items-center gap-2 rounded-md border px-4 py-2 text-sm transition-colors',
                     active
-                      ? 'border-brand bg-brand-soft text-brand'
+                      ? 'border-brand bg-brand-soft text-fg-brand-strong'
                       : 'border-line text-fg-subtle hover:border-fill hover:text-fg',
                   )}
                 >
@@ -1084,7 +1084,7 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
                           className={cn(
                             'flex h-12 w-12 shrink-0 items-center justify-center rounded-lg text-lg font-bold tabular-nums',
                             page?.enabled
-                              ? 'bg-brand-soft text-brand'
+                              ? 'bg-brand-soft text-fg-brand-strong'
                               : 'bg-recessed text-fg-subtle',
                           )}
                         >

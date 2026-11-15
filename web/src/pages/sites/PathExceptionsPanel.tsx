@@ -400,7 +400,7 @@ export function PathExceptionsPanel() {
                   className={cn(
                     'rounded-md border px-3 py-1.5 text-[13px] font-medium transition-colors',
                     form.match_type === mt
-                      ? 'border-brand bg-brand-soft text-brand'
+                      ? 'border-brand bg-brand-soft text-fg-brand-strong'
                       : 'border-line text-fg-subtle hover:border-fill hover:text-fg',
                   )}
                 >

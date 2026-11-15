@@ -479,7 +479,7 @@ export function DashboardPage() {
                     </p>
                     <p className="mt-0.5 text-[13px] text-fg-subtle">{stat.label}</p>
                     {stat.sub && (
-                      <p className="mt-1 text-xs text-fg-subtle/80 tabular-nums">{stat.sub}</p>
+                      <p className="mt-1 text-xs text-fg-subtle tabular-nums">{stat.sub}</p>
                     )}
                   </>
                 )}
@@ -951,7 +951,7 @@ function SystemCpuCard() {
             {snap.cpu.process_cpu_percent.toFixed(1)}%
           </p>
           <p className="mt-0.5 text-[13px] text-fg-subtle">{t('pages.dashboard.cpuCard.processCpu')}</p>
-          <p className="mt-1 text-xs text-fg-subtle/80 tabular-nums">
+          <p className="mt-1 text-xs text-fg-subtle tabular-nums">
             {t('pages.dashboard.cpuCard.hostCpu')}:{' '}
             <span className="font-medium text-fg">{snap.cpu.host_cpu_percent.toFixed(1)}%</span>
             <span className="mx-2 text-fg-subtle/40">·</span>

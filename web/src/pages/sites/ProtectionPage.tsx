@@ -191,7 +191,7 @@ export function ProtectionPage() {
             <span className="flex min-w-0 items-center gap-3">
               <span
                 className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
-                  engineOn ? 'bg-brand-soft text-brand' : 'bg-warning/15 text-fg-warning'
+                  engineOn ? 'bg-brand-soft text-fg-brand-strong' : 'bg-warning/15 text-fg-warning'
                 }`}
               >
                 <ShieldCheck weight="duotone" className="h-5 w-5" />
@@ -360,7 +360,7 @@ export function ProtectionPage() {
                         className={cn(
                           'h-7 w-9 rounded-md border text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60',
                           active
-                            ? 'border-brand bg-brand-soft text-brand'
+                            ? 'border-brand bg-brand-soft text-fg-brand-strong'
                             : 'border-line text-fg-subtle hover:border-fill hover:bg-recessed',
                         )}
                       >

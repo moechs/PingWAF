@@ -883,7 +883,7 @@ function MethodToggle({
   const { t } = useTranslation()
   return (
     <div className="flex items-start gap-3 rounded-lg border border-line bg-recessed/40 p-3">
-      <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-brand-soft text-brand">
+      <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-brand-soft text-fg-brand-strong">
         {icon}
       </span>
       {comingSoon ? (

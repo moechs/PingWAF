@@ -558,7 +558,7 @@ export function RuleDialog({
                     form.severity === level
                       ? level >= 4
                         ? 'border-danger bg-danger/12 text-fg-danger'
-                        : 'border-brand bg-brand-soft text-brand'
+                        : 'border-brand bg-brand-soft text-fg-brand-strong'
                       : 'border-line text-fg-subtle hover:border-fill hover:text-fg',
                   )}
                 >

@@ -534,7 +534,7 @@ export function SslPage() {
           <span
             className={cn(
               'flex h-8 w-8 shrink-0 items-center justify-center rounded-md',
-              isCurrent(c) ? 'bg-brand text-white' : 'bg-brand-soft text-brand',
+              isCurrent(c) ? 'bg-brand text-white' : 'bg-brand-soft text-fg-brand-strong',
             )}
           >
             <Lock weight="duotone" className="h-4 w-4" />

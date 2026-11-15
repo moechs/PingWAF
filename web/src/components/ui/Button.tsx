@@ -25,11 +25,11 @@ export type ButtonProps = ButtonBaseProps &
 
 const variantClasses: Record<ButtonVariant, string> = {
   primary:
-    'bg-brand text-white border border-transparent hover:bg-brand-hover active:brightness-95 shadow-sm disabled:bg-brand/50',
+    'bg-brand text-[#1d1d1d] border border-transparent hover:bg-brand-hover active:brightness-95 shadow-sm disabled:bg-brand/50',
   secondary:
     'bg-elevated text-fg border border-line hover:bg-recessed active:bg-recessed shadow-sm',
   danger:
-    'bg-danger text-white border border-transparent hover:brightness-110 active:brightness-95 shadow-sm disabled:bg-danger/50',
+    'bg-danger text-[#1d1d1d] border border-transparent hover:brightness-110 active:brightness-95 shadow-sm disabled:bg-danger/50',
   ghost:
     'bg-transparent text-fg-subtle border border-transparent hover:bg-recessed hover:text-fg',
   link: 'bg-transparent text-link border border-transparent hover:underline px-0',
