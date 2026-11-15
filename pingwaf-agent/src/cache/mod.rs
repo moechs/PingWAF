@@ -575,8 +575,8 @@ impl From<i32> for WafMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WafRule {
-    pub id: String,
-    pub name: String,
+    pub id: Arc<str>,
+    pub name: Arc<str>,
     pub description: String,
     pub expression: String,
     pub action: WafAction,
@@ -3035,8 +3035,8 @@ impl RuleCache {
                 .custom_rules
                 .iter()
                 .map(|r| WafRule {
-                    id: r.id.clone(),
-                    name: r.name.clone(),
+                    id: Arc::from(r.id.as_str()),
+                    name: Arc::from(r.name.as_str()),
                     description: r.description.clone(),
                     expression: r.expression.clone(),
                     action: WafAction::from(r.action),

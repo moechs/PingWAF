@@ -3241,7 +3241,7 @@ fn build_site_engine(cfg: &CacheWafConfig) -> WafEngine {
         .iter()
         // Only monitor rules participate in the event/score stream.
         .filter(|r| r.enabled && effective_mode(r) == CacheWafMode::Monitor)
-        .map(|r| r.id.clone())
+        .map(|r| r.id.to_string())
         .collect();
     // Active rules: enabled and not off. Off rules must not be compiled or
     // evaluated (R-01); `enabled = false` rules are likewise skipped.
@@ -3270,8 +3270,8 @@ fn build_site_engine(cfg: &CacheWafConfig) -> WafEngine {
                 },
             };
             match CompiledRule::compile(
-                r.id.clone(),
-                r.name.clone(),
+                Arc::clone(&r.id),
+                Arc::clone(&r.name),
                 &r.expression,
                 action,
                 r.severity as u8,

@@ -564,7 +564,7 @@ impl WafEngine {
                 base.managed_rules
                     .iter()
                     .filter(|r| {
-                        !config.disabled_managed_rules.contains(r.id.as_str())
+                        !config.disabled_managed_rules.contains(r.id.as_ref())
                     })
                     .cloned(),
             );
@@ -578,7 +578,7 @@ impl WafEngine {
 
         let mut fast_path_monitored = CategorySet::EMPTY;
         for rule in &rules {
-            if !config.monitor_managed_rules.contains(rule.id.as_str()) {
+            if !config.monitor_managed_rules.contains(rule.id.as_ref()) {
                 continue;
             }
             if let Some(category) = managed_rule_category(rule) {
@@ -641,9 +641,9 @@ impl WafEngine {
     /// plane's per-rule monitor switch), never implicitly.
     fn rule_monitored(&self, rule: &CompiledRule) -> bool {
         if !rule.id.starts_with("PINGWAF-") {
-            return self.monitor_custom_rules.contains(rule.id.as_str());
+            return self.monitor_custom_rules.contains(rule.id.as_ref());
         }
-        if self.monitor_managed_rules.contains(rule.id.as_str()) {
+        if self.monitor_managed_rules.contains(rule.id.as_ref()) {
             return true;
         }
         match managed_rule_category(rule) {
@@ -717,8 +717,10 @@ impl WafEngine {
         // access/security event payload does not change.
         self.rules
             .iter()
-            .find(|rule| rule.id == id && !rule.id.starts_with("PINGWAF-"))
-            .map(|rule| rule.name.as_str())
+            .find(|rule| {
+                rule.id.as_ref() == id && !rule.id.starts_with("PINGWAF-")
+            })
+            .map(|rule| rule.name.as_ref())
     }
 
     /// Main inspection entry point.
@@ -1576,7 +1578,7 @@ impl WafEngine {
                 continue;
             }
             let mut matched = self.matched_from(&recs, &[]);
-            matched.push(rule.id.clone());
+            matched.push(rule.id.to_string());
             return WafVerdict {
                 action: WafAction::Pass,
                 score: breakdown.total_u8(),
@@ -1687,7 +1689,7 @@ impl WafEngine {
                     if !rule_monitored {
                         forced_action = Some(WafAction::Block);
                         if enforced_block.is_none() {
-                            enforced_block = Some(rule.id.clone());
+                            enforced_block = Some(rule.id.to_string());
                         }
                     }
                 },
@@ -1702,7 +1704,7 @@ impl WafEngine {
                     {
                         forced_action = Some(WafAction::Challenge);
                         if enforced_challenge.is_none() {
-                            enforced_challenge = Some(rule.id.clone());
+                            enforced_challenge = Some(rule.id.to_string());
                         }
                     }
                 },
@@ -2644,6 +2646,24 @@ mod tests {
         let v = e.inspect(&req("GET", "/secret/data", ""));
         assert!(matches!(v.action, WafAction::Block | WafAction::Monitor));
         assert!(v.matched_rules.contains(&"BLOCK-SECRET".to_string()));
+    }
+
+    #[test]
+    fn compile_keeps_a_shared_rule_id() {
+        // The control plane's per-site rule bundle owns one `Arc<str>` per
+        // id/name; compilation must keep the pointer instead of copying the
+        // string, so a site's engine and its cache entry share the bytes.
+        let id: std::sync::Arc<str> = std::sync::Arc::from("SHARED-1");
+        let rule = CompiledRule::compile(
+            std::sync::Arc::clone(&id),
+            "shared name",
+            r#"http.request.uri.path eq "/x""#,
+            RuleAction::Block,
+            3,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&rule.id, &id));
     }
 
     #[test]

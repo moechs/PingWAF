@@ -112,6 +112,13 @@ verbatim for reference and attribution, and is not maintained here.
   name through the site engine on the event path only; managed rules still
   report no name, matching the old payload exactly.
 
+- **Rule ids and names are shared instead of copied per site.** The agent's
+  cached `WafRule.id/name` and the compiled `CompiledRule.id/name` are
+  `Arc<str>`: compiling a site's rules now reuses the bundle's strings
+  instead of cloning them per site (~1.6-4 MB at 1000 sites × 20 rules). The
+  serialized cache format is unchanged (serde's `rc` support), and a
+  regression test pins the pointer sharing.
+
 ### Changed
 
 - **`detect_sqli` returns an empty fingerprint for non-detections.** The

@@ -357,16 +357,16 @@ fn stack_names(stacks: StackSet) -> Vec<String> {
 pub fn managed_rule_catalogue(level: WafLevel) -> Vec<ManagedRuleInfo> {
     let normal_rules = default_managed_rules(WafLevel::Normal);
     let normal_ids: std::collections::HashSet<&str> =
-        normal_rules.iter().map(|r| r.id.as_str()).collect();
+        normal_rules.iter().map(|r| r.id.as_ref()).collect();
     default_managed_rules(level)
         .into_iter()
         .map(|r| {
             let category =
                 managed_rule_category(&r).map(|c| c.as_str().to_string());
             ManagedRuleInfo {
-                strict_only: !normal_ids.contains(r.id.as_str()),
-                id: r.id,
-                name: r.name,
+                strict_only: !normal_ids.contains(r.id.as_ref()),
+                id: r.id.to_string(),
+                name: r.name.to_string(),
                 action: r.action.as_str().to_string(),
                 severity: r.severity,
                 tags: r.tags,
@@ -445,7 +445,7 @@ mod tests {
     fn find<'r>(rules: &'r [CompiledRule], id: &str) -> &'r CompiledRule {
         rules
             .iter()
-            .find(|r| r.id == id)
+            .find(|r| r.id.as_ref() == id)
             .unwrap_or_else(|| panic!("{id} missing"))
     }
 
@@ -538,7 +538,7 @@ mod tests {
         assert!(evaluate(&find(&strict, "PINGWAF-1004").expression, &ctx));
 
         // The RCE sub-score gate exists only at Strict.
-        assert!(normal.iter().all(|r| r.id != "PINGWAF-1061"));
+        assert!(normal.iter().all(|r| r.id.as_ref() != "PINGWAF-1061"));
         assert!(evaluate(
             &find(&strict, "PINGWAF-1061").expression,
             &score_ctx(0, 0, 48, 48)
@@ -638,7 +638,7 @@ mod tests {
         // spec comment for why that is a deliberate trade-off).
         assert!(default_managed_rules(WafLevel::Normal)
             .iter()
-            .all(|r| r.id != "PINGWAF-1070"));
+            .all(|r| r.id.as_ref() != "PINGWAF-1070"));
 
         let ct = content_type_header();
         let cookie = session_cookie();
