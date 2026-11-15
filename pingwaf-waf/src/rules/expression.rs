@@ -727,11 +727,14 @@ pub struct EvalContext<'a> {
 }
 
 impl EvalContext<'_> {
+    /// Case-insensitive header lookup. Header names arrive lower-cased from
+    /// `http::HeaderName`, but the needle comes from a rule expression that
+    /// may be written in any case, so the comparison stays case-insensitive
+    /// without allocating a lowercased copy per evaluation.
     pub fn header(&self, name: &str) -> Option<&str> {
-        let needle = name.to_ascii_lowercase();
         self.headers
             .iter()
-            .find(|(k, _)| *k == needle)
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
 
@@ -1030,6 +1033,18 @@ mod tests {
     #[test]
     fn parses_header_lookup() {
         assert_eval(r#"http.request.headers["x-custom"] eq "hello""#, true);
+    }
+
+    #[test]
+    fn header_lookup_is_case_insensitive() {
+        // Rule authors may write `X-Custom`; header names arrive lower-cased
+        // and the lookup must not allocate a lowercased needle per request.
+        assert_eval(r#"http.request.headers["X-Custom"] eq "hello""#, true);
+        assert_eval(
+            r#"http.request.headers["CONTENT-TYPE"] contains "json""#,
+            true,
+        );
+        assert_eval(r#"http.request.headers["missing"] eq "x""#, false);
     }
 
     #[test]

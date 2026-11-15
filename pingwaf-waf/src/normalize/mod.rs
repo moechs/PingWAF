@@ -539,7 +539,12 @@ pub fn decode_value<'a>(
     } else {
         url_decoded
     };
-    let out = if decode_escapes {
+    // Escape resolution is only meaningful when a marker is present. The
+    // previous shape wrapped `decode_escapes_owned` in `Cow::Owned`
+    // unconditionally, which allocated and copied the whole value for every
+    // Strict-level request even when nothing changed — the very fast path
+    // `decode_escapes` exists for was thrown away one layer up.
+    let out = if decode_escapes && has_escape_marker(&out) {
         Cow::Owned(decode_escapes_owned(&out))
     } else {
         out
@@ -579,15 +584,21 @@ fn decode_value_form<'a>(
     decode_value(input, max_decode_layers, decode_escapes)
 }
 
+/// `true` when `input` carries a `\xHH` / `\uHHHH` escape marker. Shared by
+/// [`decode_escapes`] (its fast path) and [`decode_value`] (so the Strict
+/// level can skip the owned copy when no marker is present).
+fn has_escape_marker(input: &str) -> bool {
+    input.contains("\\x")
+        || input.contains("\\X")
+        || input.contains("\\u")
+        || input.contains("\\U")
+}
+
 /// Resolve `\xHH` and `\uHHHH` escape sequences. Returns the input untouched
 /// (borrowed) when it contains no escape marker, so the Normal-level path
 /// never allocates for this.
 pub fn decode_escapes(input: &str) -> Cow<'_, str> {
-    let has_marker = input.contains("\\x")
-        || input.contains("\\X")
-        || input.contains("\\u")
-        || input.contains("\\U");
-    if !has_marker {
+    if !has_escape_marker(input) {
         return Cow::Borrowed(input);
     }
     let bytes = input.as_bytes();
@@ -1380,6 +1391,19 @@ fn parse_cookies<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_value_without_escape_marker_borrows() {
+        // Strict-level `decode_value` used to wrap `decode_escapes_owned` in
+        // `Cow::Owned` unconditionally, allocating and copying every value
+        // even when no `\x`/`\u` marker was present.
+        let decoded = decode_value("plain-value", 3, true);
+        assert!(matches!(decoded, Cow::Borrowed(_)));
+        assert_eq!(decoded, "plain-value");
+
+        // A real marker is still resolved.
+        assert_eq!(decode_value(r"a\x41", 3, true), "aA");
+    }
 
     #[test]
     fn key_only_b64_and_escape_onions_join_scan_surface() {

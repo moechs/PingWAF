@@ -36,14 +36,18 @@ struct ManagedSpec {
 /// body, a well-formed session id, and — for the session-file-write variant —
 /// a NUL byte right after the part headers.
 ///
-/// Both condition groups share the same prefix, so it is built once here
-/// rather than copied. The media type is matched case-insensitively (`(?i)`):
-/// RFC 2045 makes type/subtype case-insensitive on the wire, while the
-/// `contains` operator is a byte-exact substring test, so `MULTIPART/FORM-DATA`
-/// would otherwise walk straight past the rule. The progress field name stays
-/// case-sensitive on purpose — PHP compares it byte-exactly against
-/// `session.upload_progress.name`, so folding case would only add false
-/// positives.
+/// Both condition groups share the same prefix, so it is built once here and
+/// hoisted out of the disjunction — `(P and A) or (P and B)` is
+/// `P and (A or B)`. That matters at evaluation time: `P` starts with a
+/// `contains` over the whole request body, and the previous shape evaluated
+/// it twice for every POST (the left branch failed and the right branch
+/// re-scanned the same bytes). The media type is matched case-insensitively
+/// (`(?i)`): RFC 2045 makes type/subtype case-insensitive on the wire, while
+/// the `contains` operator is a byte-exact substring test, so
+/// `MULTIPART/FORM-DATA` would otherwise walk straight past the rule. The
+/// progress field name stays case-sensitive on purpose — PHP compares it
+/// byte-exactly against `session.upload_progress.name`, so folding case would
+/// only add false positives.
 fn php_upload_progress_expression() -> String {
     let prefix = concat!(
         r#"http.request.body contains "PHP_SESSION_UPLOAD_PROGRESS" and "#,
@@ -54,15 +58,12 @@ fn php_upload_progress_expression() -> String {
     [
         "(",
         prefix,
-        " and (",
+        ") and (",
         r#"http.request.cookies["PHPSESSID"] matches "^[0-9A-Za-z,-]{16,256}$""#,
         r#" or http.request.body matches 'name="PHPSESSID"[^\x0d\x0a]*"#,
         r#"\x0d\x0a([^\x0d\x0a]+\x0d\x0a)*\x0d\x0a[0-9A-Za-z,-]{16,256}'"#,
-        r#" or http.request.uri.query matches 'PHPSESSID=[0-9A-Za-z,-]{16,256}'))"#,
-        " or (",
-        prefix,
-        " and ",
-        r#"http.request.body matches 'Content-Disposition:\s*form-data;\s*name="[^"]+"#,
+        r#" or http.request.uri.query matches 'PHPSESSID=[0-9A-Za-z,-]{16,256}'"#,
+        r#" or http.request.body matches 'Content-Disposition:\s*form-data;\s*name="[^"]+"#,
         r#"\x0d\x0a([^\x0d\x0a]+\x0d\x0a)*\x0d\x0a[\s\S]{0,32}\x00')"#,
     ]
     .concat()

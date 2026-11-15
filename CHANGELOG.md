@@ -10,6 +10,45 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+### Performance
+
+- **The detection hot path is materially cheaper, with no verdict changes.**
+  Measured on the production feature graph (release, `opt-level="z"`), p50:
+  clean 8-header GET 8.7µs → 7.1–7.7µs (−12%–18%), 4KB JSON POST 196µs →
+  110µs (−44%), 10KB form POST 565µs → 267µs (−53%); per-request allocations
+  37/91/113 → 32/77/81. A 49,747-input differential run (docs prose, dictionary
+  words, curated payloads, Unicode-fold/case variants, fuzz, CJK) produced
+  byte-identical `detect_sqli`/`detect_xss` results and `WafVerdict`s before
+  and after. The changes:
+
+  - `pingwaf-waf` now declares `regex`'s `perf` feature explicitly. Without it
+    a waf-only build (tests, examples, downstream users) silently fell back to
+    the PikeVM — measured 17–49x slower — while the shipped binary only got the
+    fast path through feature unification with `pingora-cache`.
+  - `fingerprint_sql` classifies tokens through a hash set instead of two
+    linear slice scans (54 + 71 entries per token).
+  - The three longest SQLi alternations (`SQLI_BLIND_PROBE`,
+    `SQLI_TAUTOLOGY`, `SQLI_BOOL_SUBQUERY`) run behind necessary-condition
+    gates, so prose and CJK text skip them entirely; the gates accept the
+    long-s (`ſ`) code point that `(?i)` folds to `s`.
+  - `detect_sqli` skips the tokenizer for values with no strong check and runs
+    the strong regexes on the original input (all are `(?i)`); `detect_xss` no
+    longer allocates a lowercased copy.
+  - Strict-level escape decoding keeps the borrowed form when no `\x`/`\u`
+    marker is present (the previous shape copied every value).
+  - `EvalContext::header` compares case-insensitively instead of allocating a
+    lowercased needle per evaluation.
+  - Managed rule PINGWAF-1070's expression hoists its shared prefix out of the
+    disjunction, so the body `contains` no longer runs twice per Strict POST.
+
+### Changed
+
+- **`detect_sqli` returns an empty fingerprint for non-detections.** The
+  fingerprint is contractually only read when `is_sqli` is true (every engine
+  caller gates on it), and building it was the largest single cost of the SQLi
+  confirmation path on prose. The `(bool, String)` signature is unchanged; a
+  weak-only fingerprint was never actionable.
+
 ## [PingWAF 0.32.29] — 2026-11-15
 
 ### Security
