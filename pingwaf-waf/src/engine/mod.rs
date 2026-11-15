@@ -703,6 +703,20 @@ impl WafEngine {
         self.rules.len()
     }
 
+    /// Configured name of the rule with `id`, for event attribution.
+    ///
+    /// Linear over the engine's rule set; only called when a verdict produces
+    /// a security event, never on the clean-pass path. This replaces the
+    /// per-site `id -> name` map the plugin used to keep: the engine already
+    /// holds every rule (including the managed ones), so the map was a second
+    /// copy of the same strings for each site.
+    pub fn rule_name(&self, id: &str) -> Option<&str> {
+        self.rules
+            .iter()
+            .find(|rule| rule.id == id)
+            .map(|rule| rule.name.as_str())
+    }
+
     /// Main inspection entry point.
     ///
     /// Pipeline:

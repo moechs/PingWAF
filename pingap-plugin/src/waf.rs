@@ -75,7 +75,7 @@ use pingwaf_waf::{
     WafVerdict,
 };
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -691,8 +691,6 @@ struct SiteContext {
     /// Site-wide basic auth gate; `None` when the site has none, it is
     /// disabled, or it stores no usable credential.
     basic_auth: Option<BasicAuthGate>,
-    /// Custom rule id → name.
-    rule_names: HashMap<String, String>,
     /// Site paused from the dashboard: every request gets the maintenance page.
     paused: bool,
     /// Observation mode: every protection keeps detecting but only records —
@@ -757,14 +755,6 @@ impl SiteContext {
             rate_limits: (!rate_limits.rules.is_empty()).then_some(rate_limits),
             mtls: MtlsPolicy::build(site_rules.ssl_config.as_ref()),
             basic_auth,
-            rule_names: waf_cfg
-                .map(|cfg| {
-                    cfg.custom_rules
-                        .iter()
-                        .map(|r| (r.id.clone(), r.name.clone()))
-                        .collect()
-                })
-                .unwrap_or_default(),
             paused: site_rules.is_paused(),
             observation_mode: site_rules.observation_mode,
             waf_mode: waf_cfg.map(|cfg| cfg.mode),
@@ -797,6 +787,18 @@ impl SiteContext {
                     })
                 }),
         }
+    }
+
+    /// Configured name of the rule with `id`, for the security event.
+    ///
+    /// Looks through the site engine's rule set instead of keeping a per-site
+    /// `id -> name` map: the map duplicated every custom rule's id and name
+    /// for every site, while the engine already holds the compiled rules.
+    fn rule_name(&self, id: &str) -> Option<String> {
+        self.engine
+            .as_ref()
+            .and_then(|engine| engine.rule_name(id))
+            .map(str::to_string)
     }
 
     /// Resolves the engine choice for the rules this context was built from.
@@ -3958,8 +3960,7 @@ impl WafPlugin {
                 return String::new();
             };
             context
-                .and_then(|context| context.rule_names.get(id))
-                .cloned()
+                .and_then(|context| context.rule_name(id))
                 .unwrap_or_default()
         };
 
