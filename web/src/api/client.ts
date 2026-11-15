@@ -30,23 +30,34 @@ interface ErrorEnvelope {
   message?: string
 }
 
+/** Response header the control plane stamps every `/api/v1` reply with. */
+export const REQUEST_ID_HEADER = 'x-request-id'
+
 export class ApiError extends Error {
   status: number
   code: ApiErrorCode | string
   /** True when the request never reached the server (DNS/TLS/offline). */
   networkError: boolean
+  /**
+   * Correlation id the server returned for this request (`x-request-id`).
+   * Error cards quote it so a bug report can be matched to the control plane's
+   * log line; `null` when the request never produced a response.
+   */
+  requestId: string | null
 
   constructor(
     message: string,
     status: number,
     code: ApiErrorCode | string = 'internal_error',
     networkError = false,
+    requestId: string | null = null,
   ) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
     this.networkError = networkError
+    this.requestId = requestId
   }
 }
 
@@ -188,7 +199,10 @@ async function readError(response: Response): Promise<ApiError> {
       : response.status === 501 ? 'not_implemented'
       : 'bad_request'
   }
-  return new ApiError(message, response.status, code)
+  // T03: keep the server's correlation id on the error so the UI can show the
+  // exact request a support ticket refers to.
+  const requestId = response.headers.get(REQUEST_ID_HEADER)?.trim() || null
+  return new ApiError(message, response.status, code, false, requestId)
 }
 
 /**

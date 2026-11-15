@@ -2663,11 +2663,15 @@ impl ProxyHttp for Server {
         // The full error (with request_id) is already logged once above in
         // the single "fail to proxy" line (R-05); only the fixed,
         // error-type-specific page renders here.
+        // The shared error page is used for 4xx and 5xx alike (404, 408, 413,
+        // 429, 5xx), so it renders the status code it is answering with.
+        let status = code.to_string();
         let content = self.error_template.render(
             pingap_util::get_pkg_version(),
             public_error_message(error_type),
             error_type,
             ctx.state.request_id.as_deref().unwrap_or(""),
+            &status,
         );
         let buf = Bytes::from(content);
         let content_type = if self.error_template.is_json() {

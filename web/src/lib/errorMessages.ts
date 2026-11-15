@@ -247,12 +247,25 @@ export function retryDelayMs(attempt: number): number {
 let referenceCounter = 0
 
 /**
- * Short client-side reference for a failure. The control plane's error
- * envelope carries no request id today, so the console mints its own opaque
- * value that an operator can quote in a bug report; it is deliberately not
- * derivable from anything sensitive.
+ * Correlation id the control plane returned for this failure (`x-request-id`,
+ * T03). `null` when the request never reached the server or an older control
+ * plane did not send the header.
+ */
+export function serverRequestId(err: unknown): string | null {
+  return err instanceof ApiError ? err.requestId : null
+}
+
+/**
+ * Reference an error card shows for a failure: the server's request id when
+ * present (it matches the control plane's access log line), otherwise a short
+ * client-minted value that an operator can quote in a bug report.
+ *
+ * Memoize the result per error instance before rendering — the client fallback
+ * is intentionally unique per call so two failures never share a reference.
  */
 export function failureReference(err: unknown): string {
+  const server = serverRequestId(err)
+  if (server) return server
   referenceCounter = (referenceCounter + 1) % 1296
   const stamp = Date.now().toString(36).toUpperCase()
   const suffix = referenceCounter.toString(36).toUpperCase().padStart(2, '0')

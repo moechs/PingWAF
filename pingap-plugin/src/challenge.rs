@@ -398,7 +398,7 @@ fn brand_page(
   <h1>{heading}</h1>
   <p class="msg">{message_html}</p>
   <div class="details">{details}</div>
-  <p class="brand">Protected by <b>PingWAF</b></p>
+  <p class="brand">Protected by <a href="https://www.pingwaf.com" target="_blank" rel="noopener"><b>PingWAF</b></a></p>
 </div>
 </body>
 </html>"##,
@@ -1285,6 +1285,45 @@ mod tests {
         assert!(pending.bytes > 0);
         if let Some((_, removed)) = PENDING_CHALLENGES.remove(&request_id) {
             account_pending_removed(&removed);
+        }
+    }
+
+    /// The footer brand on every shared page links to the official site, and
+    /// the new tab cannot reach back through `window.opener`.
+    #[test]
+    fn brand_pages_link_to_the_official_site() {
+        let pages: Vec<(&str, String)> = vec![
+            (
+                "block",
+                String::from_utf8_lossy(&block_page("r", "x").body).to_string(),
+            ),
+            (
+                "paused",
+                String::from_utf8_lossy(&paused_page("r").body).to_string(),
+            ),
+            (
+                "rate-limit",
+                String::from_utf8_lossy(&rate_limit_page("r", "x", 30).body)
+                    .to_string(),
+            ),
+            (
+                "basic-auth",
+                String::from_utf8_lossy(&basic_auth_page("r", "x", "y").body)
+                    .to_string(),
+            ),
+            (
+                "fail-closed",
+                String::from_utf8_lossy(&fail_closed_page("r").body)
+                    .to_string(),
+            ),
+        ];
+        for (label, body) in pages {
+            assert!(
+                body.contains(r#"href="https://www.pingwaf.com""#),
+                "{label}: {body}"
+            );
+            assert!(body.contains(r#"rel="noopener""#), "{label}: {body}");
+            assert!(body.contains("Protected by"), "{label}: {body}");
         }
     }
 

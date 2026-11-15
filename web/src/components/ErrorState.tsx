@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useMemo, type ReactNode } from 'react'
 import {
   Clock,
   CloudSlash,
@@ -13,6 +13,7 @@ import { errorMessage } from '@/api/errors'
 import {
   classifyFailure,
   docsUrl,
+  failureReference,
   type FailureKind,
 } from '@/lib/errorMessages'
 import { cn } from '@/lib/utils'
@@ -77,9 +78,13 @@ export function ErrorState({
   const hint = t(failure.hintKey)
   const docs = docUrl === undefined ? docsUrl(failure.docSlug) : docUrl
   const docLabel = t('errors.openDocs')
-  const referenceLabel = reference
-    ? t('errors.reference', { id: reference })
-    : null
+  // T03: prefer the server's `x-request-id`; fall back to the client reference
+  // so every failure still has something an operator can quote.
+  const effectiveReference = useMemo(
+    () => reference ?? failureReference(error),
+    [reference, error],
+  )
+  const referenceLabel = t('errors.reference', { id: effectiveReference })
 
   if (variant === 'inline') {
     return (

@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { NavLink, Outlet, useParams } from 'react-router-dom'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { NavLink, Outlet, useLocation, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -33,6 +33,7 @@ import { wafSettingsApi, wafSettingsKeys } from '@/api/wafSettings'
 import { useCanWrite, useSiteDetail } from '@/hooks'
 import { useAnyUnsaved, useUnsavedGuard } from '@/hooks/useUnsavedGuard'
 import { useSiteStore } from '@/stores/siteStore'
+import { centeredTabScrollLeft } from './siteDetailTabs'
 import type { SiteStatus } from '@/api/types'
 
 const STATUS_TONE: Record<SiteStatus, 'success' | 'warning' | 'neutral'> = {
@@ -117,6 +118,54 @@ export function SiteDetailPage() {
     { to: `${base}/traffic`, label: t('nav.traffic'), icon: ChartLine },
     { to: `${base}/rules/rewrite`, label: t('pages.rewrite.title'), icon: Sliders },
   ]
+
+  // Mobile tab bar (UX-19): the nine tabs overflow at 390px. The bar sticks
+  // below the console header while the page scrolls, shows a fade on the side
+  // that still has tabs, and scrolls the active tab into view on navigation.
+  const location = useLocation()
+  const tabListRef = useRef<HTMLDivElement>(null)
+  const [tabOverflow, setTabOverflow] = useState({ left: false, right: false })
+  const updateTabOverflow = useCallback(() => {
+    const el = tabListRef.current
+    if (!el) return
+    setTabOverflow({
+      left: el.scrollLeft > 2,
+      right: el.scrollWidth - el.clientWidth - el.scrollLeft > 2,
+    })
+  }, [])
+
+  useEffect(() => {
+    updateTabOverflow()
+    if (typeof ResizeObserver === 'undefined') return
+    const el = tabListRef.current
+    if (!el) return
+    const observer = new ResizeObserver(updateTabOverflow)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [updateTabOverflow, tabs.length])
+
+  useEffect(() => {
+    const el = tabListRef.current
+    if (!el) return
+    const activeEl = el.querySelector<HTMLElement>('[aria-current="page"]')
+    if (!activeEl) return
+    const left = centeredTabScrollLeft({
+      offsetLeft: activeEl.offsetLeft,
+      itemWidth: activeEl.clientWidth,
+      clientWidth: el.clientWidth,
+      scrollWidth: el.scrollWidth,
+    })
+    if (typeof el.scrollTo === 'function') {
+      try {
+        el.scrollTo({ left, behavior: 'smooth' })
+      } catch {
+        el.scrollLeft = left
+      }
+    } else {
+      el.scrollLeft = left
+    }
+    updateTabOverflow()
+  }, [location.pathname, updateTabOverflow])
 
   // The server answers 404 for sites the caller may not see — surface that
   // instead of rendering an empty shell around a broken id.
@@ -255,28 +304,46 @@ export function SiteDetailPage() {
       {/* Z5: offline/degraded agents mean config changes may lag. */}
       <AgentStatusBanner siteId={siteId} />
 
-      {/* Tab nav */}
-      <div className="mb-6 flex gap-1 overflow-x-auto border-b border-line">
-        {tabs.map((tab) => {
-          const Icon = tab.icon
-          return (
-            <NavLink
-              key={tab.to}
-              to={tab.to}
-              className={({ isActive }) =>
-                cn(
-                  '-mb-px inline-flex shrink-0 items-center gap-2 whitespace-nowrap border-b-2 px-3 py-2.5 text-sm font-medium transition-colors',
-                  isActive
-                    ? 'border-brand text-fg-strong'
-                    : 'border-transparent text-fg-subtle hover:text-fg',
-                )
-              }
-            >
-              <Icon weight="duotone" className="h-4 w-4" />
-              {tab.label}
-            </NavLink>
-          )
-        })}
+      {/* Tab nav — sticky on phones so the nine tabs stay reachable (UX-19). */}
+      <div className="sticky top-0 z-20 -mx-4 mb-6 bg-base/95 px-4 backdrop-blur sm:-mx-6 sm:px-6 md:static md:mx-0 md:bg-transparent md:px-0 md:backdrop-blur-none">
+        <div
+          ref={tabListRef}
+          onScroll={updateTabOverflow}
+          className="flex gap-1 overflow-x-auto border-b border-line"
+        >
+          {tabs.map((tab) => {
+            const Icon = tab.icon
+            return (
+              <NavLink
+                key={tab.to}
+                to={tab.to}
+                className={({ isActive }) =>
+                  cn(
+                    'pw-touch-target -mb-px inline-flex shrink-0 items-center gap-2 whitespace-nowrap border-b-2 px-3 py-2.5 text-sm font-medium transition-colors',
+                    isActive
+                      ? 'border-brand text-fg-strong'
+                      : 'border-transparent text-fg-subtle hover:text-fg',
+                  )
+                }
+              >
+                <Icon weight="duotone" className="h-4 w-4" />
+                {tab.label}
+              </NavLink>
+            )
+          })}
+        </div>
+        {tabOverflow.left && (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-y-0 left-0 w-6 bg-gradient-to-r from-base to-transparent"
+          />
+        )}
+        {tabOverflow.right && (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-y-0 right-0 w-6 bg-gradient-to-l from-base to-transparent"
+          />
+        )}
       </div>
 
       <Outlet />

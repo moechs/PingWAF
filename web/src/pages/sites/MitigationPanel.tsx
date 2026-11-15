@@ -480,7 +480,7 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
         confirmLabel={t('pages.cc.disableConfirmTitle')}
         disabled={!disableAck}
       >
-        <label className="flex items-start gap-2.5 text-[13px]">
+        <label className="flex items-start gap-2.5 text-[13px] pw-touch-check">
           <input
             type="checkbox"
             className="mt-0.5 rounded border-border accent-brand"

@@ -10,6 +10,29 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+### Added
+
+- **Edge error pages are clearer and link back to the project.** The built-in
+  page used by 404/408/413/429/5xx now shows the HTTP status, request ID, error
+  and detail rows, a retry suggestion, `noindex`, and a mobile/dark layout; the
+  shared footer `PingWAF` is a link to https://www.pingwaf.com (the WAF block,
+  challenge, rate-limit, paused and fail-closed pages, and the branded 502/503/
+  504 page, use the same link). The error template also supports a new
+  `{{status}}` placeholder.
+
+- **Every REST response carries `x-request-id`.** The control plane echoes a
+  valid caller-supplied id (or mints a UUID) and sets it on both success and
+  error responses; the console reads it into `ApiError.requestId` and shows it
+  in error cards so an operator can quote one id in a report. Client-side
+  fallback references remain for network failures.
+
+- **The last touch-target and mobile gaps are closed.** Site-detail tabs stick
+  on mobile and scroll the active tab into view; remaining icon buttons,
+  checkboxes and text inputs get a >=44px hit area on small or coarse-pointer
+  screens; the console 404 page links to the official site and no longer nests
+  a button inside a link.
+
+
 ### Performance
 
 - **The detection hot path is materially cheaper, with no verdict changes.**

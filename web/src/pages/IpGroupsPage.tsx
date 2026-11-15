@@ -600,7 +600,7 @@ function GroupDialog({ initial, sites, onClose, onSaved }: GroupDialogProps) {
         </div>
 
         <div className="flex items-center gap-4">
-          <label className="flex items-center gap-2 text-sm">
+          <label className="flex items-center gap-2 text-sm pw-touch-check">
             <input
               type="checkbox"
               checked={isGlobal}
@@ -609,7 +609,7 @@ function GroupDialog({ initial, sites, onClose, onSaved }: GroupDialogProps) {
             />
             {t('pages.ipGroups.fieldGlobal')}
           </label>
-          <label className="flex items-center gap-2 text-sm">
+          <label className="flex items-center gap-2 text-sm pw-touch-check">
             <input
               type="checkbox"
               checked={enabled}
@@ -629,7 +629,7 @@ function GroupDialog({ initial, sites, onClose, onSaved }: GroupDialogProps) {
               {sites.map((s) => (
                 <label
                   key={s.id}
-                  className="flex items-center gap-2 text-sm"
+                  className="flex items-center gap-2 text-sm pw-touch-check"
                 >
                   <input
                     type="checkbox"

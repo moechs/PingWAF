@@ -333,6 +333,26 @@ body {
   nav a.flex {
     min-height: 44px;
   }
+
+  /* Text fields and textareas are the remaining 36px controls in filter bars. */
+  input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]),
+  textarea {
+    min-height: 44px;
+  }
+
+  /* Icon-only buttons: `Button` renders a lone <svg> when it has no text, so
+     the hit area can be widened without changing the component. */
+  button:has(> svg:only-child) {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  /* Checkbox / radio rows: the wrapping <label> is the real hit target, so a
+     page adds this class to that row for a 44px tap height (the box itself
+     keeps its visual size). */
+  .pw-touch-check {
+    min-height: 44px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

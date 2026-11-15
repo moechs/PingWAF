@@ -421,7 +421,7 @@ export function ProtectionPage() {
         loading={updateSettings.isPending}
         disabled={!engineOffAck}
       >
-        <label className="flex items-start gap-2.5 text-[13px]">
+        <label className="flex items-start gap-2.5 text-[13px] pw-touch-check">
           <input
             type="checkbox"
             className="mt-0.5 rounded border-border accent-brand"
@@ -737,7 +737,7 @@ function EnforcementModeCard() {
         loading={applyMode.isPending}
         disabled={!downgradeAck}
       >
-        <label className="flex items-start gap-2.5 text-[13px]">
+        <label className="flex items-start gap-2.5 text-[13px] pw-touch-check">
           <input
             type="checkbox"
             className="mt-0.5 rounded border-border accent-brand"

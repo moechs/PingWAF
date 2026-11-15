@@ -3,7 +3,9 @@
     <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Origin Server Error · PingWAF</title>
+        <meta name="color-scheme" content="light dark" />
+        <meta name="robots" content="noindex, nofollow" />
+        <title>Request could not be completed · PingWAF</title>
         <style>
             :root {
                 --bg: #f6f7f9; --card: #ffffff; --fg: #141417;
@@ -22,7 +24,8 @@
             * { box-sizing: border-box; margin: 0; padding: 0; }
             body {
                 margin: 0; min-height: 100vh; display: flex;
-                align-items: center; justify-content: center; padding: 24px;
+                align-items: center; justify-content: center;
+                padding: clamp(16px, 4vw, 24px);
                 color: var(--fg); background-color: var(--bg);
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
                     Roboto, Helvetica, Arial, sans-serif;
@@ -31,8 +34,8 @@
             .card {
                 width: 100%; max-width: 560px; background: var(--card);
                 border: 1px solid var(--border); border-radius: 18px;
-                padding: 44px 36px; box-shadow: var(--shadow);
-                text-align: center;
+                padding: clamp(28px, 6vw, 44px) clamp(20px, 5vw, 36px);
+                box-shadow: var(--shadow); text-align: center;
             }
             .icon {
                 width: 68px; height: 68px; margin: 0 auto 18px;
@@ -44,13 +47,13 @@
                 stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round;
             }
             .code {
-                font-size: 15px; font-weight: 700; letter-spacing: 0.16em;
+                font-size: 14px; font-weight: 700; letter-spacing: 0.16em;
                 text-transform: uppercase; color: var(--accent);
                 margin-bottom: 6px;
             }
             h1 {
-                font-size: 24px; margin: 0 0 10px; letter-spacing: -0.015em;
-                font-weight: 650;
+                font-size: clamp(20px, 4.6vw, 24px); margin: 0 0 10px;
+                letter-spacing: -0.015em; font-weight: 650;
             }
             .msg {
                 color: var(--muted); margin: 0 0 26px; line-height: 1.65;
@@ -77,25 +80,36 @@
                 margin-top: 26px; font-size: 12px; color: var(--muted);
                 letter-spacing: 0.02em;
             }
+            .brand a { text-decoration: none; }
+            .brand a:hover { text-decoration: underline; }
             .brand b { color: var(--accent); font-weight: 700; }
+            @media (max-width: 480px) {
+                .card { border-radius: 14px; }
+                .msg { margin-bottom: 20px; }
+                .row {
+                    flex-direction: column; gap: 2px; padding: 8px 0;
+                }
+                .v { text-align: left; }
+            }
         </style>
     </head>
     <body>
-        <div class="card">
+        <main class="card">
             <div class="icon">
-                <svg viewBox="0 0 24 24">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
                     <rect x="3" y="4" width="18" height="7" rx="2" />
                     <rect x="3" y="13" width="18" height="7" rx="2" />
                     <path d="M7 7.5h.01M7 16.5h.01" />
                 </svg>
             </div>
-            <div class="code">Origin Server Error</div>
-            <h1>The website is temporarily unreachable</h1>
+            <div class="code">HTTP {{status}}</div>
+            <h1>This request could not be completed</h1>
             <p class="msg">
-                The request reached the PingWAF edge, but the website's origin
-                server could not be reached or did not answer in time.
-                <b>This is not a security block</b> — please try again in a few
-                moments.
+                The PingWAF edge could not complete this request.
+                <b>This is not a security block.</b>
+                Please check the address, wait a moment and try again — if the
+                problem persists, contact the site operator with the request ID
+                below.
             </p>
             <div class="details">
                 <div class="row">
@@ -111,7 +125,13 @@
                     <span class="v">{{content}}</span>
                 </div>
             </div>
-            <p class="brand">Routed via <b>PingWAF</b> {{version}}</p>
-        </div>
+            <p class="brand">
+                Routed via
+                <a href="https://www.pingwaf.com" target="_blank" rel="noopener"
+                    ><b>PingWAF</b></a
+                >
+                {{version}}
+            </p>
+        </main>
     </body>
 </html>
