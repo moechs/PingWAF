@@ -88,7 +88,7 @@ pub struct NormalizedRequest<'a> {
     /// copies this into the verdict so a truncated/undecoded body can never
     /// look like a clean pass.
     pub body_inspection: BodyInspection,
-    pub cookies: Vec<(String, String)>,
+    pub cookies: Vec<(Cow<'a, str>, Cow<'a, str>)>,
     /// Flat list of every decoded value the detectors should scan.
     pub decoded_values: Vec<DecodedValue<'a>>,
     /// Scan-surface truncations that happened while normalizing. Kept apart
@@ -1024,36 +1024,34 @@ fn expand_base64<'a>(
     let mut layer_end = decoded_values.len();
     let mut depth = 0usize;
     while layer_start < layer_end && depth < B64_MAX_DEPTH {
-        // Snapshot the layer: expanding pushes into the same vector.
-        let layer: Vec<(ValueSource, Cow<'_, str>, Cow<'_, str>)> =
-            decoded_values[layer_start..layer_end]
-                .iter()
-                // Do not clone every field just to discover that it is not
-                // base64. The cheap alphabet/length prefilter keeps the common
-                // request (no encoded payloads) allocation-free here.
-                .filter(|v| {
-                    v.field
-                        && v.decoded.len() >= 10
-                        && v.decoded.len() <= B64_MAX_VALUE_LEN
-                        && v.decoded.bytes().all(|b| {
-                            b.is_ascii_alphanumeric()
-                                || b == b'+'
-                                || b == b'/'
-                                || b == b'='
-                        })
-                })
-                .map(|v| (v.source, v.name.clone(), v.decoded.clone()))
-                .collect();
-        for (source, name, value) in layer {
+        // Snapshot only the indices: expanding pushes into the same vector,
+        // and cloning `name`/`decoded` here copied every owned body value
+        // (up to 16KB each) just to read it once.
+        let layer: Vec<usize> = (layer_start..layer_end)
+            .filter(|&index| {
+                let v = &decoded_values[index];
+                v.field
+                    && v.decoded.len() >= 10
+                    && v.decoded.len() <= B64_MAX_VALUE_LEN
+                    && v.decoded.bytes().all(|b| {
+                        b.is_ascii_alphanumeric()
+                            || b == b'+'
+                            || b == b'/'
+                            || b == b'='
+                    })
+            })
+            .collect();
+        for index in layer {
             // 10B floor: `MSBhbmQgMT0y` (`1 and 1=2`, 12B) rides inside JSON
             // members and falls between the old 16B gate and the 12B core
             // gate inside `b64_decode_value`. The charset + printability
             // gates there remain the real quality filter; this length check
             // only bounds work.
+            let value = &decoded_values[index].decoded;
             if value.len() < 10 || value.len() > B64_MAX_VALUE_LEN {
                 continue;
             }
-            let Some(mut decoded) = b64_decode_value(&value) else {
+            let Some(mut decoded) = b64_decode_value(value) else {
                 continue;
             };
             // Transport-wrapped payloads often carry a second obfuscation
@@ -1095,10 +1093,11 @@ fn expand_base64<'a>(
                     })
                     .collect();
             }
-            let name = Cow::Owned(if name.is_empty() {
+            let source = decoded_values[index].source;
+            let name = Cow::Owned(if decoded_values[index].name.is_empty() {
                 "b64".to_string()
             } else {
-                format!("{name}.b64")
+                format!("{}.b64", decoded_values[index].name)
             });
             if looks_like_json(&decoded)
                 && unpack_string_json(
@@ -1166,62 +1165,74 @@ fn expand_b64_substrings<'a>(
     if !strict {
         return;
     }
-    let layer: Vec<(ValueSource, Cow<'_, str>, Cow<'_, str>)> = decoded_values
-        .iter()
-        .filter(|v| {
+    let layer: Vec<usize> = (0..decoded_values.len())
+        .filter(|&index| {
+            let v = &decoded_values[index];
             v.field
                 && !v.name.contains(".b64")
                 && v.decoded.len() >= 16
                 && (v.decoded.contains('"') || v.decoded.contains('\''))
         })
-        .map(|v| (v.source, v.name.clone(), v.decoded.clone()))
         .collect();
-    for (source, name, value) in layer {
-        let bytes = value.as_bytes();
-        let mut pushed = 0usize;
-        let mut i = 0usize;
-        while i + 1 < bytes.len() && pushed < 4 {
-            // Run must open right behind a string quote. Single quotes count
-            // too: SQL/Python string literals carry payloads the same way
-            // (`{'id': 'MCcgfHwg…='}` unwraps to a UNION/tautology chain),
-            // and the white corpus's only single-quoted runs are camelCase
-            // API names that the printability gate inside
-            // [`b64_decode_value`] rejects after decoding.
-            if bytes[i] != b'"' && bytes[i] != b'\'' {
-                i += 1;
-                continue;
-            }
-            let quote = bytes[i];
-            let start = i + 1;
-            let mut end = start;
-            while end < bytes.len()
-                && (bytes[end].is_ascii_alphanumeric()
-                    || bytes[end] == b'+'
-                    || bytes[end] == b'/'
-                    || bytes[end] == b'=')
-            {
-                end += 1;
-            }
-            let run_len = end - start;
-            // Close straight into the matching quote; padding may precede it.
-            if run_len >= 16 && end < bytes.len() && bytes[end] == quote {
-                if let Some(decoded) = b64_decode_value(&value[start..end]) {
-                    decoded_values.push(DecodedValue {
-                        source,
-                        name: Cow::Owned(if name.is_empty() {
-                            "b64q".to_string()
-                        } else {
-                            format!("{name}.b64q")
-                        }),
-                        decoded: Cow::Owned(decoded),
-                        field: true,
-                    });
-                    pushed += 1;
+    for index in layer {
+        // Collect the decoded runs first: `decoded_values` cannot be pushed
+        // to while `value` is borrowed, and the old snapshot copied every
+        // candidate value just to work around that.
+        let mut runs: Vec<String> = Vec::new();
+        {
+            let value = &decoded_values[index].decoded;
+            let bytes = value.as_bytes();
+            let mut i = 0usize;
+            while i + 1 < bytes.len() && runs.len() < 4 {
+                // Run must open right behind a string quote. Single quotes
+                // count too: SQL/Python string literals carry payloads the
+                // same way (`{'id': 'MCcgfHwg…='}` unwraps to a
+                // UNION/tautology chain), and the white corpus's only
+                // single-quoted runs are camelCase API names that the
+                // printability gate inside [`b64_decode_value`] rejects
+                // after decoding.
+                if bytes[i] != b'"' && bytes[i] != b'\'' {
+                    i += 1;
+                    continue;
                 }
-                i = end + 1;
-            } else {
-                i = end.max(start + 1);
+                let quote = bytes[i];
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric()
+                        || bytes[end] == b'+'
+                        || bytes[end] == b'/'
+                        || bytes[end] == b'=')
+                {
+                    end += 1;
+                }
+                let run_len = end - start;
+                // Close straight into the matching quote; padding may
+                // precede it.
+                if run_len >= 16 && end < bytes.len() && bytes[end] == quote {
+                    if let Some(decoded) = b64_decode_value(&value[start..end])
+                    {
+                        runs.push(decoded);
+                    }
+                    i = end + 1;
+                } else {
+                    i = end.max(start + 1);
+                }
             }
+        }
+        let source = decoded_values[index].source;
+        for decoded in runs {
+            let name = Cow::Owned(if decoded_values[index].name.is_empty() {
+                "b64q".to_string()
+            } else {
+                format!("{}.b64q", decoded_values[index].name)
+            });
+            decoded_values.push(DecodedValue {
+                source,
+                name,
+                decoded: Cow::Owned(decoded),
+                field: true,
+            });
         }
     }
 }
@@ -1394,7 +1405,7 @@ fn parse_cookies<'a>(
     header: &'a str,
     max_decode_layers: usize,
     decode_escapes: bool,
-    cookies: &mut Vec<(String, String)>,
+    cookies: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     decoded_values: &mut Vec<DecodedValue<'a>>,
 ) {
     for pair in header.split(';') {
@@ -1408,7 +1419,7 @@ fn parse_cookies<'a>(
         };
         let key_decoded = multi_decode(k, max_decode_layers);
         let val_decoded = decode_value(v, max_decode_layers, decode_escapes);
-        cookies.push((key_decoded.to_string(), val_decoded.to_string()));
+        cookies.push((key_decoded.clone(), val_decoded.clone()));
         decoded_values.push(DecodedValue {
             source: ValueSource::Cookie,
             name: key_decoded,
@@ -1491,13 +1502,12 @@ mod tests {
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/foo/bar");
         assert_eq!(req.full_uri, "/foo/bar?x=1&y=hello world");
-        assert_eq!(
-            req.cookies,
-            vec![
-                ("a".to_string(), "1".to_string()),
-                ("b".to_string(), "hello world".to_string()),
-            ]
-        );
+        let cookies: Vec<(&str, &str)> = req
+            .cookies
+            .iter()
+            .map(|(k, v)| (k.as_ref(), v.as_ref()))
+            .collect();
+        assert_eq!(cookies, vec![("a", "1"), ("b", "hello world")]);
         // path + 2 query keys + 2 query values + UA + 2 cookies
         assert_eq!(req.decoded_values.len(), 8);
     }

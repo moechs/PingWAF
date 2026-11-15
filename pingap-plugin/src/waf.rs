@@ -1883,7 +1883,7 @@ impl RateLimitPolicy {
 /// [`EvalContext`] borrows from this state plus the request data.
 struct ExpressionState {
     full_uri: std::cell::OnceCell<String>,
-    cookies: std::cell::OnceCell<Vec<(String, String)>>,
+    cookies: std::cell::OnceCell<Vec<(Cow<'static, str>, Cow<'static, str>)>>,
 }
 
 impl ExpressionState {
@@ -1938,7 +1938,9 @@ impl ExpressionState {
 }
 
 /// Parses the `Cookie` header into name/value pairs.
-fn parse_cookies(headers: &[(String, String)]) -> Vec<(String, String)> {
+fn parse_cookies(
+    headers: &[(String, String)],
+) -> Vec<(Cow<'static, str>, Cow<'static, str>)> {
     let Some(raw) = headers
         .iter()
         .find(|(k, _)| k == "cookie")
@@ -1949,7 +1951,10 @@ fn parse_cookies(headers: &[(String, String)]) -> Vec<(String, String)> {
     raw.split(';')
         .filter_map(|pair| {
             let (name, value) = pair.trim().split_once('=')?;
-            Some((name.trim().to_string(), value.trim().to_string()))
+            Some((
+                Cow::Owned(name.trim().to_string()),
+                Cow::Owned(value.trim().to_string()),
+            ))
         })
         .collect()
 }

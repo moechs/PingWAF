@@ -16,6 +16,7 @@
 //! value    := STRING | NUMBER | BOOL | "{" (STRING|NUMBER)+ "}"
 //! ```
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
@@ -715,7 +716,7 @@ pub struct EvalContext<'a> {
     pub body: Option<&'a str>,
     /// Lower-cased header names paired with original-cased values.
     pub headers: &'a [(String, String)],
-    pub cookies: &'a [(String, String)],
+    pub cookies: &'a [(Cow<'a, str>, Cow<'a, str>)],
     pub client_ip: &'a str,
     pub parsed_ip: Option<IpAddr>,
     pub country_code: Option<&'a str>,
@@ -742,7 +743,7 @@ impl EvalContext<'_> {
         self.cookies
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+            .map(|(_, v)| &**v)
     }
 }
 
@@ -970,7 +971,7 @@ mod tests {
     /// Owns the data the borrowed [`EvalContext`] refers to.
     struct TestCtx {
         headers: Vec<(String, String)>,
-        cookies: Vec<(String, String)>,
+        cookies: Vec<(Cow<'static, str>, Cow<'static, str>)>,
     }
 
     impl TestCtx {

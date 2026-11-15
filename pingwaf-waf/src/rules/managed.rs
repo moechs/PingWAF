@@ -400,6 +400,8 @@ pub(crate) fn managed_rule_category(
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
     use crate::rules::expression::{evaluate, EvalContext};
 
@@ -451,7 +453,7 @@ mod tests {
     fn request_ctx<'a>(
         body: Option<&'a str>,
         headers: &'a [(String, String)],
-        cookies: &'a [(String, String)],
+        cookies: &'a [(Cow<'a, str>, Cow<'a, str>)],
     ) -> EvalContext<'a> {
         EvalContext {
             body,
@@ -468,10 +470,10 @@ mod tests {
         )]
     }
 
-    fn session_cookie() -> Vec<(String, String)> {
+    fn session_cookie() -> Vec<(Cow<'static, str>, Cow<'static, str>)> {
         vec![(
-            "PHPSESSID".to_string(),
-            "abcdefghijklmnopqrstuvwxyz".to_string(),
+            Cow::Borrowed("PHPSESSID"),
+            Cow::Borrowed("abcdefghijklmnopqrstuvwxyz"),
         )]
     }
 
@@ -724,7 +726,8 @@ mod tests {
         ));
 
         // 9. a session id shorter than PHP's minimum is not the shape either.
-        let short_cookie = vec![("PHPSESSID".to_string(), "abc".to_string())];
+        let short_cookie =
+            vec![(Cow::Borrowed("PHPSESSID"), Cow::Borrowed("abc"))];
         assert!(!evaluate(
             &rule.expression,
             &request_ctx(Some(progress), &ct, &short_cookie)
