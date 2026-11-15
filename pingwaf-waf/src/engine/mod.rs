@@ -711,9 +711,13 @@ impl WafEngine {
     /// holds every rule (including the managed ones), so the map was a second
     /// copy of the same strings for each site.
     pub fn rule_name(&self, id: &str) -> Option<&str> {
+        // Managed rules are excluded on purpose: the plugin's old per-site
+        // map only covered custom rules, and the event's `rule_name` for a
+        // managed-rule hit is empty by contract. Keep that behaviour so the
+        // access/security event payload does not change.
         self.rules
             .iter()
-            .find(|rule| rule.id == id)
+            .find(|rule| rule.id == id && !rule.id.starts_with("PINGWAF-"))
             .map(|rule| rule.name.as_str())
     }
 
@@ -2640,6 +2644,28 @@ mod tests {
         let v = e.inspect(&req("GET", "/secret/data", ""));
         assert!(matches!(v.action, WafAction::Block | WafAction::Monitor));
         assert!(v.matched_rules.contains(&"BLOCK-SECRET".to_string()));
+    }
+
+    #[test]
+    fn rule_name_lookup_covers_custom_rules_only() {
+        let custom = CompiledRule::compile(
+            "CUSTOM-NAME",
+            "custom display name",
+            r#"http.request.uri.path starts_with "/x""#,
+            RuleAction::Block,
+            3,
+            Vec::new(),
+        )
+        .unwrap();
+        let e = WafEngine::new(&WafEngineConfig {
+            rules: vec![custom],
+            ..Default::default()
+        });
+        assert_eq!(e.rule_name("CUSTOM-NAME"), Some("custom display name"));
+        // Managed rules are excluded: the plugin's old per-site name map only
+        // covered custom rules, so a managed-rule event carries no name.
+        assert_eq!(e.rule_name("PINGWAF-1001"), None);
+        assert_eq!(e.rule_name("missing"), None);
     }
 
     /// L3-006: when a custom rule enforces the block, `enforced_rule_id`

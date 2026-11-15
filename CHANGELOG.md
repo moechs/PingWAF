@@ -106,6 +106,12 @@ verbatim for reference and attribution, and is not maintained here.
   contexts on the next request. The new bound leaves headroom for growth at
   single-digit MB worst case across the per-host maps.
 
+- **The per-site rule-name map is gone.** The plugin kept an `id -> name` map
+  for every custom rule on every site, duplicating strings the engine already
+  holds (~1.6 MB at 1000 sites × 20 rules). Security events now resolve the
+  name through the site engine on the event path only; managed rules still
+  report no name, matching the old payload exactly.
+
 ### Changed
 
 - **`detect_sqli` returns an empty fingerprint for non-detections.** The
