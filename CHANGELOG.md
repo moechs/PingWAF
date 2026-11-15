@@ -10,6 +10,8 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+## [PingWAF 0.32.28] — 2026-11-15
+
 ### Security
 
 - **The host installer now verifies the release asset before running it.** It
