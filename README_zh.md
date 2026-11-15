@@ -230,7 +230,7 @@ PINGWAF_CONFIG=/etc/pingwaf/pingwaf.toml pingwaf all-in-one   # 等价写法
 | `PINGWAF_DB_URL` | `postgres://pingwaf:pingwaf@localhost:5432/pingwaf` | PostgreSQL DSN |
 | `PINGWAF_ADMIN_ADDR` | `0.0.0.0:9080` | REST API + 控制台监听地址 |
 | `PINGWAF_GRPC_ADDR` | `0.0.0.0:9090` | gRPC 控制面监听地址 |
-| `PINGWAF_JWT_SECRET` | `change-me-in-production` | JWT 签名密钥（**≥ 16 字符**，生产必改） |
+| `PINGWAF_JWT_SECRET` | `change-me-in-production` | JWT 签名密钥（**32 字节随机**，`openssl rand -hex 32`；生产必改） |
 | `PINGWAF_ADMIN_EMAIL` | `admin@pingwaf.local` | 初始管理员邮箱 |
 | `PINGWAF_ADMIN_PASSWORD` | `pingwaf123` | 初始管理员密码（**生产必改**） |
 | `PINGWAF_ALLOW_REGISTRATION` | `true` | `POST /api/v1/auth/register` 是否接受注册（`docker-compose.yml` 已将其设为 `false`） |

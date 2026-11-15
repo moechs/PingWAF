@@ -10,6 +10,23 @@
     "retentionWindow": "保留时长",
     "toggleSubscription": "切换 {{name}} 的订阅"
   },
+  "mobile": {
+    "scrollableTable": "可横向滚动的表格 — 左右滑动查看全部列",
+    "logsTable": "日志表格 — 左右滑动查看全部列",
+    "sitesTable": "站点表格 — 左右滑动查看全部列"
+  },
+  "logs": {
+    "unknownField": "未知字段“{{field}}”",
+    "invalidValue": "{{field}} 的取值“{{value}}”无效",
+    "didYouMean": "是否想用：",
+    "useCandidate": "使用 {{token}}",
+    "fixBeforeSearch": "未执行搜索 — 请先修正高亮的词元。",
+    "statusValues": "请使用 4xx/5xx 或三位状态码。",
+    "methodValues": "请使用 GET、POST、PUT、PATCH、DELETE、HEAD 或 OPTIONS。",
+    "actionValues": "请使用 block、challenge、js_challenge、log 或 allow。",
+    "cacheValues": "请使用 hit、miss 或 bypass。",
+    "latencyValues": "请填写毫秒数，例如 latency:>200。"
+  },
   "system": {
     "title": "System 观测",
     "subtitle": "控制面的墙钟耗时归因——占比为墙钟耗时占比，非 CPU 占比。",
@@ -131,7 +148,14 @@
     "noResults": "无结果",
     "toggleTheme": "切换暗色主题",
     "toggleLanguage": "切换语言",
-    "goToSettings": "进入设置"
+    "goToSettings": "进入设置",
+    "newSite": "新建站点",
+    "openLogs": "打开流量日志",
+    "unblockIp": "解封 IP",
+    "openDocs": "打开文档",
+    "recent": "最近使用",
+    "shortcuts": "↑↓ 选择 · ↵ 执行 · esc 关闭",
+    "noRecent": "输入以搜索页面、站点与动作"
   },
   "common": {
     "save": "保存",
@@ -290,6 +314,10 @@
     "next": "下一页",
     "showing": "{{from}}–{{to}} / 共 {{total}} 条"
   },
+  "format": {
+    "timezone": "时区：{{zone}}",
+    "rawValue": "原始值：{{value}}"
+  },
   "errors": {
     "unauthorized": "会话已过期",
     "forbidden": "权限不足",
@@ -317,7 +345,14 @@
     "unknownHint": "发生意外错误，请重试。",
     "invalidCredentials": "邮箱或密码不正确。请检查邮箱与密码后重试。",
     "domainConflict": "该域名已被其他站点使用。请更换域名，或编辑现有站点。",
-    "expressionInvalid": "表达式不合法。请检查语法与字段名后重试。"
+    "expressionInvalid": "表达式不合法。请检查语法与字段名后重试。",
+    "timeoutTitle": "请求超时",
+    "timeoutHint": "控制面未在预期时间内响应。请检查网络链路或前置代理后重试。",
+    "rateLimitedTitle": "请求过于频繁",
+    "rateLimitedHint": "控制面正在对该客户端限流，请稍候再试。",
+    "openDocs": "查看文档",
+    "reference": "参考编号：{{id}}",
+    "retryIn": "{{seconds}} 秒后可重试"
   },
   "auth": {
     "loginTitle": "登录 PingWAF",
@@ -405,6 +440,20 @@
       "sitesTracked": "共 {{count}} 个站点",
       "noSiteTraffic": "暂无站点流量",
       "noSiteTrafficDescription": "站点收到请求后，这里会展示分站点流量曲线。",
+      "metricHelp": {
+        "requests": "所选时间窗内由边缘节点处理的请求数。",
+        "egress": "所选时间窗内返回给客户端的响应字节数。",
+        "blocked": "所选时间窗内被 WAF 拦截的请求数。",
+        "security": "所选时间窗内记录的安全事件数。",
+        "agents": "已注册节点中当前在线的数量。",
+        "cache": "所选时间窗内缓存命中 ÷（命中 + 未命中）。",
+        "latency": "所选时间窗内的平均请求总延迟。"
+      },
+      "metricWindow": "时间窗：最近 {{hours}} 小时",
+      "metricSample": "样本量：{{count}}",
+      "noDataInWindow": "当前时间窗无数据",
+      "viewDetails": "查看明细",
+      "metricHelpLabel": "关于{{metric}}",
       "topPaths": "热点路径",
       "topPathsDescription": "所选时间窗口内请求最多的路径。",
       "statusCodes": "状态码分布",
@@ -2211,6 +2260,12 @@
       "tlsGenerateConfirm": "当前证书会立即被替换，在信任新证书前浏览器会给出警告。仅建议在测试环境或控制台不对外暴露时使用。",
       "tlsDefaultSans": "将使用的备用名称",
       "tlsApplyHint": "变更立即生效：监听器就地切换证书，已连接的浏览器需刷新后才能看到新证书。",
+      "tlsFixCta": "修复证书",
+      "tlsRequestHint": "上传由你的 CA 签发的证书，或复制下方 openssl 命令生成带正确 SAN 的私钥与 CSR。",
+      "tlsAcmeHint": "控制面使用此处上传的证书；ACME 签发按站点在边缘配置。",
+      "tlsCopyOpenssl": "复制 openssl 命令",
+      "tlsOpensslCopied": "已复制 openssl 命令",
+      "tlsOpenDocs": "证书指南",
       "tlsNoCertificate": "尚未存储证书",
       "tlsNoCertificateDescription": "启用 TLS 后首次启动会自动生成一对自签名证书。",
       "observationMode": "观察模式",

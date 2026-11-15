@@ -10,6 +10,64 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+### Security
+
+- **Release artifacts now carry supply-chain metadata.** The release workflow
+  attests both tarballs with signed SLSA build provenance
+  (`gh attestation verify pingwaf-linux-amd64.tar.gz --repo …`) and publishes an
+  SPDX SBOM for each archive. Container attestations remain off because the
+  per-arch tags must stay plain manifests for `docker manifest create`; the
+  reason and the `buildx imagetools create` follow-up are documented in the
+  workflow.
+
+- **Secrets can stay out of process arguments.** `pingwaf` and the maintenance
+  commands accept `--db-url-file` / `--api-key-file` (or
+  `PINGWAF_DB_URL_FILE` / `PINGWAF_API_KEY_FILE`), trim the file content and
+  prefer it over an inline value; passing `--db-url`/`--api-key` on the command
+  line now warns that the value is visible in the process list.
+
+- **Installer permissions are tightened.** `/etc/pingwaf` is `0750
+  root:pingwaf`, the config is `0640 root:pingwaf`, `/var/lib/pingwaf` is
+  `0750 pingwaf`, and `pingwaf.env` stays `0600 root:root`; the closing summary
+  points at backups, warns against rotating the JWT/instance keys and prints the
+  upgrade, rollback, backup and uninstall commands. The compose installer
+  resolves the latest release tag instead of defaulting to `main`, and the host
+  cleanup script keeps the newest two PingWAF images by default
+  (`--keep-images N`).
+
+### Added
+
+- **Mobile console.** Logs and sites switch to card lists below 768px (no more
+  horizontal blind scrolling), every interactive control gets a ≥44px touch
+  target, tabs stay visible while scrolling, and the log query editor validates
+  fields and values inline with "did you mean" suggestions and one-click fixes.
+
+- **Faster navigation and clearer metrics.** The ⌘K palette now runs actions
+  (new site, open logs, unblock IP, switch theme/language, open docs) and
+  remembers recent commands; the dashboard shows a definition, time window and
+  sample size for each KPI, empty windows say so instead of showing `0`, and
+  compact numbers reveal their exact value on hover.
+
+- **Actionable error states.** Failures are classified (401/403/404/409/422/429/
+  5xx/network/timeout) with a title, a suggested next step, a documentation
+  link, a client-minted support reference and exponential retry backoff; toast
+  errors are announced assertively and carry optional action links.
+
+- **Web-protection page reorganised** into six entries — overview, engine &
+  detection, managed rules, custom rules, path exceptions, rate limiting &
+  challenge — with the overview first and old `?tab=` deep links rewritten to
+  the new vocabulary. The console HTTPS card now offers a certificate fix CTA
+  with a copyable `openssl` command.
+
+### Changed
+
+- JWT secret guidance is consistent everywhere: 32 random bytes
+  (`openssl rand -hex 32`), with the server's 16-character floor documented as
+  a minimum rather than the recommendation. `docs/modules.md` gains a trust
+  boundary section, `docs/api.md` documents the response security headers, and
+  the Chinese docs summarise the security chapters.
+
+
 ## [PingWAF 0.32.28] — 2026-11-15
 
 ### Security

@@ -2,7 +2,18 @@ import { useEffect, useMemo, useState } from 'react'
 import { Navigate, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Cloud, Gauge, Lightning, Path as PathIcon, ShieldCheck, Sliders, Timer, Warning } from '@phosphor-icons/react'
+import {
+  Cloud,
+  Eye,
+  Gauge,
+  Lightning,
+  Path as PathIcon,
+  Pulse,
+  ShieldCheck,
+  Sliders,
+  Timer,
+  Warning,
+} from '@phosphor-icons/react'
 import { PageHeader } from '@/components/PageHeader'
 import { Tabs } from '@/components/ui/Tabs'
 import { Switch } from '@/components/ui/Switch'
@@ -12,12 +23,14 @@ import { SkeletonCard } from '@/components/ui/Skeleton'
 import { Input } from '@/components/ui/Input'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { useToast } from '@/components/ui/Toast'
-import { challengeApi, challengeKeys } from '@/api/challenge'
+import { ErrorState } from '@/components/ErrorState'
 import { wafSettingsApi, wafSettingsKeys } from '@/api/wafSettings'
+import { configVersionsApi } from '@/api/configVersions'
 import { ruleKeys, rulesApi } from '@/api/rules'
 import { RULE_MODES, type RuleMode, type WafSettings } from '@/api/types'
 import { useCanWrite, useSiteDetail, useWafSettingsMutation } from '@/hooks'
 import { cn } from '@/lib/utils'
+import { formatDateTime } from '@/lib/format'
 import { PostureOverview, type PostureTarget } from './PostureOverview'
 import { ManagedRulesPanel } from './ManagedRulesPanel'
 import { CustomRulesPanel } from './CustomRulesPanel'
@@ -29,9 +42,10 @@ import {
   BODY_STAGE_TIMEOUT_MIN,
   normaliseBodyStageTimeout,
 } from '@/lib/bodyStageTimeout'
-import { parseTab, type ProtectionTab } from '@/lib/protectionTab'
+import { isLegacyTab, parseTab, type ProtectionTab } from '@/lib/protectionTab'
 
-/** Body-stage inspection budget — constants come from `@/lib/bodyStageTimeout`. */
+/** How many recent configuration versions the overview lists. */
+const RECENT_CHANGES_LIMIT = 5
 
 function SectionHeading({ title, hint }: { title: string; hint?: string }) {
   return (
@@ -43,15 +57,23 @@ function SectionHeading({ title, hint }: { title: string; hint?: string }) {
 }
 
 /**
- * Web protection for one site, laid out around three concepts: the WAF
- * engine switch, detection grading (under attack / deep inspection), and
- * enforcement (managed categories, custom rules, rate limiting) — fronted by
- * a live posture card aggregating what the data plane actually enforces.
+ * Web protection for one site, organised as six entries (UX-09):
+ *
+ * - **Overview** — the live posture card, the site-wide enforcement-mode
+ *   switch (the downgrade path carries a confirmation) and the recent
+ *   configuration changes.
+ * - **Engine & detection** — the WAF engine switch, deep inspection, detection
+ *   sensitivity, the body-stage budget and the deployment-wide observation
+ *   mode.
+ * - **Managed rules / Custom rules / Path exceptions / Rate limiting &
+ *   challenge** — the enforcement surfaces, one per tab.
+ *
+ * `?tab=` remains the deep-link contract: older values are translated by
+ * `parseTab` and rewritten in place, so a bookmark keeps working and the
+ * address bar always shows the current vocabulary.
  */
 export function ProtectionPage() {
   const { t } = useTranslation()
-  const toast = useToast()
-  const queryClient = useQueryClient()
   const canWrite = useCanWrite()
   const navigate = useNavigate()
   const { siteId = '' } = useParams<{ siteId: string }>()
@@ -74,21 +96,16 @@ export function ProtectionPage() {
     }
   }
 
-  // Rewrite a legacy `?tab=settings|rules` link in place so the address bar
-  // always shows the current vocabulary — every other param (`?rule=`) stays.
+  // Rewrite a legacy `?tab=` link in place so the address bar always shows the
+  // current vocabulary — every other param (`?rule=`) stays.
   useEffect(() => {
     const raw = searchParams.get('tab')
-    if (raw !== 'settings' && raw !== 'rules') return
+    if (!isLegacyTab(raw)) return
     const params = new URLSearchParams(searchParams)
     params.set('tab', parseTab(raw))
     setSearchParams(params, { replace: true })
   }, [searchParams, setSearchParams])
 
-  const challengeQuery = useQuery({
-    queryKey: challengeKeys.config(siteId),
-    queryFn: () => challengeApi.get(siteId),
-    enabled: Boolean(siteId),
-  })
   const settingsQuery = useQuery({
     queryKey: wafSettingsKeys.settings(siteId),
     queryFn: () => wafSettingsApi.get(siteId),
@@ -98,38 +115,20 @@ export function ProtectionPage() {
   const updateSettings = useWafSettingsMutation(siteId)
   const engineOn = settings?.waf_enabled ?? true
 
-  const underAttack = challengeQuery.data?.under_attack_mode ?? false
-
-  const setUnderAttack = useMutation({
-    mutationFn: (enabled: boolean) =>
-      challengeApi.update(siteId, {
-        // The challenge gate must be on for the banner to mean anything; the
-        // server forces the same pairing.
-        under_attack_mode: enabled,
-        ...(enabled ? { enabled: true } : {}),
-      }),
-    onSuccess: (saved) => {
-      queryClient.setQueryData(challengeKeys.config(siteId), saved)
-      toast.success(
-        saved.under_attack_mode
-          ? t('pages.protection.underAttackOn')
-          : t('pages.protection.underAttackOff'),
-      )
-      void queryClient.invalidateQueries({ queryKey: challengeKeys.all(siteId) })
-    },
-    onError: (error) => {
-      toast.error(
-        t('pages.protection.updateFailed'),
-        error instanceof Error ? error.message : undefined,
-      )
-    },
-  })
-
-  const [confirmUnderAttack, setConfirmUnderAttack] = useState(false)
   // UX-04: turning the engine off is the one switch that disables every other
   // protection control, so it takes an explicit acknowledgement first.
   const [confirmEngineOff, setConfirmEngineOff] = useState(false)
   const [engineOffAck, setEngineOffAck] = useState(false)
+
+  const tabLabels: Record<ProtectionTab, string> = {
+    // The overview reuses the site-detail "Overview" label.
+    overview: t('pages.siteDetail.overview'),
+    engine: `${t('pages.protection.engineTitle')} · ${t('pages.protection.detectionTitle')}`,
+    managed: t('pages.protection.tabManaged'),
+    custom: t('pages.protection.tabCustom'),
+    paths: t('pages.protection.tabPaths'),
+    cc: t('pages.protection.tabCc'),
+  }
 
   return (
     <div className="animate-slide-up">
@@ -139,7 +138,7 @@ export function ProtectionPage() {
       />
 
       {/* UX-04: a disabled engine is a persistent, page-level state — keep it
-          visible instead of hiding it inside the switch card. */}
+          visible on every tab instead of hiding it inside the engine card. */}
       {!settingsQuery.isPending && !engineOn && (
         <div
           role="status"
@@ -169,278 +168,238 @@ export function ProtectionPage() {
         </div>
       )}
 
-      {/* ── Current effective posture ─────────────────────────────────── */}
-      <div className="mb-5">
-        <PostureOverview siteId={siteId} onNavigate={handlePostureNavigate} />
-      </div>
-
-      {/* ── WAF Engine ────────────────────────────────────────────────── */}
-      <section className="mb-5">
-        <SectionHeading
-          title={t('pages.protection.engineTitle')}
-          hint={t('pages.protection.engineHint')}
-        />
-        {settingsQuery.isPending ? (
-          <SkeletonCard className="h-16" />
-        ) : (
-          <div
-            className={`flex flex-wrap items-center justify-between gap-4 rounded-lg border px-4 py-3 ${
-              engineOn ? 'border-line bg-elevated' : 'border-warning/45 bg-warning/10'
-            }`}
-          >
-            <span className="flex min-w-0 items-center gap-3">
-              <span
-                className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
-                  engineOn ? 'bg-brand-soft text-fg-brand-strong' : 'bg-warning/15 text-fg-warning'
-                }`}
-              >
-                <ShieldCheck weight="duotone" className="h-5 w-5" />
-              </span>
-              <span className="min-w-0">
-                <span className="block text-sm font-semibold text-fg-strong">
-                  {t('pages.protection.engineTitle')}
-                </span>
-                <span className="mt-0.5 block text-[13px] text-fg-subtle">
-                  {t('pages.protection.engineCardHint')}
-                </span>
-                {!engineOn && (
-                  <span className="mt-1.5 block text-xs text-fg-warning">
-                    {t('pages.protection.engineOffWarn')}
-                  </span>
-                )}
-              </span>
-            </span>
-            <Switch
-              size="md"
-              checked={engineOn}
-              disabled={!canWrite || updateSettings.isPending}
-              aria-label={t('pages.protection.engineTitle')}
-              onCheckedChange={(waf_enabled) => {
-                if (waf_enabled) {
-                  updateSettings.mutate({ waf_enabled: true })
-                  return
-                }
-                setEngineOffAck(false)
-                setConfirmEngineOff(true)
-              }}
-            />
-          </div>
-        )}
-      </section>
-
-      {/* ── Detection and enforcement share one row on wide screens ────── */}
-      <div className="grid items-start gap-5 lg:grid-cols-2">
-      <section className="mb-5 lg:mb-0">
-        <SectionHeading
-          title={t('pages.protection.detectionTitle')}
-          hint={t('pages.protection.detectionHint')}
-        />
-        <div className="grid gap-4">
-        {challengeQuery.isPending ? (
-          <SkeletonCard className="h-16" />
-        ) : (
-          <div
-            className={`flex flex-wrap items-center justify-between gap-4 rounded-lg border px-4 py-3 ${
-              underAttack
-                ? 'border-danger/45 bg-danger/10'
-                : 'border-line bg-elevated'
-            }`}
-          >
-            <span className="flex min-w-0 items-center gap-3">
-              <span
-                className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
-                  underAttack
-                    ? 'bg-danger/15 text-fg-danger'
-                    : 'bg-recessed text-fg-subtle'
-                }`}
-              >
-                {underAttack ? (
-                  <Warning weight="fill" className="h-5 w-5" />
-                ) : (
-                  <ShieldCheck weight="duotone" className="h-5 w-5" />
-                )}
-              </span>
-              <span className="min-w-0">
-                <span className="block text-sm font-semibold text-fg-strong">
-                  {underAttack
-                    ? t('pages.protection.underAttackActive')
-                    : t('pages.protection.underAttackTitle')}
-                </span>
-                <span className="mt-0.5 block text-[13px] text-fg-subtle">
-                  {underAttack
-                    ? t('pages.protection.underAttackActiveHint')
-                    : t('pages.protection.underAttackHint')}
-                </span>
-              </span>
-            </span>
-            {canWrite && (
-              <Switch
-                size="md"
-                checked={underAttack}
-                disabled={!canWrite || setUnderAttack.isPending}
-                aria-label={t('pages.protection.underAttackTitle')}
-                onCheckedChange={(enabled) => {
-                  if (enabled) {
-                    setConfirmUnderAttack(true)
-                  } else {
-                    setUnderAttack.mutate(false)
-                  }
-                }}
-              />
-            )}
-          </div>
-        )}
-        {settingsQuery.isPending ? (
-          <SkeletonCard className="h-16" />
-        ) : (
-          <div
-            className={`flex flex-wrap items-center justify-between gap-4 rounded-lg border px-4 py-3 ${
-              settings?.advanced_mode
-                ? 'border-danger/45 bg-danger/10'
-                : 'border-line bg-elevated'
-            }`}
-          >
-            <span className="flex min-w-0 items-center gap-3">
-              <span
-                className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
-                  settings?.advanced_mode
-                    ? 'bg-danger/15 text-fg-danger'
-                    : 'bg-recessed text-fg-subtle'
-                }`}
-              >
-                <Lightning weight="duotone" className="h-5 w-5" />
-              </span>
-              <span className="min-w-0">
-                <span className="block text-sm font-semibold text-fg-strong">
-                  {t('pages.protection.deepInspection')}
-                </span>
-                <span className="mt-0.5 block text-[13px] text-fg-subtle">
-                  {t('pages.protection.deepInspectionHint')}
-                </span>
-                <span className="mt-1.5 flex items-center gap-1.5 text-xs text-fg-warning">
-                  <Gauge weight="duotone" className="h-3.5 w-3.5 shrink-0" />
-                  {t('pages.protection.performanceHint')}
-                </span>
-              </span>
-            </span>
-            <Switch
-              size="md"
-              checked={settings?.advanced_mode ?? false}
-              disabled={!canWrite || updateSettings.isPending}
-              aria-label={t('pages.protection.deepInspection')}
-              onCheckedChange={(advanced_mode) => updateSettings.mutate({ advanced_mode })}
-            />
-          </div>
-        )}
-        {settingsQuery.isPending ? (
-          <SkeletonCard className="h-16" />
-        ) : (
-          <div className="flex flex-wrap items-center justify-between gap-4 rounded-lg border border-line bg-elevated px-4 py-3">
-            <span className="flex min-w-0 items-center gap-3">
-              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-recessed text-fg-subtle">
-                <Gauge weight="duotone" className="h-5 w-5" />
-              </span>
-              <span className="min-w-0">
-                <span className="block text-sm font-semibold text-fg-strong">
-                  {t('pages.protection.paranoiaTitle')}
-                </span>
-                <span className="mt-0.5 block text-[13px] text-fg-subtle">
-                  {t('pages.protection.paranoiaCardHint')}
-                </span>
-                <span className="mt-2 flex items-center gap-1">
-                  {[1, 2, 3, 4].map((level) => {
-                    const active = (settings?.paranoia_level ?? 2) === level
-                    return (
-                      <button
-                        key={level}
-                        type="button"
-                        disabled={!canWrite || updateSettings.isPending}
-                        aria-label={`${t('pages.protection.paranoiaTitle')} ${level}`}
-                        onClick={() => updateSettings.mutate({ paranoia_level: level })}
-                        className={cn(
-                          'h-7 w-9 rounded-md border text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60',
-                          active
-                            ? 'border-brand bg-brand-soft text-fg-brand-strong'
-                            : 'border-line text-fg-subtle hover:border-fill hover:bg-recessed',
-                        )}
-                      >
-                        {level}
-                      </button>
-                    )
-                  })}
-                </span>
-              </span>
-            </span>
-          </div>
-        )}
-        <BodyStageTimeoutCard
-          settings={settings}
-          canWrite={canWrite}
-          pending={updateSettings.isPending}
-          onCommit={(secs) => updateSettings.mutate({ body_stage_timeout_secs: secs })}
-        />
-        </div>
-      </section>
-
-      {/* ── Enforcement ───────────────────────────────────────────────── */}
-      <section className="mb-5 lg:mb-0">
-        <SectionHeading
-          title={t('pages.protection.enforcementTitle')}
-          hint={t('pages.protection.enforcementHint')}
-        />
-        <EnforcementModeCard />
-      </section>
-      </div>
-
-      <section className="mt-5">
-        <Tabs
-          variant="pill"
-          className="mb-5"
-          value={tab}
-          onChange={setTab}
-          items={[
-            {
-              value: 'managed',
-              label: t('pages.protection.tabManaged'),
-              icon: <Sliders weight="duotone" className="h-4 w-4" />,
-            },
-            {
-              value: 'custom',
-              label: t('pages.protection.tabCustom'),
-              icon: <ShieldCheck weight="duotone" className="h-4 w-4" />,
-            },
-            {
-              value: 'cc',
-              label: t('pages.protection.tabCc'),
-              icon: <Cloud weight="duotone" className="h-4 w-4" />,
-            },
-            {
-              value: 'paths',
-              label: t('pages.protection.tabPaths'),
-              icon: <PathIcon weight="duotone" className="h-4 w-4" />,
-            },
-          ]}
-        />
-
-        {tab === 'managed' && <ManagedRulesPanel />}
-        {tab === 'custom' && <CustomRulesPanel />}
-        {tab === 'cc' && <MitigationPanel />}
-        {tab === 'paths' && <PathExceptionsPanel />}
-      </section>
-
-      <ConfirmDialog
-        open={confirmUnderAttack}
-        onClose={() => setConfirmUnderAttack(false)}
-        onConfirm={() => {
-          setConfirmUnderAttack(false)
-          setUnderAttack.mutate(true)
-        }}
-        tone="danger"
-        title={t('pages.protection.underAttackConfirmTitle')}
-        description={t('pages.protection.underAttackConfirmDescription')}
-        confirmLabel={t('pages.protection.underAttackCta')}
-        loading={setUnderAttack.isPending}
+      {/* Sticky so the entry points stay reachable while a long rule list
+          scrolls; the wrapper scrolls horizontally on narrow screens because
+          six labels do not fit a phone. The Tabs component already renders
+          real `role="tab"` buttons, so keyboard focus/activation is native. */}
+      <Tabs
+        variant="pill"
+        className="sticky top-0 z-20 mb-5 overflow-x-auto bg-base py-2"
+        value={tab}
+        onChange={setTab}
+        items={[
+          {
+            value: 'overview',
+            label: tabLabels.overview,
+            icon: <Pulse weight="duotone" className="h-4 w-4" />,
+          },
+          {
+            value: 'engine',
+            label: tabLabels.engine,
+            icon: <Lightning weight="duotone" className="h-4 w-4" />,
+          },
+          {
+            value: 'managed',
+            label: tabLabels.managed,
+            icon: <Sliders weight="duotone" className="h-4 w-4" />,
+          },
+          {
+            value: 'custom',
+            label: tabLabels.custom,
+            icon: <ShieldCheck weight="duotone" className="h-4 w-4" />,
+          },
+          {
+            value: 'paths',
+            label: tabLabels.paths,
+            icon: <PathIcon weight="duotone" className="h-4 w-4" />,
+          },
+          {
+            value: 'cc',
+            label: tabLabels.cc,
+            icon: <Cloud weight="duotone" className="h-4 w-4" />,
+          },
+        ]}
       />
+
+      {/* ── Overview: posture, high-risk switch, recent changes ──────────── */}
+      {tab === 'overview' && (
+        <div role="tabpanel" aria-label={tabLabels.overview} className="flex flex-col gap-5">
+          <PostureOverview siteId={siteId} onNavigate={handlePostureNavigate} />
+          <EnforcementModeCard />
+          <RecentChangesCard siteId={siteId} canWrite={canWrite} />
+        </div>
+      )}
+
+      {/* ── Engine & detection ──────────────────────────────────────────── */}
+      {tab === 'engine' && (
+        <div role="tabpanel" aria-label={tabLabels.engine}>
+          <section className="mb-6">
+            <SectionHeading
+              title={t('pages.protection.engineTitle')}
+              hint={t('pages.protection.engineHint')}
+            />
+            {settingsQuery.isPending ? (
+              <SkeletonCard className="h-16" />
+            ) : (
+              <div
+                className={`flex flex-wrap items-center justify-between gap-4 rounded-lg border px-4 py-3 ${
+                  engineOn ? 'border-line bg-elevated' : 'border-warning/45 bg-warning/10'
+                }`}
+              >
+                <span className="flex min-w-0 items-center gap-3">
+                  <span
+                    className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
+                      engineOn ? 'bg-brand-soft text-fg-brand-strong' : 'bg-warning/15 text-fg-warning'
+                    }`}
+                  >
+                    <ShieldCheck weight="duotone" className="h-5 w-5" />
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block text-sm font-semibold text-fg-strong">
+                      {t('pages.protection.engineTitle')}
+                    </span>
+                    <span className="mt-0.5 block text-[13px] text-fg-subtle">
+                      {t('pages.protection.engineCardHint')}
+                    </span>
+                    {!engineOn && (
+                      <span className="mt-1.5 block text-xs text-fg-warning">
+                        {t('pages.protection.engineOffWarn')}
+                      </span>
+                    )}
+                  </span>
+                </span>
+                <Switch
+                  size="md"
+                  checked={engineOn}
+                  disabled={!canWrite || updateSettings.isPending}
+                  aria-label={t('pages.protection.engineTitle')}
+                  onCheckedChange={(waf_enabled) => {
+                    if (waf_enabled) {
+                      updateSettings.mutate({ waf_enabled: true })
+                      return
+                    }
+                    setEngineOffAck(false)
+                    setConfirmEngineOff(true)
+                  }}
+                />
+              </div>
+            )}
+          </section>
+
+          <section>
+            <SectionHeading
+              title={t('pages.protection.detectionTitle')}
+              hint={t('pages.protection.detectionHint')}
+            />
+            <div className="flex flex-col gap-4">
+              <div className="grid items-start gap-4 lg:grid-cols-2">
+                {settingsQuery.isPending ? (
+                  <SkeletonCard className="h-16" />
+                ) : (
+                  <div
+                    className={`flex flex-wrap items-center justify-between gap-4 rounded-lg border px-4 py-3 ${
+                      settings?.advanced_mode
+                        ? 'border-danger/45 bg-danger/10'
+                        : 'border-line bg-elevated'
+                    }`}
+                  >
+                    <span className="flex min-w-0 items-center gap-3">
+                      <span
+                        className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
+                          settings?.advanced_mode
+                            ? 'bg-danger/15 text-fg-danger'
+                            : 'bg-recessed text-fg-subtle'
+                        }`}
+                      >
+                        <Lightning weight="duotone" className="h-5 w-5" />
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block text-sm font-semibold text-fg-strong">
+                          {t('pages.protection.deepInspection')}
+                        </span>
+                        <span className="mt-0.5 block text-[13px] text-fg-subtle">
+                          {t('pages.protection.deepInspectionHint')}
+                        </span>
+                        <span className="mt-1.5 flex items-center gap-1.5 text-xs text-fg-warning">
+                          <Gauge weight="duotone" className="h-3.5 w-3.5 shrink-0" />
+                          {t('pages.protection.performanceHint')}
+                        </span>
+                      </span>
+                    </span>
+                    <Switch
+                      size="md"
+                      checked={settings?.advanced_mode ?? false}
+                      disabled={!canWrite || updateSettings.isPending}
+                      aria-label={t('pages.protection.deepInspection')}
+                      onCheckedChange={(advanced_mode) => updateSettings.mutate({ advanced_mode })}
+                    />
+                  </div>
+                )}
+                {settingsQuery.isPending ? (
+                  <SkeletonCard className="h-16" />
+                ) : (
+                  <div className="flex flex-wrap items-center justify-between gap-4 rounded-lg border border-line bg-elevated px-4 py-3">
+                    <span className="flex min-w-0 items-center gap-3">
+                      <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-recessed text-fg-subtle">
+                        <Gauge weight="duotone" className="h-5 w-5" />
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block text-sm font-semibold text-fg-strong">
+                          {t('pages.protection.paranoiaTitle')}
+                        </span>
+                        <span className="mt-0.5 block text-[13px] text-fg-subtle">
+                          {t('pages.protection.paranoiaCardHint')}
+                        </span>
+                        <span className="mt-2 flex items-center gap-1">
+                          {[1, 2, 3, 4].map((level) => {
+                            const active = (settings?.paranoia_level ?? 2) === level
+                            return (
+                              <button
+                                key={level}
+                                type="button"
+                                disabled={!canWrite || updateSettings.isPending}
+                                aria-label={`${t('pages.protection.paranoiaTitle')} ${level}`}
+                                aria-pressed={active}
+                                onClick={() => updateSettings.mutate({ paranoia_level: level })}
+                                className={cn(
+                                  'h-7 w-9 rounded-md border text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60',
+                                  active
+                                    ? 'border-brand bg-brand-soft text-fg-brand-strong'
+                                    : 'border-line text-fg-subtle hover:border-fill hover:bg-recessed',
+                                )}
+                              >
+                                {level}
+                              </button>
+                            )
+                          })}
+                        </span>
+                      </span>
+                    </span>
+                  </div>
+                )}
+              </div>
+              <BodyStageTimeoutCard
+                settings={settings}
+                canWrite={canWrite}
+                pending={updateSettings.isPending}
+                onCommit={(secs) => updateSettings.mutate({ body_stage_timeout_secs: secs })}
+              />
+              <ObservationModeCard />
+            </div>
+          </section>
+        </div>
+      )}
+
+      {tab === 'managed' && (
+        <div role="tabpanel" aria-label={tabLabels.managed}>
+          <ManagedRulesPanel />
+        </div>
+      )}
+      {tab === 'custom' && (
+        <div role="tabpanel" aria-label={tabLabels.custom}>
+          <CustomRulesPanel />
+        </div>
+      )}
+      {tab === 'paths' && (
+        <div role="tabpanel" aria-label={tabLabels.paths}>
+          <PathExceptionsPanel />
+        </div>
+      )}
+      {tab === 'cc' && (
+        <div role="tabpanel" aria-label={tabLabels.cc}>
+          <MitigationPanel />
+        </div>
+      )}
 
       <ConfirmDialog
         open={confirmEngineOff}
@@ -477,12 +436,132 @@ export function ProtectionPage() {
 }
 
 /**
+ * The deployment-wide observation mode, reported on the engine tab.
+ *
+ * The switch itself is global (Settings → defense), not per site, so this card
+ * only states the state and what it means: with it on, every rule on this page
+ * detects but nothing is blocked.
+ */
+function ObservationModeCard() {
+  const { t } = useTranslation()
+  const { siteId = '' } = useParams<{ siteId: string }>()
+  const query = useQuery({
+    queryKey: wafSettingsKeys.posture(siteId),
+    queryFn: () => wafSettingsApi.posture(siteId),
+    enabled: Boolean(siteId),
+    staleTime: 30_000,
+  })
+  if (query.isPending) return <SkeletonCard className="h-16" />
+  const on = query.data?.enforcement.observation_mode ?? false
+
+  return (
+    <div
+      className={cn(
+        'flex flex-wrap items-center justify-between gap-4 rounded-lg border px-4 py-3',
+        on ? 'border-warning/45 bg-warning/10' : 'border-line bg-elevated',
+      )}
+    >
+      <span className="flex min-w-0 items-center gap-3">
+        <span
+          className={cn(
+            'flex h-10 w-10 shrink-0 items-center justify-center rounded-lg',
+            on ? 'bg-warning/15 text-fg-warning' : 'bg-recessed text-fg-subtle',
+          )}
+        >
+          <Eye weight="duotone" className="h-5 w-5" />
+        </span>
+        <span className="min-w-0">
+          <span className="block text-sm font-semibold text-fg-strong">
+            {t('pages.protection.postureObservation')}
+          </span>
+          {on && (
+            <span className="mt-0.5 block text-[13px] text-fg-subtle">
+              {t('pages.protection.observationModeHint')}
+            </span>
+          )}
+        </span>
+      </span>
+      <span className={cn('text-sm font-semibold', on ? 'text-fg-warning' : 'text-fg-subtle')}>
+        {on ? t('pages.protection.postureOn') : t('pages.protection.postureOff')}
+      </span>
+    </div>
+  )
+}
+
+/**
+ * The overview's "what changed lately" list: the newest configuration versions
+ * recorded for this site.
+ *
+ * `GET /config-versions` is administrator-only, so the card (and its request)
+ * is hidden for read-only accounts. It uses its own query key on purpose: the
+ * versions page caches a larger page under the shared
+ * `configVersionKeys.list(siteId)` key, and reusing that key here would
+ * truncate the other page's list to five rows.
+ */
+function RecentChangesCard({ siteId, canWrite }: { siteId: string; canWrite: boolean }) {
+  const { t } = useTranslation()
+  const navigate = useNavigate()
+  const query = useQuery({
+    queryKey: ['protection', 'recent-changes', siteId] as const,
+    queryFn: () => configVersionsApi.list(siteId, RECENT_CHANGES_LIMIT),
+    enabled: Boolean(siteId) && canWrite,
+  })
+
+  if (!canWrite) return null
+  const rows = query.data ?? []
+
+  return (
+    <Card>
+      <div className="flex flex-wrap items-center justify-between gap-3 px-4 pt-4">
+        <h3 className="text-sm font-semibold text-fg-strong">
+          {t('common.lastUpdated')}
+        </h3>
+        <Button size="sm" variant="secondary" onClick={() => navigate('/config-versions')}>
+          {t('common.viewAll')}
+        </Button>
+      </div>
+      <CardBody className="flex flex-col gap-2">
+        {query.isPending ? (
+          <SkeletonCard className="h-16" />
+        ) : query.isError ? (
+          <ErrorState
+            error={query.error}
+            onRetry={() => void query.refetch()}
+            variant="inline"
+          />
+        ) : rows.length === 0 ? (
+          <p className="text-[13px] text-fg-subtle">
+            {t('pages.configVersions.emptyTitle')}
+          </p>
+        ) : (
+          <ul className="flex flex-col gap-2">
+            {rows.map((row) => (
+              <li
+                key={row.id}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-line bg-recessed px-3 py-2 text-[13px]"
+              >
+                <span className="text-fg">{formatDateTime(row.created_at)}</span>
+                <span className="text-fg-subtle">
+                  {t(`pages.configVersions.sources.${row.source}`, row.source)}
+                  {' · '}
+                  {row.actor ?? t('pages.configVersions.actorUnknown')}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardBody>
+    </Card>
+  )
+}
+
+/**
  * Site-level enforcement mode — the master switch the WAF engine runs in
  * (block > monitor > off), stored on the site's WAF settings row and shipped
  * to the data plane verbatim. Custom rules keep their per-rule mode; a
  * monitor-mode rule only downgrades its own action while the site is in
- * block. Kept out of the custom-rules panel so the Enforcement section opens
- * with the posture-level control.
+ * block. Lives on the overview: it is the site-wide downgrade switch, so it is
+ * surfaced next to the posture it changes.
  */
 function EnforcementModeCard() {
   const { t } = useTranslation()
@@ -529,6 +608,11 @@ function EnforcementModeCard() {
       })
       void queryClient.invalidateQueries({
         queryKey: wafSettingsKeys.posture(siteId),
+      })
+      // A mode change is recorded as a configuration version, so the overview's
+      // "recent changes" list is stale too.
+      void queryClient.invalidateQueries({
+        queryKey: ['protection', 'recent-changes', siteId],
       })
     },
     onError: (error) => {

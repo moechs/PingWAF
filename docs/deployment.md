@@ -162,7 +162,7 @@ The systemd path solves the same problem a different way — the unit grants
 | `POSTGRES_PASSWORD` | `pingwaf` (development fallback) | PostgreSQL password. **Set a random value in `.env`** (`openssl rand -hex 16`) for any real deployment: the compose file still falls back to `pingwaf` when unset, and the compose installer does not generate this one |
 | `POSTGRES_BIND` | `127.0.0.1` | Host address the PostgreSQL port publishes on (`0.0.0.0` exposes it to the network) |
 | `POSTGRES_PORT` | `5432` | Host port for PostgreSQL |
-| `JWT_SECRET` | placeholder | JWT signing secret — leaving the placeholder is safe: a random secret is generated on first boot and persisted (≥16 chars when set) |
+| `JWT_SECRET` | placeholder | JWT signing secret — leaving the placeholder is safe: a random secret is generated on first boot and persisted. When setting it, use 32 random bytes (`openssl rand -hex 32`); the server enforces a 16-character floor but a 32-byte random value is the recommended value |
 | `PINGWAF_SECRET_KEY` | unset (required for sealing) | Instance key that seals notification-channel secrets, the AI provider key and backup-target credentials at rest. **Set it to 32 random bytes** (`openssl rand -hex 32`); without it those fields are stored in clear text (only a warning is logged). The official installers generate it (`deploy/compose/install.sh` into `.env`; the host installer into `/etc/pingwaf/pingwaf.env`, mode `0600`). Back it up separately and read the rotation note in [`SECURITY.md`](../SECURITY.md#credentials-and-secrets) — there is no online rotation |
 | `ADMIN_EMAIL` | `admin@pingwaf.local` | Initial admin email |
 | `ADMIN_PASSWORD` | **none — required on a fresh database** | Initial admin password. An empty value makes the first boot fail instead of seeding a known account; `deploy/compose/install.sh` generates a random one and prints it once. The dashboard forces a change at first login |
@@ -346,7 +346,7 @@ file and in the environment is taken from the environment.
 | `grpc_tls_cert` | string | — | PEM certificate for the gRPC listener; takes priority over the self-signed pair (requires `grpc_tls_key`) |
 | `grpc_tls_key` | string | — | PEM private key for `grpc_tls_cert` |
 | `public_host` | string | — | Host the dashboard is reached under from the outside (optionally with port); pinned into the HTTP-to-HTTPS redirect instead of the client's `Host` header |
-| `jwt_secret` | string | `change-me-in-production` | JWT signing secret (≥16 chars, required) |
+| `jwt_secret` | string | `change-me-in-production` | JWT signing secret (required; 32 random bytes recommended, server floor 16 chars) |
 | `admin_email` | string | `admin@pingwaf.local` | Seeded admin email |
 | `admin_password` | string | `pingwaf123` | Seeded admin password. Only used to seed an empty `users` table; the compose file sets no default and the installers generate a random password when unset |
 | `serve_frontend` | bool | `true` | Serve the embedded dashboard SPA for non-API routes |

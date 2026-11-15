@@ -301,6 +301,40 @@ body {
   font-feature-settings: "zero" 1;
 }
 
+/* ============================================================
+   Mobile ergonomics (UX-08)
+
+   On phones — and on any coarse pointer, which is what a tablet or a
+   touch laptop reports — interactive controls keep at least a 44×44 CSS
+   px hit area (WCAG 2.5.5 / Apple HIG). Only the hit area grows: the
+   desktop layout and the visual size of a control are unchanged.
+
+   `.pw-touch-target` is the opt-in class for icon-only controls whose
+   visual box is smaller than 44px (header icon buttons, pagination
+   arrows, row actions). Text buttons and selects are covered by the
+   element rules below.
+   ============================================================ */
+@media (max-width: 767px), (pointer: coarse) {
+  .pw-touch-target {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* Text buttons and form controls are row items, so raising their
+     minimum height cannot reflow inline prose. Inline text links (`a`)
+     are deliberately excluded. */
+  button,
+  select,
+  [role="switch"] {
+    min-height: 44px;
+  }
+
+  /* Sidebar / drawer navigation rows (inline text links stay compact). */
+  nav a.flex {
+    min-height: 44px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

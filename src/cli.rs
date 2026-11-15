@@ -17,6 +17,8 @@
 //! These are additive to the existing pingap CLI and are detected before
 //! the normal argument parsing runs.
 
+use std::path::{Path, PathBuf};
+
 use clap::{CommandFactory, Parser, Subcommand};
 
 /// PingWAF top-level CLI wrapper.
@@ -76,6 +78,13 @@ pub struct CommonOpts {
         default_value = "postgres://pingwaf:pingwaf@localhost:5432/pingwaf"
     )]
     pub db_url: String,
+
+    /// Read the PostgreSQL connection string from a file instead of
+    /// `--db-url`/`PINGWAF_DB_URL`. The file content is trimmed and used as
+    /// the whole connection string, keeping its password out of the process
+    /// list (`ps`) and shell history.
+    #[arg(long, env = "PINGWAF_DB_URL_FILE")]
+    pub db_url_file: Option<PathBuf>,
 
     /// HTTP admin/API listen address
     #[arg(long, env = "PINGWAF_ADMIN_ADDR", default_value = "0.0.0.0:9080")]
@@ -204,6 +213,12 @@ pub struct AgentOpts {
     #[arg(long, env = "PINGWAF_API_KEY", default_value = "")]
     pub api_key: String,
 
+    /// Read the agent API key from a file instead of `--api-key`/
+    /// `PINGWAF_API_KEY`. The file content is trimmed, keeping the key out of
+    /// the process list (`ps`) and shell history.
+    #[arg(long, env = "PINGWAF_API_KEY_FILE")]
+    pub api_key_file: Option<PathBuf>,
+
     /// Local rule cache directory
     #[arg(long, env = "PINGWAF_CACHE_DIR", default_value = "./data/cache")]
     pub cache_dir: String,
@@ -311,6 +326,11 @@ pub struct AllInOneOpts {
     #[arg(long, env = "PINGWAF_API_KEY", default_value = "")]
     pub api_key: String,
 
+    /// Read the agent API key from a file instead of `--api-key`/
+    /// `PINGWAF_API_KEY` (see `pingwaf agent --help`).
+    #[arg(long, env = "PINGWAF_API_KEY_FILE")]
+    pub api_key_file: Option<PathBuf>,
+
     /// Local rule cache directory
     #[arg(long, env = "PINGWAF_CACHE_DIR", default_value = "./data/cache")]
     pub cache_dir: String,
@@ -364,6 +384,12 @@ pub struct DbOpts {
         default_value = "postgres://pingwaf:pingwaf@localhost:5432/pingwaf"
     )]
     pub db_url: String,
+
+    /// Read the PostgreSQL connection string from a file instead of
+    /// `--db-url`/`PINGWAF_DB_URL` (keeps the password out of the process
+    /// list and shell history).
+    #[arg(long, env = "PINGWAF_DB_URL_FILE")]
+    pub db_url_file: Option<PathBuf>,
 }
 
 /// `user` — dashboard account administration.
@@ -566,6 +592,128 @@ fn wants_version(args: &[String]) -> bool {
         .any(|arg| arg == "--version" || arg == "-V")
 }
 
+/// Reads one secret from a file: surrounding whitespace and the trailing
+/// newline are trimmed, and an empty file is refused instead of silently
+/// configuring an empty password/key.
+fn load_secret_file(path: &Path, flag: &str) -> Result<String, String> {
+    let value = std::fs::read_to_string(path).map_err(|err| {
+        format!("{flag} {} cannot be read: {err}", path.display())
+    })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{flag} {} is empty", path.display()));
+    }
+    Ok(value.to_string())
+}
+
+fn apply_db_file(db: &mut DbOpts) -> Result<(), String> {
+    if let Some(path) = db.db_url_file.as_deref() {
+        db.db_url = load_secret_file(path, "--db-url-file")?;
+    }
+    Ok(())
+}
+
+fn apply_common_file(common: &mut CommonOpts) -> Result<(), String> {
+    if let Some(path) = common.db_url_file.as_deref() {
+        common.db_url = load_secret_file(path, "--db-url-file")?;
+    }
+    Ok(())
+}
+
+fn apply_api_key_file(
+    api_key: &mut String,
+    file: Option<&Path>,
+) -> Result<(), String> {
+    if let Some(path) = file {
+        *api_key = load_secret_file(path, "--api-key-file")?;
+    }
+    Ok(())
+}
+
+fn apply_user_subcommand(command: &mut UserSubcommand) -> Result<(), String> {
+    match command {
+        UserSubcommand::List(db) => apply_db_file(db),
+        UserSubcommand::AddAdmin(opts) => apply_db_file(&mut opts.db),
+        UserSubcommand::ResetPassword(opts) => apply_db_file(&mut opts.db),
+    }
+}
+
+fn apply_mode_subcommand(command: &mut ModeCommand) -> Result<(), String> {
+    match command {
+        ModeCommand::Observe(db)
+        | ModeCommand::Enforce(db)
+        | ModeCommand::Status(db) => apply_db_file(db),
+    }
+}
+
+fn apply_security_subcommand(
+    command: &mut SecurityCommand,
+) -> Result<(), String> {
+    match command {
+        SecurityCommand::Status(db) => apply_db_file(db),
+        SecurityCommand::Allowlist(opts) => apply_db_file(&mut opts.db),
+    }
+}
+
+fn apply_config_subcommand(command: &mut ConfigCommand) -> Result<(), String> {
+    match command {
+        ConfigCommand::History(opts) => apply_db_file(&mut opts.db),
+        ConfigCommand::Show(opts) => apply_db_file(&mut opts.db),
+        ConfigCommand::Rollback(opts) => apply_db_file(&mut opts.db),
+    }
+}
+
+/// Resolves `--db-url-file` / `--api-key-file` over the inline values.
+///
+/// The file wins over `--db-url`/`--api-key` (and their environment
+/// variables): a caller that passes both gets the file, and the inline-secret
+/// warning below still tells them the inline value was visible.
+fn apply_secret_files(command: &mut PingWafCommand) -> Result<(), String> {
+    match command {
+        PingWafCommand::Server(opts) => apply_common_file(&mut opts.common),
+        PingWafCommand::AllInOne(opts) => {
+            apply_common_file(&mut opts.common)?;
+            apply_api_key_file(&mut opts.api_key, opts.api_key_file.as_deref())
+        },
+        PingWafCommand::Agent(opts) => {
+            apply_api_key_file(&mut opts.api_key, opts.api_key_file.as_deref())
+        },
+        PingWafCommand::User { command } => apply_user_subcommand(command),
+        PingWafCommand::Mode { command } => apply_mode_subcommand(command),
+        PingWafCommand::Security { command } => {
+            apply_security_subcommand(command)
+        },
+        PingWafCommand::Config { command } => apply_config_subcommand(command),
+    }
+}
+
+/// True when `flag` appears as `--flag` or `--flag=...` in the raw argv.
+fn flag_present(argv: &[String], flag: &str) -> bool {
+    let prefix = format!("{flag}=");
+    argv.iter()
+        .skip(1)
+        .any(|arg| arg == flag || arg.starts_with(&prefix))
+}
+
+/// Warnings for secrets passed inline: argv is visible to other local users
+/// through the process list (`ps`) and often ends up in shell history/CI logs.
+/// A `--db-url-file` / `--api-key-file` alternative is offered instead.
+fn inline_secret_warnings(argv: &[String]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (flag, file_flag, env) in [
+        ("--db-url", "--db-url-file", "PINGWAF_DB_URL_FILE"),
+        ("--api-key", "--api-key-file", "PINGWAF_API_KEY_FILE"),
+    ] {
+        if flag_present(argv, flag) && !flag_present(argv, file_flag) {
+            warnings.push(format!(
+                "{flag} is visible to other local users in the process list; \
+                 prefer {file_flag} or the {env} environment variable"
+            ));
+        }
+    }
+    warnings
+}
+
 /// Parse the PingWAF CLI from command line arguments.
 ///
 /// If `PINGWAF_MODE` is set but no subcommand is given on the command line,
@@ -608,7 +756,15 @@ pub fn parse_pingwaf_cli() -> PingWafCli {
         },
     }
 
-    PingWafCli::parse_from(argv)
+    let mut cli = PingWafCli::parse_from(argv);
+    if let Err(err) = apply_secret_files(&mut cli.command) {
+        eprintln!("pingwaf: {err}");
+        std::process::exit(1);
+    }
+    for warning in inline_secret_warnings(&args) {
+        eprintln!("warning: {warning}");
+    }
+    cli
 }
 
 #[cfg(test)]
@@ -812,5 +968,153 @@ mod tests {
         assert!(wants_version(&argv(&["pingwaf", "server", "--version"])));
         assert!(!wants_version(&argv(&["pingwaf", "server", "--config=x"])));
         assert!(!wants_version(&argv(&["pingwaf"])));
+    }
+
+    /// Writes a secret to a temporary file for the `*-file` option tests.
+    fn secret_file(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(contents.as_bytes())
+            .expect("write secret file");
+        file.flush().expect("flush secret file");
+        file
+    }
+
+    #[test]
+    fn db_url_file_is_trimmed_and_wins_over_the_inline_value() {
+        let file = secret_file("postgres://file:pw@db:5432/pingwaf\n\n");
+        let path = file.path().to_str().unwrap();
+        let mut cli = PingWafCli::try_parse_from([
+            "pingwaf",
+            "server",
+            "--db-url=postgres://inline:pw@inline:5432/pingwaf",
+            &format!("--db-url-file={path}"),
+        ])
+        .unwrap();
+        apply_secret_files(&mut cli.command).unwrap();
+        let PingWafCommand::Server(opts) = cli.command else {
+            panic!("expected the server mode");
+        };
+        assert_eq!(opts.common.db_url, "postgres://file:pw@db:5432/pingwaf");
+    }
+
+    #[test]
+    fn agent_api_key_file_is_applied() {
+        let file = secret_file("pwk_from_file\n");
+        let path = file.path().to_str().unwrap();
+        let mut cli = PingWafCli::try_parse_from([
+            "pingwaf",
+            "agent",
+            "--api-key=pwk_inline",
+            &format!("--api-key-file={path}"),
+        ])
+        .unwrap();
+        apply_secret_files(&mut cli.command).unwrap();
+        let PingWafCommand::Agent(opts) = cli.command else {
+            panic!("expected the agent mode");
+        };
+        assert_eq!(opts.api_key, "pwk_from_file");
+    }
+
+    #[test]
+    fn maintenance_commands_accept_a_db_url_file() {
+        let file = secret_file("postgres://file:pw@db:5432/pingwaf");
+        let path = file.path().to_str().unwrap();
+        let mut cli = PingWafCli::try_parse_from([
+            "pingwaf",
+            "user",
+            "list",
+            &format!("--db-url-file={path}"),
+        ])
+        .unwrap();
+        apply_secret_files(&mut cli.command).unwrap();
+        let PingWafCommand::User {
+            command: UserSubcommand::List(opts),
+        } = cli.command
+        else {
+            panic!("expected the user list command");
+        };
+        assert_eq!(opts.db_url, "postgres://file:pw@db:5432/pingwaf");
+    }
+
+    #[test]
+    fn empty_or_missing_secret_files_are_refused() {
+        let empty = secret_file("  \n");
+        let path = empty.path().to_str().unwrap();
+        let mut cli = PingWafCli::try_parse_from([
+            "pingwaf",
+            "server",
+            &format!("--db-url-file={path}"),
+        ])
+        .unwrap();
+        let err = apply_secret_files(&mut cli.command).unwrap_err();
+        assert!(err.contains("is empty"), "unexpected error: {err}");
+
+        let mut cli = PingWafCli::try_parse_from([
+            "pingwaf",
+            "server",
+            "--db-url-file=/nonexistent/secret-file",
+        ])
+        .unwrap();
+        let err = apply_secret_files(&mut cli.command).unwrap_err();
+        assert!(err.contains("cannot be read"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn inline_secrets_warn_but_file_flags_do_not() {
+        let argv = |args: &[&str]| {
+            args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>()
+        };
+
+        let warnings =
+            inline_secret_warnings(&argv(&["pingwaf", "server", "--db-url=x"]));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--db-url"));
+        assert!(warnings[0].contains("--db-url-file"));
+
+        assert!(
+            inline_secret_warnings(&argv(&[
+                "pingwaf",
+                "server",
+                "--db-url-file=/run/secrets/db-url",
+            ]))
+            .is_empty()
+        );
+
+        let warnings = inline_secret_warnings(&argv(&[
+            "pingwaf",
+            "agent",
+            "--api-key=pwk_x",
+        ]));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--api-key"));
+
+        assert!(
+            inline_secret_warnings(&argv(&[
+                "pingwaf",
+                "agent",
+                "--api-key-file=/run/secrets/api-key",
+            ]))
+            .is_empty()
+        );
+
+        // Values passed through the environment are not in argv, so no
+        // warning is emitted for them.
+        assert!(
+            inline_secret_warnings(&argv(&["pingwaf", "server"])).is_empty()
+        );
+    }
+
+    #[test]
+    fn flag_presence_matches_both_spellings() {
+        let argv = |args: &[&str]| {
+            args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>()
+        };
+        let args = argv(&["pingwaf", "server", "--db-url", "x"]);
+        assert!(flag_present(&args, "--db-url"));
+        let args = argv(&["pingwaf", "server", "--db-url=x"]);
+        assert!(flag_present(&args, "--db-url"));
+        let args = argv(&["pingwaf", "server", "--db-url-file=x"]);
+        assert!(!flag_present(&args, "--db-url"));
     }
 }

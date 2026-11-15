@@ -37,9 +37,11 @@ Usage:
   install.sh [options]
 
 Options:
-  --tag <tag>              Image tag (default: latest; pin a release in production)
+  --tag <tag>              Image tag (default: the newest GitHub release tag,
+                           resolved through the API; never the moving `main`)
   --ref <git-ref>          Git ref the compose file is downloaded from
-                           (default: v<tag> for a release tag, otherwise main)
+                           (default: v<tag>; `main` must be requested explicitly
+                           and is only for development)
   --dir <path>             Directory to create/use (default: ./pingwaf)
   --admin-email <email>    Initial administrator e-mail
   --admin-password <pw>    Initial administrator password (default: a random
@@ -49,7 +51,9 @@ Options:
   --https-port <port>      Host port for HTTPS (default: 443)
   --admin-port <port>      Host port for the console/API (default: 9080)
   --grpc-port <port>       Host port for the agent gRPC endpoint (default: 9090)
-  --force                  Overwrite an existing .env (keeps the data volumes)
+  --force                  Overwrite an existing .env. The data volumes and the
+                           database are kept, and PINGWAF_SECRET_KEY / the admin
+                           password are reused from the old .env when present.
   --dry-run                Print the resolved plan and exit
   -h, --help               Show this help
 
@@ -90,6 +94,20 @@ random_hex() { # $1 bytes (default 32) -> lowercase hex
     else
         od -An -tx1 -N "$bytes" /dev/urandom | tr -d ' \n'
     fi
+}
+
+latest_release_tag() {
+    local url="https://api.github.com/repos/${REPO}/releases/latest" tag=""
+    if command -v curl >/dev/null 2>&1; then
+        tag="$(curl -fsSL --proto '=https' "$url" 2>/dev/null \
+            | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | head -n1)"
+    elif command -v wget >/dev/null 2>&1; then
+        tag="$(wget -qO- "$url" 2>/dev/null \
+            | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | head -n1)"
+    fi
+    printf '%s' "${tag#v}"
 }
 
 random_password() { # $1 length (default 32) -> alphanumeric password
@@ -140,8 +158,24 @@ validate_port "--admin-port" "$ADMIN_PORT"
 validate_port "--grpc-port" "$GRPC_PORT"
 
 if [[ -z "$REF" ]]; then
-    if [[ "$TAG" == "latest" ]]; then
+    if [[ "$TAG" == "main" ]]; then
+        # `main` is the unstable development branch: allow it only when asked
+        # for explicitly, and say so.
+        warn "tag 'main' is the unstable development snapshot; pin a release tag for production"
         REF="main"
+    elif [[ "$TAG" == "latest" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            # A dry run must not depend on the network; show what will happen.
+            REF="<latest-release-tag>"
+        else
+            resolved="$(latest_release_tag)"
+            if [[ -z "$resolved" ]]; then
+                die "cannot resolve the latest release tag (GitHub API unreachable); pass --tag <version>"
+            fi
+            TAG="$resolved"
+            REF="v${TAG}"
+            printf 'Resolved latest release: %s\n' "$TAG"
+        fi
     else
         REF="v${TAG#v}"
     fi
@@ -164,7 +198,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
 PingWAF Docker Compose install plan
   compose file : ${COMPOSE_URL}
   directory    : $(cd "$(dirname "$DIR")" 2>/dev/null && pwd || pwd)/$(basename "$DIR")
-  image tag    : ${TAG}
+  image tag    : $([[ "$TAG" == "latest" ]] && echo "latest release (resolved at install)" || echo "$TAG")
   admin e-mail : ${ADMIN_EMAIL}
   admin passwd : $([[ -n "$ADMIN_PASSWORD" ]] && echo "custom" || echo "random (generated at install, printed once)")
   instance key : $([[ -n "$PINGWAF_SECRET_KEY" ]] && echo "from environment" || echo "generated into .env (0600)")
@@ -262,7 +296,15 @@ a minute to answer. Follow it with:
 
   cd $(pwd) && docker compose logs -f pingwaf
 
+Data volumes are never removed by this script, and "docker compose down" keeps
+them too: only "docker compose down -v" (never use it) or deleting the volumes
+by hand would destroy the database and the control-plane TLS material.
+
 Upgrade later with:
 
   cd $(pwd) && docker compose pull && docker compose up -d
+
+The .env keeps PINGWAF_SECRET_KEY and the administrator password; back it up
+(0600) before a --force re-run, and do not rotate the instance key: sealed
+notification/AI/backup credentials become unreadable.
 EOF

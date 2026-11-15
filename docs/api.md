@@ -5945,6 +5945,37 @@ execution or upstream contact:
 These responses are produced by the proxy itself; they do not appear in
 `/api/v1` error codes and do not consume an origin connection.
 
+## Response security headers
+
+Every control-plane response (`/api/v1`, the MCP endpoint and the embedded
+dashboard) carries the same browser-hardening headers. They are applied with
+**if-not-present** semantics, so a handler or a reverse proxy can override them
+deliberately — audit any override, and do not strip them.
+
+| Header | Value |
+| --- | --- |
+| `Content-Security-Policy` | `default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'` |
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `DENY` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+
+Notes for operators:
+
+- **Split-origin dashboards** are the only reason to widen the policy: add the
+  API origin to `connect-src` explicitly, and keep `script-src`, `base-uri` and
+  `frame-ancestors` restrictive. Never add `'unsafe-inline'` to `script-src`.
+  One exception is built in: the `dashboard.svg?refresh=` asset answers with its
+  own `Content-Security-Policy: script-src 'unsafe-inline'` for that single
+  response, because the refresh animation uses an inline script.
+- **HSTS** is a per-site data-plane setting (enable it on the sites you proxy);
+  the control-plane listener does not set it. Terminate TLS in a proxy that
+  sends `Strict-Transport-Security`, or enable HSTS on the served sites.
+- A reverse proxy that rewrites the dashboard origin must preserve these
+  headers; see [`SECURITY.md` → Response security headers](../SECURITY.md#response-security-headers).
+- The MCP endpoint's credential and data boundary (read vs write keys, and what
+  the AI assistant forwards to a provider) is documented under
+  [MCP server](#mcp-server).
+
 ## Error Responses
 
 **Every** `4xx`/`5xx` response from `/api/v1` follows one consistent format —

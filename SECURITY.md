@@ -152,9 +152,11 @@ control.**
 
 - [ ] Set `PINGWAF_ADMIN_EMAIL` and a strong `PINGWAF_ADMIN_PASSWORD` — never
       leave `admin@pingwaf.local` / `pingwaf123`.
-- [ ] Set `PINGWAF_JWT_SECRET` to 32 random bytes
-      (`openssl rand -hex 32`); the minimum the server accepts is 16 characters.
-      Rotate it immediately if it was ever committed or logged.
+- [ ] Set `PINGWAF_JWT_SECRET` to **32 random bytes** (`openssl rand -hex 32`).
+      Do not pick a memorable passphrase: the server only enforces a
+      16-character minimum, so it will accept a weak value and sign every token
+      with it. Rotate it immediately if it was ever committed or logged (this
+      invalidates all sessions).
 - [ ] Set `PINGWAF_SECRET_KEY` to 32 random bytes (`openssl rand -hex 32`). It
       encrypts notification-channel secrets (SMTP passwords, robot webhook
       keys), the AI provider API key and backup-target credentials at rest.
@@ -218,6 +220,26 @@ control.**
       and set `PINGWAF_PASSKEY_TRUST_FORWARDED_PROTO=true` only when that proxy
       is the one terminating TLS — see
       [`docs/deployment.md`](./docs/deployment.md).
+
+### Response security headers
+
+- [ ] Leave the console's built-in security headers in place. Every control-plane
+      response carries `Content-Security-Policy` (`default-src 'self'`,
+      `script-src 'self'`, `connect-src 'self'`, `frame-ancestors 'none'`,
+      `base-uri 'self'`, `form-action 'self'`), `X-Content-Type-Options:
+      nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy:
+      strict-origin-when-cross-origin`. A reverse proxy or middleware must not
+      strip or weaken them.
+- [ ] A split-origin deployment is the only reason to widen the policy: add the
+      API origin to `connect-src` explicitly and keep `frame-ancestors` and
+      `script-src` restrictive. Do not add `'unsafe-inline'` to `script-src`.
+- [ ] The headers are applied with "if not present" semantics, so a handler or
+      proxy can override them deliberately — audit any override.
+- [ ] HSTS is a site-level setting (enable it on every proxied site); the
+      control-plane listener does not set it — terminate TLS in a proxy that
+      does, or enable HSTS on the sites it serves.
+- [ ] See [`docs/api.md` → Response security headers](./docs/api.md#response-security-headers)
+      for the exact header values.
 
 ### Logging and stored data
 

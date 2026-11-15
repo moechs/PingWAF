@@ -174,7 +174,7 @@ a reachable instance with the built-in defaults.
 
 ```bash
 export POSTGRES_PASSWORD="$(openssl rand -hex 16)"
-export JWT_SECRET="$(openssl rand -hex 32)"      # must be >= 16 characters
+export JWT_SECRET="$(openssl rand -hex 32)"      # 32 random bytes (server floor: 16 chars)
 export PINGWAF_SECRET_KEY="$(openssl rand -hex 32)"  # seals channel/AI/backup secrets
 export ADMIN_PASSWORD="$(openssl rand -hex 16)"
 ```
@@ -211,7 +211,7 @@ Compose variables you can set:
 | --- | --- | --- |
 | `POSTGRES_PASSWORD` | `pingwaf` (development fallback) | PostgreSQL password (also used to build the DSN). Set a random value for any real deployment |
 | `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` | `127.0.0.1` | Host address the console (9080) / gRPC (9090) publish on; loopback by default |
-| `JWT_SECRET` | `change-me-in-production-use-32-chars` | JWT signing secret, **≥ 16 characters** |
+| `JWT_SECRET` | `change-me-in-production-use-32-chars` | JWT signing secret, **32 random bytes** (`openssl rand -hex 32`; server floor 16 chars) |
 | `PINGWAF_SECRET_KEY` | unset (required for sealing) | Instance key for sealed secrets (channels, AI key, backup targets); **set 32 random bytes**, unset = clear text. The installer generates it into `.env` |
 | `ADMIN_EMAIL` | `admin@pingwaf.local` | Seeded administrator email |
 | `ADMIN_PASSWORD` | **none — required on a fresh database** | Seeded administrator password; empty makes the first boot fail. The installer generates a random one and prints it once (forced change at first login) |
@@ -581,7 +581,7 @@ sudo journalctl -u pingwaf -f
 ```
 
 Before exposing this to the internet, override every default credential:
-`PINGWAF_JWT_SECRET` (≥ 16 chars), `PINGWAF_ADMIN_PASSWORD`,
+`PINGWAF_JWT_SECRET` (32 random bytes; server floor 16 chars), `PINGWAF_ADMIN_PASSWORD`,
 `PINGWAF_ADMIN_EMAIL`, and set `PINGWAF_ALLOW_REGISTRATION=false`. The
 shipped unit (`pingwaf.service`) and the unit `install.sh` writes grant
 `CAP_NET_BIND_SERVICE` via `AmbientCapabilities`, so the unprivileged
@@ -760,7 +760,7 @@ one:
 
 | Flag | Environment | Default | Description |
 | --- | --- | --- | --- |
-| `--jwt-secret` | `PINGWAF_JWT_SECRET` | `change-me-in-production` | JWT signing secret, **≥ 16 characters** |
+| `--jwt-secret` | `PINGWAF_JWT_SECRET` | `change-me-in-production` | JWT signing secret, **32 random bytes** (`openssl rand -hex 32`; server floor 16 chars) |
 | `--admin-email` | `PINGWAF_ADMIN_EMAIL` | `admin@pingwaf.local` | Seeded administrator email |
 | `--admin-password` | `PINGWAF_ADMIN_PASSWORD` | random, printed once | Seeded administrator password; when empty the installer generates one and prints it once |
 | `--serve-frontend` | `PINGWAF_SERVE_FRONTEND` | `true` | Serve the embedded dashboard SPA |

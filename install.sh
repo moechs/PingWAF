@@ -910,7 +910,15 @@ create_dirs() {
             $cmd useradd -r -m -d "$DATA_DIR" -s /usr/sbin/nologin pingwaf 2>/dev/null || \
             $cmd adduser -r -d "$DATA_DIR" -s /sbin/nologin pingwaf 2>/dev/null || true
         fi
-        $cmd chown -R pingwaf:pingwaf "$CONFIG_DIR" "$DATA_DIR" 2>/dev/null || true
+        # /etc/pingwaf is configuration, not application state: root owns it
+        # and only the service group may read it (the unit runs as pingwaf and
+        # needs the 0640 config, but must not be able to rewrite its own
+        # secrets). /var/lib/pingwaf is the agent's writable state.
+        $cmd chown root:pingwaf "$CONFIG_DIR" 2>/dev/null || true
+        $cmd chmod 0750 "$CONFIG_DIR" 2>/dev/null || true
+        $cmd chown -R pingwaf:pingwaf "$DATA_DIR" 2>/dev/null || true
+        $cmd chmod 0750 "$DATA_DIR" 2>/dev/null || true
+        $cmd chmod 0750 "${DATA_DIR}/cache" "${DATA_DIR}/certs" 2>/dev/null || true
     fi
 }
 
@@ -1049,13 +1057,14 @@ EOF
 
     # Not behind `if [[ -n "$cmd" ]]`: a root install has no sudo wrapper, and
     # skipping the branch left the file with the seeded admin password and the
-    # JWT secret readable by every local user (0644, owned by root). It must be
-    # pingwaf-owned as well, because the unit runs as User=pingwaf.
-    if ! $cmd chown pingwaf:pingwaf "$config_file" 2>/dev/null; then
-        warn "Could not hand ${config_file} to pingwaf:pingwaf — does the user exist?"
+    # JWT secret readable by every local user (0644, owned by root). Root owns
+    # the file; the pingwaf group may read it (the unit runs as User=pingwaf)
+    # but cannot rewrite its own secrets.
+    if ! $cmd chown root:pingwaf "$config_file" 2>/dev/null; then
+        warn "Could not hand ${config_file} to root:pingwaf — does the group exist?"
     fi
-    if ! $cmd chmod 640 "$config_file" 2>/dev/null; then
-        warn "Could not chmod 640 ${config_file}; it may stay readable by other local users."
+    if ! $cmd chmod 0640 "$config_file" 2>/dev/null; then
+        warn "Could not chmod 0640 ${config_file}; it may stay readable by other local users."
     fi
 
     success "Configuration written to ${config_file}"
@@ -1084,11 +1093,14 @@ write_secret_env_file() {
 PINGWAF_SECRET_KEY=${PINGWAF_SECRET_KEY}
 EOF
     )
-    if ! $cmd chown pingwaf:pingwaf "$env_file" 2>/dev/null; then
-        warn "Could not hand ${env_file} to pingwaf:pingwaf — does the user exist?"
+    # systemd reads EnvironmentFile as root before dropping to User=pingwaf, so
+    # the instance key stays root-only: the service process never needs to read
+    # this file itself.
+    if ! $cmd chown root:root "$env_file" 2>/dev/null; then
+        warn "Could not hand ${env_file} to root:root."
     fi
-    if ! $cmd chmod 600 "$env_file" 2>/dev/null; then
-        warn "Could not chmod 600 ${env_file}; it may stay readable by other local users."
+    if ! $cmd chmod 0600 "$env_file" 2>/dev/null; then
+        warn "Could not chmod 0600 ${env_file}; it may stay readable by other local users."
     fi
     success "Instance secret key written to ${env_file} (0600)"
 }
@@ -1439,13 +1451,29 @@ else
     if [[ "$ADMIN_PASSWORD_GENERATED" == "true" ]]; then
         echo "  ${YELLOW}⚠ Save the generated administrator password now: it is not shown again.${NO_COLOR}"
     fi
-    echo "  ${YELLOW}⚠ Keep ${CONFIG_DIR}/pingwaf.toml and ${CONFIG_DIR}/pingwaf.env private:${NO_COLOR}"
-    echo "  ${YELLOW}   they hold the admin password, the JWT secret and the instance key.${NO_COLOR}"
+    echo "  ${YELLOW}⚠ Back up ${CONFIG_DIR}/pingwaf.toml and ${CONFIG_DIR}/pingwaf.env.${NO_COLOR}"
+    echo "  ${YELLOW}   Do NOT regenerate the JWT secret or PINGWAF_SECRET_KEY: previously sealed${NO_COLOR}"
+    echo "  ${YELLOW}   credentials become unreadable and sessions are invalidated. Change the${NO_COLOR}"
+    echo "  ${YELLOW}   administrator password from the dashboard (Settings → Account) instead.${NO_COLOR}"
     echo ""
     echo "  Next steps:"
     echo "    1. Ensure PostgreSQL is running and accessible"
     echo "    2. Edit ${CONFIG_DIR}/pingwaf.toml, then: sudo systemctl restart ${SERVICE_NAME}"
     echo "    3. Start the service: sudo systemctl enable --now ${SERVICE_NAME}"
     echo "    4. Open the dashboard and add your first site"
+    echo ""
+    echo "  Upgrade / rollback / uninstall:"
+    echo "    Upgrade:   re-run this installer with --version <new>; the config and the"
+    echo "               secrets in ${CONFIG_DIR} are kept. Then: sudo systemctl restart ${SERVICE_NAME}"
+    echo "    Rollback:  re-run with --version <previous> (older releases stay on GitHub),"
+    echo "               then: sudo systemctl restart ${SERVICE_NAME}"
+    echo "    Backup:    sudo tar -czf pingwaf-config-\$(date +%F).tgz -C / etc/pingwaf"
+    echo "               sudo chmod 600 pingwaf-config-*.tgz   # it holds the admin password and keys"
+    echo "    Uninstall: sudo systemctl disable --now ${SERVICE_NAME}"
+    echo "               sudo rm -f /etc/systemd/system/${SERVICE_NAME}.service"
+    echo "               sudo rm -f ${INSTALL_DIR}/${BINARY_NAME}"
+    echo "               keep (or back up) ${CONFIG_DIR} and ${DATA_DIR}; remove the account with:"
+    echo "               sudo userdel pingwaf"
+    echo "    Never delete ${DATA_DIR} or drop the database before taking a backup."
     echo ""
 fi

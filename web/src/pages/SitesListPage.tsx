@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useEffect, useMemo, useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -23,6 +23,7 @@ import { Switch } from '@/components/ui/Switch'
 import { Table, type Column } from '@/components/ui/Table'
 import { Dialog } from '@/components/ui/Dialog'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
+import { Pagination } from '@/components/ui/Pagination'
 import { SkeletonRows } from '@/components/ui/Skeleton'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { useToast } from '@/components/ui/Toast'
@@ -36,7 +37,11 @@ import {
 } from '@/lib/errorMessages'
 import { analyticsApi, analyticsKeys } from '@/api/analytics'
 import { useCanWrite, useDebouncedValue } from '@/hooks'
-import { formatCompactNumber, formatDateTime, formatNumber } from '@/lib/format'
+import {
+  formatDateTime,
+  formatDateTimeWithZone,
+  formatNumber,
+} from '@/lib/format'
 import type {
   CloneSiteRequest,
   CreateSiteRequest,
@@ -114,6 +119,8 @@ export function SitesListPage() {
   >(null)
   const [pendingDelete, setPendingDelete] = useState<Site | null>(null)
   const [pendingToggle, setPendingToggle] = useState<Site | null>(null)
+  // Mobile card list pages client-side; the desktop table keeps its own pager.
+  const [cardPage, setCardPage] = useState(1)
 
   /* ── Clone dialog ────────────────────────────────────────────────── */
   const [cloneOpen, setCloneOpen] = useState(false)
@@ -315,6 +322,22 @@ export function SitesListPage() {
     setDialogOpen(true)
   }
 
+  // The ⌘K palette's "New site" action lands on /sites?new=1. The request is
+  // latched into local state during render (a derived flag, not a side effect)
+  // and the parameter is then removed with `replace` so refresh/back does not
+  // re-open the dialog. A read-only account consumes the parameter without
+  // opening a dialog it could not submit (the server would answer 403).
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [urlCreateOpen, setUrlCreateOpen] = useState(false)
+  const wantsNewSite = canWrite && searchParams.get('new') === '1'
+  if (wantsNewSite && !urlCreateOpen) setUrlCreateOpen(true)
+  useEffect(() => {
+    if (searchParams.get('new') !== '1') return
+    const next = new URLSearchParams(searchParams)
+    next.delete('new')
+    setSearchParams(next, { replace: true })
+  }, [searchParams, setSearchParams])
+
   const openClone = (site: Site) => {
     setCloneSource(site)
     setCloneForm({
@@ -425,6 +448,7 @@ export function SitesListPage() {
 
   const closeDialog = () => {
     setDialogOpen(false)
+    setUrlCreateOpen(false)
     setEditing(null)
     setForm(emptyForm)
     setFormErrors({})
@@ -518,6 +542,60 @@ export function SitesListPage() {
 
   const pending = createSite.isPending || updateSite.isPending
 
+  /** Row actions, shared by the desktop table and the mobile cards (UX-08). */
+  const renderSiteActions = (r: Site) => (
+    <div
+      className="flex items-center justify-end gap-1"
+      onClick={(e) => e.stopPropagation()}
+    >
+      <Button
+        size="icon"
+        variant="ghost"
+        className="pw-touch-target"
+        aria-label={
+          r.status === 'active' ? t('pages.sites.deactivate') : t('pages.sites.activate')
+        }
+        disabled={!canWrite || toggleStatus.isPending}
+        loading={toggleStatus.isPending && toggleStatus.variables?.site.id === r.id}
+        onClick={() => setPendingToggle(r)}
+        icon={
+          r.status === 'active' ? (
+            <Pause weight="duotone" className="h-4 w-4" />
+          ) : (
+            <Play weight="duotone" className="h-4 w-4" />
+          )
+        }
+      />
+      <Button
+        size="icon"
+        variant="ghost"
+        className="pw-touch-target"
+        aria-label={t('common.edit')}
+        disabled={!canWrite}
+        onClick={() => openEdit(r)}
+        icon={<PencilSimple weight="duotone" className="h-4 w-4" />}
+      />
+      <Button
+        size="icon"
+        variant="ghost"
+        className="pw-touch-target"
+        aria-label={t('pages.sites.clone')}
+        disabled={!canWrite || clonePending}
+        onClick={() => openClone(r)}
+        icon={<CopySimple weight="duotone" className="h-4 w-4" />}
+      />
+      <Button
+        size="icon"
+        variant="ghost"
+        aria-label={t('common.delete')}
+        disabled={!canWrite}
+        className="pw-touch-target hover:text-fg-danger"
+        onClick={() => setPendingDelete(r)}
+        icon={<Trash weight="duotone" className="h-4 w-4" />}
+      />
+    </div>
+  )
+
   const columns: Column<Site>[] = [
     {
       key: 'select',
@@ -592,7 +670,7 @@ export function SitesListPage() {
         <span className="tabular-nums text-[13px]">
           {trafficQuery.isPending
             ? '…'
-            : formatCompactNumber(trafficBySite.get(r.id)?.requests ?? 0)}
+            : formatNumber(trafficBySite.get(r.id)?.requests ?? 0)}
         </span>
       ),
     },
@@ -606,7 +684,7 @@ export function SitesListPage() {
         <span className="tabular-nums text-[13px] text-fg-danger">
           {trafficQuery.isPending
             ? '…'
-            : formatCompactNumber(trafficBySite.get(r.id)?.blocked ?? 0)}
+            : formatNumber(trafficBySite.get(r.id)?.blocked ?? 0)}
         </span>
       ),
     },
@@ -616,7 +694,12 @@ export function SitesListPage() {
       accessor: (r) => r.created_at,
       sortable: true,
       cell: (r) => (
-        <span className="text-[13px] text-fg-subtle">{formatDateTime(r.created_at)}</span>
+        <span
+          className="text-[13px] text-fg-subtle"
+          title={formatDateTimeWithZone(r.created_at)}
+        >
+          {formatDateTime(r.created_at)}
+        </span>
       ),
     },
     {
@@ -624,54 +707,85 @@ export function SitesListPage() {
       header: '',
       align: 'right',
       width: '1%',
-      cell: (r) => (
-        <div className="flex items-center justify-end gap-1" onClick={(e) => e.stopPropagation()}>
-          <Button
-            size="icon"
-            variant="ghost"
-            aria-label={
-              r.status === 'active' ? t('pages.sites.deactivate') : t('pages.sites.activate')
-            }
-            disabled={!canWrite || toggleStatus.isPending}
-            loading={toggleStatus.isPending && toggleStatus.variables?.site.id === r.id}
-            onClick={() => setPendingToggle(r)}
-            icon={
-              r.status === 'active' ? (
-                <Pause weight="duotone" className="h-4 w-4" />
-              ) : (
-                <Play weight="duotone" className="h-4 w-4" />
-              )
-            }
-          />
-          <Button
-            size="icon"
-            variant="ghost"
-            aria-label={t('common.edit')}
-            disabled={!canWrite}
-            onClick={() => openEdit(r)}
-            icon={<PencilSimple weight="duotone" className="h-4 w-4" />}
-          />
-          <Button
-            size="icon"
-            variant="ghost"
-            aria-label={t('pages.sites.clone')}
-            disabled={!canWrite || clonePending}
-            onClick={() => openClone(r)}
-            icon={<CopySimple weight="duotone" className="h-4 w-4" />}
-          />
-          <Button
-            size="icon"
-            variant="ghost"
-            aria-label={t('common.delete')}
-            disabled={!canWrite}
-            className="hover:text-fg-danger"
-            onClick={() => setPendingDelete(r)}
-            icon={<Trash weight="duotone" className="h-4 w-4" />}
-          />
-        </div>
-      ),
+      cell: (r) => renderSiteActions(r),
     },
   ]
+
+  /* ── Mobile cards (UX-08) ─────────────────────────────────────
+     Below 768px the seven-column table cannot be read without a blind
+     horizontal scroll, so each site becomes a card: identity + status first,
+     traffic counters next, actions as 44px targets. Desktop keeps the table. */
+  const CARD_PAGE_SIZE = 20
+  const cardPageCount = Math.max(1, Math.ceil(sites.length / CARD_PAGE_SIZE))
+  const safeCardPage = Math.min(cardPage, cardPageCount)
+  const cardSites = sites.slice(
+    (safeCardPage - 1) * CARD_PAGE_SIZE,
+    safeCardPage * CARD_PAGE_SIZE,
+  )
+
+  const siteCard = (r: Site) => (
+    <li key={r.id} className="flex flex-col gap-2 px-4 py-3">
+      <div className="flex items-start gap-2">
+        {/* 44px hit area around the 20px box (UX-08): the label is the target. */}
+        <label className="-ml-3 flex h-11 w-11 shrink-0 items-center justify-center">
+          <input
+            type="checkbox"
+            aria-label={r.name || r.domain}
+            checked={selected.has(r.id)}
+            onChange={() => toggleRow(r.id)}
+            onClick={(e) => e.stopPropagation()}
+            disabled={batch !== null}
+            className="h-5 w-5 cursor-pointer rounded border-border disabled:cursor-not-allowed disabled:opacity-50"
+          />
+        </label>
+        <button
+          type="button"
+          onClick={() => navigate(`/sites/${r.id}/basic`)}
+          className="flex min-w-0 flex-1 flex-col gap-1 text-left"
+        >
+          <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="pw-mono truncate font-medium text-fg-strong">
+              {r.domain}
+              {(r.alternate_domains?.length ?? 0) > 0 && (
+                <span className="ml-1.5 text-xs font-normal text-fg-subtle">
+                  +{r.alternate_domains.length}
+                </span>
+              )}
+            </span>
+            <Badge tone={STATUS_TONE[r.status as SiteStatus] ?? 'neutral'} dot>
+              {t(`status.${r.status}`, r.status)}
+            </Badge>
+          </span>
+          <span className="truncate text-xs text-fg-subtle">{r.name}</span>
+          <span className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-fg-subtle">
+            <span>
+              {t('pages.sites.requests')}:{' '}
+              <span className="tabular-nums text-fg">
+                {trafficQuery.isPending
+                  ? '…'
+                  : formatNumber(trafficBySite.get(r.id)?.requests ?? 0)}
+              </span>
+            </span>
+            <span>
+              {t('pages.sites.blocked')}:{' '}
+              <span className="tabular-nums text-fg-danger">
+                {trafficQuery.isPending
+                  ? '…'
+                  : formatNumber(trafficBySite.get(r.id)?.blocked ?? 0)}
+              </span>
+            </span>
+            <span
+              className="tabular-nums"
+              title={formatDateTimeWithZone(r.created_at)}
+            >
+              {formatDateTime(r.created_at)}
+            </span>
+          </span>
+        </button>
+      </div>
+      <div className="pl-8">{renderSiteActions(r)}</div>
+    </li>
+  )
 
   return (
     <div className="animate-slide-up">
@@ -789,13 +903,29 @@ export function SitesListPage() {
                 />
               )
             ) : (
-              <Table
-                columns={columns}
-                data={sites}
-                rowKey={(r) => r.id}
-                pageSize={20}
-                onRowClick={(r) => navigate(`/sites/${r.id}/basic`)}
-              />
+              <>
+                <ul className="divide-y divide-line md:hidden">
+                  {cardSites.map(siteCard)}
+                </ul>
+                <div className="hidden md:block">
+                  <Table
+                    columns={columns}
+                    data={sites}
+                    rowKey={(r) => r.id}
+                    pageSize={20}
+                    scrollLabel={t('mobile.sitesTable')}
+                    onRowClick={(r) => navigate(`/sites/${r.id}/basic`)}
+                  />
+                </div>
+                <div className="md:hidden">
+                  <Pagination
+                    page={safeCardPage}
+                    pageSize={CARD_PAGE_SIZE}
+                    total={sites.length}
+                    onChange={setCardPage}
+                  />
+                </div>
+              </>
             )}
           </CardBody>
         </Card>
@@ -803,7 +933,7 @@ export function SitesListPage() {
 
       {/* Create / edit dialog */}
       <Dialog
-        open={dialogOpen}
+        open={dialogOpen || urlCreateOpen}
         onClose={pending ? () => undefined : closeDialog}
         title={editing ? t('pages.sites.editSite') : t('pages.sites.addSite')}
         description={editing ? t('pages.sites.editDescription') : t('pages.sites.createDescription')}

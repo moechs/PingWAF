@@ -53,6 +53,7 @@ variable.
 | Option | Environment variable | Default | Purpose |
 | --- | --- | --- | --- |
 | `--db-url` | `PINGWAF_DB_URL` | `postgres://pingwaf:pingwaf@localhost:5432/pingwaf` | PostgreSQL connection string |
+| `--db-url-file` | `PINGWAF_DB_URL_FILE` | — | Read the PostgreSQL connection string from a file instead (trimmed; empty/unreadable aborts with exit code 1; **wins over `--db-url`**). Accepted by `server`, `all-in-one` and every maintenance command |
 | `--admin-addr` | `PINGWAF_ADMIN_ADDR` | `0.0.0.0:9080` | HTTP admin/API listen address |
 | `--grpc-addr` | `PINGWAF_GRPC_ADDR` | `0.0.0.0:9090` | gRPC listen (server/all-in-one) or connect (agent) address |
 | `--grpc-tls-cert` | `PINGWAF_GRPC_TLS_CERT` | — | PEM certificate chain for the gRPC control plane; agents then connect via `https://` |
@@ -64,8 +65,9 @@ variable.
 | `--config` | `PINGWAF_CONFIG` | — | TOML configuration file; its `[server]` and `[agent]` tables hold the same settings |
 
 Server-only options (`server` / `all-in-one`): `--jwt-secret`
-(`PINGWAF_JWT_SECRET`, default `change-me-in-production`, must be ≥ 16
-characters; a placeholder value is replaced by a random secret persisted on
+(`PINGWAF_JWT_SECRET`, default `change-me-in-production`, **use 32 random
+bytes**: `openssl rand -hex 32`; the server only enforces a 16-character
+minimum, and a placeholder value is replaced by a random secret persisted on
 first boot), `--admin-email` (`PINGWAF_ADMIN_EMAIL`, default
 `admin@pingwaf.local`), `--admin-password` (`PINGWAF_ADMIN_PASSWORD`, default
 `pingwaf123` — the compose file and the installers require an explicit password
@@ -92,6 +94,32 @@ Agent-only options (`agent` / the agent half of `all-in-one`): `--server-url`
 (`PINGWAF_HEARTBEAT_INTERVAL`, default `30`), `--metrics-ship-interval`
 (`PINGWAF_METRICS_SHIP_INTERVAL`, default `30`), plus `--log-batch-size`,
 `--log-flush-interval-secs` and `--max-body-log-size` (command line only).
+
+### Passing secrets safely
+
+`--db-url`, `--api-key`, `--jwt-secret` and `--admin-password` are visible to
+every local user in `ps` and are recorded in shell history. For the two
+highest-value ones the CLI can read the value from a file instead:
+
+| Flag | Environment variable | Reads |
+| --- | --- | --- |
+| `--db-url-file` | `PINGWAF_DB_URL_FILE` | PostgreSQL connection string (`server`, `all-in-one`, and every maintenance command) |
+| `--api-key-file` | `PINGWAF_API_KEY_FILE` | Agent enrollment API key (`agent`, `all-in-one`) |
+
+The file content is trimmed (surrounding whitespace and the trailing newline)
+and used as the whole value; an unreadable or **empty** file aborts with exit
+code 1 instead of silently configuring an empty secret. When both an inline
+value and the file are given, **the file wins**. Passing `--db-url` or
+`--api-key` inline without the matching file flag prints a warning that the
+value is visible in the process list.
+
+For scripts and CI, write the secret to a `0600` file (or use the environment
+variable / systemd `EnvironmentFile=` — the host installer writes
+`PINGWAF_SECRET_KEY` to `/etc/pingwaf/pingwaf.env` for exactly this reason) and
+pass `--db-url-file` / `--api-key-file`. `--jwt-secret` and `--admin-password`
+have no file variant yet: use `PINGWAF_JWT_SECRET` / `PINGWAF_ADMIN_PASSWORD`,
+and run the installer with `--dry-run` first so the resolved plan — not the
+secret — is what gets logged.
 
 ### Configuration precedence
 

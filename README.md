@@ -253,7 +253,7 @@ PINGWAF_CONFIG=/etc/pingwaf/pingwaf.toml pingwaf all-in-one   # equivalent
 | `PINGWAF_DB_URL` | `postgres://pingwaf:pingwaf@localhost:5432/pingwaf` | PostgreSQL DSN |
 | `PINGWAF_ADMIN_ADDR` | `0.0.0.0:9080` | REST API + dashboard listen address |
 | `PINGWAF_GRPC_ADDR` | `0.0.0.0:9090` | gRPC control-plane listen address |
-| `PINGWAF_JWT_SECRET` | `change-me-in-production` | JWT signing secret (**≥ 16 chars**, change in production) |
+| `PINGWAF_JWT_SECRET` | `change-me-in-production` | JWT signing secret (**32 random bytes**, `openssl rand -hex 32`; change in production) |
 | `PINGWAF_ADMIN_EMAIL` | `admin@pingwaf.local` | Seeded administrator email |
 | `PINGWAF_ADMIN_PASSWORD` | `pingwaf123` | Seeded administrator password (**change in production**; the compose file and installers have no default — they require it or generate a random one) |
 | `PINGWAF_ALLOW_REGISTRATION` | `true` | Whether `POST /api/v1/auth/register` accepts signups (`docker-compose.yml` sets this to `false`) |

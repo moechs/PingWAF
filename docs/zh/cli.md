@@ -33,6 +33,7 @@ Web 控制台是 `:9080` 控制面的 HTTP 客户端。当控制面本身出问�
 | 参数 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- | --- |
 | `--db-url` | `PINGWAF_DB_URL` | `postgres://pingwaf:pingwaf@localhost:5432/pingwaf` | PostgreSQL 连接串 |
+| `--db-url-file` | `PINGWAF_DB_URL_FILE` | — | 从文件读取 PostgreSQL 连接串（自动 trim；文件不可读或为空时以退出码 1 中止；**优先于 `--db-url`**）。`server`、`all-in-one` 与所有运维子命令均支持 |
 | `--admin-addr` | `PINGWAF_ADMIN_ADDR` | `0.0.0.0:9080` | HTTP 管理/API 监听地址 |
 | `--grpc-addr` | `PINGWAF_GRPC_ADDR` | `0.0.0.0:9090` | gRPC 监听（server/all-in-one）或连接（agent）地址 |
 | `--grpc-tls-cert` | `PINGWAF_GRPC_TLS_CERT` | — | gRPC 控制面的 PEM 证书链；Agent 此后经 `https://` 连接 |
@@ -43,9 +44,38 @@ Web 控制台是 `:9080` 控制面的 HTTP 客户端。当控制面本身出问�
 | `--public-host` | `PINGWAF_PUBLIC_HOST` | *（未设置）* | 控制台对外访问的主机名（可带端口）；写死到 HTTP→HTTPS 跳转目标中，取代客户端的 `Host` 头 |
 | `--config` | `PINGWAF_CONFIG` | — | TOML 配置文件；其 `[server]` 与 `[agent]` 表持有相同设置 |
 
-仅 server 侧参数（`server` / `all-in-one`）：`--jwt-secret`（`PINGWAF_JWT_SECRET`，默认 `change-me-in-production`，须 ≥ 16 字符）、`--admin-email`（`PINGWAF_ADMIN_EMAIL`，默认 `admin@pingwaf.local`）、`--admin-password`（`PINGWAF_ADMIN_PASSWORD`，二进制默认 `pingwaf123`；compose 无默认、安装器会生成随机口令并只打印一次）与 `--serve-frontend`（`PINGWAF_SERVE_FRONTEND`，默认 `true`）。
+仅 server 侧参数（`server` / `all-in-one`）：`--jwt-secret`（`PINGWAF_JWT_SECRET`，默认 `change-me-in-production`，**应使用 32 字节随机值**：`openssl rand -hex 32`；服务端只强制 ≥ 16 字符，占位符会在首启时替换为随机持久化值）、`--admin-email`（`PINGWAF_ADMIN_EMAIL`，默认 `admin@pingwaf.local`）、`--admin-password`（`PINGWAF_ADMIN_PASSWORD`，二进制默认 `pingwaf123`；compose 无默认、安装器会生成随机口令并只打印一次）与 `--serve-frontend`（`PINGWAF_SERVE_FRONTEND`，默认 `true`）。
+
+`--admin-email` / `--admin-password` 只在 `users` 表为空时**播种**第一个管理员，该账号带「强制修改口令」标记；
+之后修改这两个参数**不会**轮换已有账号的口令，请用 `pingwaf user reset-password`（同时撤销该账号全部会话）。
+
+`PINGWAF_SECRET_KEY` 没有命令行参数，只从环境读取；它加密通知渠道口令、AI Provider Key 与备份目标凭据，
+应设为 32 字节随机值。未设置时这些字段明文入库（仅 WARN），且没有在线轮换——单独备份，详见
+[SECURITY.md](../../SECURITY.md#credentials-and-secrets)。
 
 仅 agent 侧参数（`agent` / `all-in-one` 的 agent 半边）：`--server-url`（`PINGWAF_SERVER_URL`，默认 `http://localhost:9090`）、`--server-ca-cert`（`PINGWAF_SERVER_CA_CERT`）、`--api-key`（`PINGWAF_API_KEY`）、`--cache-dir`（`PINGWAF_CACHE_DIR`，默认 `./data/cache`）、`--fail-open`（`PINGWAF_FAIL_OPEN`，默认 `true`）、`--heartbeat-interval-secs`（`PINGWAF_HEARTBEAT_INTERVAL`，默认 `30`）、`--metrics-ship-interval`（`PINGWAF_METRICS_SHIP_INTERVAL`，默认 `30`），以及 `--log-batch-size`、`--log-flush-interval-secs`、`--max-body-log-size`（仅命令行）。
+
+### 安全传参
+
+`--db-url`、`--api-key`、`--jwt-secret`、`--admin-password` 会出现在 `ps` 与 shell history 中，本机任何用户可见。
+优先使用同名环境变量（`PINGWAF_DB_URL`、`PINGWAF_API_KEY`、`PINGWAF_JWT_SECRET`、`PINGWAF_ADMIN_PASSWORD`）
+或权限 `0600` 的环境文件——二进制安装器正是为此把 `PINGWAF_SECRET_KEY` 写入
+`/etc/pingwaf/pingwaf.env`，systemd 通过 `EnvironmentFile=-/etc/pingwaf/pingwaf.env` 读取。
+
+对其中两个高价值 secret，CLI 支持从文件读取（避免进入 `ps` 与 shell history）：
+
+| 参数 | 环境变量 | 读取内容 |
+| --- | --- | --- |
+| `--db-url-file` | `PINGWAF_DB_URL_FILE` | PostgreSQL 连接串（`server`、`all-in-one` 及所有运维子命令） |
+| `--api-key-file` | `PINGWAF_API_KEY_FILE` | Agent 注册 API key（`agent`、`all-in-one`） |
+
+文件内容会被 trim（去掉首尾空白与末尾换行）后整体作为取值；文件不可读或**为空**时以退出码 1 中止，而不是静默配置空 secret。
+同时给出内联值与文件时，**文件优先**；只给 `--db-url`/`--api-key` 内联值而未给对应文件参数时，会打印一条告警提示该值在进程列表中可见。
+
+脚本与 CI 建议把 secret 写入 `0600` 文件（或使用环境变量 / systemd `EnvironmentFile=`——二进制安装器正是为此把
+`PINGWAF_SECRET_KEY` 写入 `/etc/pingwaf/pingwaf.env`），再传 `--db-url-file` / `--api-key-file`。
+`--jwt-secret` 与 `--admin-password` 目前没有文件参数：用 `PINGWAF_JWT_SECRET` / `PINGWAF_ADMIN_PASSWORD`，
+并先跑安装器 `--dry-run` 检查解析后的计划（而不是把 secret 打进日志）。
 
 ### 配置优先级
 

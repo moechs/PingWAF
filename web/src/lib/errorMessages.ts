@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import i18n from '@/i18n'
 import { ApiError } from '@/api/client'
 
@@ -72,4 +73,225 @@ export function isDomainConflictError(err: unknown): boolean {
     )
   }
   return false
+}
+/* ────────────────────────────────────────────────────────────────
+   Failure classification (UX-10)
+   ──────────────────────────────────────────────────────────────── */
+
+/**
+ * How a failed request should be presented. The console must tell an operator
+ * *why* something failed — a 403 needs a permission fix, a 503 needs waiting,
+ * a timeout needs a proxy check — so the raw HTTP status is folded into these
+ * actionable kinds.
+ */
+export type FailureKind =
+  | 'unauthorized'
+  | 'forbidden'
+  | 'not_found'
+  | 'rate_limited'
+  | 'conflict'
+  | 'validation'
+  | 'server_error'
+  | 'network'
+  | 'timeout'
+  | 'unknown'
+
+export interface FailureInfo {
+  kind: FailureKind
+  /** i18n key of the heading (`errors.<kind>Title`). */
+  titleKey: string
+  /** i18n key of the actionable hint (`errors.<kind>Hint`). */
+  hintKey: string
+  /** Docs slug (appended to {@link DOCS_BASE_URL}); `null` = no page. */
+  docSlug: string | null
+  /** Whether retrying the same request can plausibly succeed. */
+  retryable: boolean
+}
+
+/** Public documentation base — the official site's `/docs` route. */
+export const DOCS_BASE_URL = 'https://www.pingwaf.com/docs'
+
+/** Absolute documentation URL for a slug, or `null` when there is none. */
+export function docsUrl(slug: string | null | undefined): string | null {
+  return slug ? `${DOCS_BASE_URL}/${slug}` : null
+}
+
+/** True for aborted/timeout failures, which the API client reports as network errors. */
+export function isTimeoutError(err: unknown): boolean {
+  if (err instanceof ApiError) {
+    if (err.code === 'timeout') return true
+    if (!err.networkError) return false
+  }
+  if (err instanceof Error) {
+    if (err.name === 'AbortError' || err.name === 'TimeoutError') return true
+    return /time(d)?\s*out|timeout|aborted/i.test(err.message)
+  }
+  return false
+}
+
+const FAILURE_BY_STATUS: Record<number, FailureInfo> = {
+  401: {
+    kind: 'unauthorized',
+    titleKey: 'errors.sessionExpiredTitle',
+    hintKey: 'errors.sessionExpiredHint',
+    docSlug: 'deployment',
+    retryable: false,
+  },
+  403: {
+    kind: 'forbidden',
+    titleKey: 'errors.forbiddenTitle',
+    hintKey: 'errors.forbiddenHint',
+    docSlug: 'api',
+    retryable: false,
+  },
+  404: {
+    kind: 'not_found',
+    titleKey: 'errors.notFoundTitle',
+    hintKey: 'errors.notFoundHint',
+    docSlug: 'api',
+    retryable: false,
+  },
+  409: {
+    kind: 'conflict',
+    titleKey: 'errors.conflictTitle',
+    hintKey: 'errors.conflictHint',
+    docSlug: 'api',
+    retryable: false,
+  },
+  422: {
+    kind: 'validation',
+    titleKey: 'errors.validationTitle',
+    hintKey: 'errors.validationHint',
+    docSlug: 'api',
+    retryable: false,
+  },
+  429: {
+    kind: 'rate_limited',
+    titleKey: 'errors.rateLimitedTitle',
+    hintKey: 'errors.rateLimitedHint',
+    docSlug: 'deployment',
+    retryable: true,
+  },
+}
+
+/** Classifies any thrown value into an actionable failure kind (UX-10). */
+export function classifyFailure(err: unknown): FailureInfo {
+  if (err instanceof ApiError) {
+    if (err.networkError || err.status === 0) {
+      const timeout = isTimeoutError(err)
+      return {
+        kind: timeout ? 'timeout' : 'network',
+        titleKey: timeout ? 'errors.timeoutTitle' : 'errors.networkTitle',
+        hintKey: timeout ? 'errors.timeoutHint' : 'errors.networkHint',
+        docSlug: 'deployment',
+        retryable: true,
+      }
+    }
+    const known = FAILURE_BY_STATUS[err.status]
+    if (known) return known
+    if (err.status >= 500) {
+      return {
+        kind: 'server_error',
+        titleKey: 'errors.serverErrorTitle',
+        hintKey: 'errors.serverErrorHint',
+        docSlug: 'deployment',
+        retryable: true,
+      }
+    }
+    if (err.status === 400) {
+      return {
+        kind: 'validation',
+        titleKey: 'errors.validationTitle',
+        hintKey: 'errors.validationHint',
+        docSlug: 'api',
+        retryable: false,
+      }
+    }
+  }
+  if (isTimeoutError(err)) {
+    return {
+      kind: 'timeout',
+      titleKey: 'errors.timeoutTitle',
+      hintKey: 'errors.timeoutHint',
+      docSlug: 'deployment',
+      retryable: true,
+    }
+  }
+  if (err instanceof TypeError) {
+    return {
+      kind: 'network',
+      titleKey: 'errors.networkTitle',
+      hintKey: 'errors.networkHint',
+      docSlug: 'deployment',
+      retryable: true,
+    }
+  }
+  return {
+    kind: 'unknown',
+    titleKey: 'errors.unknownTitle',
+    hintKey: 'errors.unknownHint',
+    docSlug: null,
+    retryable: false,
+  }
+}
+
+/**
+ * Exponential backoff for a manual retry: 1s, 2s, 4s, 8s, 16s, then capped at
+ * 30s. Attempt is zero-based (`0` = first retry).
+ */
+export function retryDelayMs(attempt: number): number {
+  const safe = Math.max(0, Math.floor(attempt))
+  return Math.min(1000 * 2 ** safe, 30_000)
+}
+
+let referenceCounter = 0
+
+/**
+ * Short client-side reference for a failure. The control plane's error
+ * envelope carries no request id today, so the console mints its own opaque
+ * value that an operator can quote in a bug report; it is deliberately not
+ * derivable from anything sensitive.
+ */
+export function failureReference(err: unknown): string {
+  referenceCounter = (referenceCounter + 1) % 1296
+  const stamp = Date.now().toString(36).toUpperCase()
+  const suffix = referenceCounter.toString(36).toUpperCase().padStart(2, '0')
+  const kind = classifyFailure(err).kind
+  return `${kind.toUpperCase()}-${stamp}-${suffix}`
+}
+
+/**
+ * Retry with exponential backoff for a page-level error card (UX-10).
+ *
+ * The first click retries immediately; after that the button stays disabled for
+ * 1s, 2s, 4s … (capped at 30s) so a control plane that is already struggling is
+ * not hammered by repeated clicks. The hook returns the remaining cooldown so
+ * the card can say when the next attempt is allowed.
+ */
+export function useRetryBackoff(retry: () => void): {
+  run: () => void
+  waiting: boolean
+  waitSeconds: number
+} {
+  const [attempt, setAttempt] = useState(0)
+  const [waitSeconds, setWaitSeconds] = useState(0)
+  const waiting = waitSeconds > 0
+
+  useEffect(() => {
+    if (!waiting) return
+    const timer = window.setInterval(
+      () => setWaitSeconds((seconds) => Math.max(0, seconds - 1)),
+      1000,
+    )
+    return () => window.clearInterval(timer)
+  }, [waiting])
+
+  const run = () => {
+    if (waiting) return
+    setAttempt((value) => value + 1)
+    setWaitSeconds(Math.ceil(retryDelayMs(attempt) / 1000))
+    retry()
+  }
+
+  return { run, waiting, waitSeconds }
 }
