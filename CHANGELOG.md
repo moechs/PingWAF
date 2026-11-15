@@ -10,6 +10,8 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+## [PingWAF 0.32.30] — 2026-11-16
+
 ### Added
 
 - **Edge error pages are clearer and link back to the project.** The built-in
