@@ -10,6 +10,21 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+## [PingWAF 0.32.31] — 2026-11-16
+
+### Performance
+
+- **The access log owns the request facts instead of copying them.** For
+  requests that never reach the body stage (GET/HEAD, sites without body
+  inspection) the request-phase `RequestData` facts are moved into the pending
+  access entry after the verdict, and the header vector is capped in place
+  instead of cloned — about 9 allocations plus the whole header copy per
+  request. Early-answer paths (paused, fail-closed, mTLS, access rules, rate
+  limit, challenge) copy the facts just before they emit, so their access rows
+  keep the same fields; a field-level regression test covers the blocked,
+  passed, paused and fail-closed paths, and the backfill helpers are unit
+  tested (including the in-place header cap).
+
 ## [PingWAF 0.32.30] — 2026-11-16
 
 ### Added
