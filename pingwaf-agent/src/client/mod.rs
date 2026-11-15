@@ -390,9 +390,11 @@ impl ControlPlaneClient {
             loop {
                 interval.tick().await;
                 if shutdown.load(Ordering::Relaxed) {
+                    rule_cache.flush_rule_cache_if_dirty();
                     break;
                 }
                 rule_cache.flush_blocked_ips();
+                rule_cache.flush_rule_cache_if_dirty();
             }
         });
         handles.push(handle);
@@ -1356,6 +1358,8 @@ impl ControlPlaneClient {
     pub fn shutdown(&self) {
         info!("Initiating agent shutdown");
         self.shutdown_signal.store(true, Ordering::Relaxed);
+        // A debounced rule update may still be waiting for the flush loop.
+        self.rule_cache.flush_rule_cache_if_dirty();
     }
 
     /// Get the current system metrics snapshot.

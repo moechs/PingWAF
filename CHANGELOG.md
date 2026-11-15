@@ -89,6 +89,23 @@ verbatim for reference and attribution, and is not maintained here.
     their file keyword instead, which keeps the prefilter a superset of every
     strong regex.
 
+- **The agent's rule-cache persistence no longer rewrites the snapshot per
+  site.** A full control-plane sync pushes one bundle per site; every bundle
+  used to serialize, CRC-validate (by deserializing the whole snapshot again)
+  and fsync the entire `sites.json`, i.e. O(S²) bytes for S sites. Writes are
+  now debounced to at most one per second, with a background flush and a
+  shutdown flush; the pre-overwrite backup is validated from the metadata
+  CRC/length stamp instead of a full parse; the primary is read once per
+  roll-over; and the snapshot is compact JSON (~25% smaller than
+  `to_string_pretty`). The atomic write plus primary → `.bak` → empty-rules
+  fallback chain is unchanged.
+
+- **Per-host caches are sized for the control-plane site ceiling.**
+  `HOST_CACHE_MAX_ENTRIES` goes from 1024 to 4096: at ~1000 sites × 1.2
+  domains the old cap made every sweep evict live entries and recompile their
+  contexts on the next request. The new bound leaves headroom for growth at
+  single-digit MB worst case across the per-host maps.
+
 ### Changed
 
 - **`detect_sqli` returns an empty fingerprint for non-detections.** The
