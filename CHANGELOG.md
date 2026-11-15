@@ -64,6 +64,29 @@ verbatim for reference and attribution, and is not maintained here.
   - Managed rule PINGWAF-1070's expression hoists its shared prefix out of the
     disjunction, so the body `contains` no longer runs twice per Strict POST.
 
+- **Normalization and the integration layer allocate far less.** Measured p50
+  after the follow-up batch: clean 8-header GET 6.0-6.7µs (from 8.7µs),
+  20-header GET 10.5µs, 4KB JSON POST 112µs, 10KB form POST 280µs; per-request
+  allocations 37/91/113 → 12/61/65 and allocated bytes 2.7/37.4/78.2KB →
+  2.0/17.3/24.4KB. A 49,747-input differential run over four normalization
+  modes and three engine verdicts stayed byte-identical.
+
+  - `DecodedValue.name` is a `Cow` (header/query/cookie keys are borrowed),
+    the normalized path is borrowed when it needs no collapsing,
+    `query_params` — a public field with no readers — is gone and `full_uri`
+    is appended while the query is parsed, entity and percent decode passes
+    are skipped when they would be no-ops, over-long values are truncated in
+    place instead of copied, and the content-type no longer gets a lowercased
+    copy per request.
+  - `convert_log_entry` takes the log entry by value instead of cloning every
+    field (and both body buffers), and `DeferredVerdict` moves the request data
+    instead of cloning it for the body stage.
+  - The SQLi prefilter no longer lists bare `into` — it matched "Macintosh"
+    and every word containing it, dragging the full confirmation battery along
+    for ordinary user agents. `INTO OUTFILE`/`INTO DUMPFILE` are reached via
+    their file keyword instead, which keeps the prefilter a superset of every
+    strong regex.
+
 ### Changed
 
 - **`detect_sqli` returns an empty fingerprint for non-detections.** The

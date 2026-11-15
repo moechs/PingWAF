@@ -2494,7 +2494,14 @@ static SQLI_PREFILTER_NEEDLES: &[&str] = &[
     "pg_catalog",
     "sysobjects",
     "syscolumns",
-    "into",
+    // `into` alone was the needle for `INTO OUTFILE`/`INTO DUMPFILE`, and it
+    // is a substring of ordinary words ("Macintosh", "into"), so every UA
+    // string paid the full confirmation battery. The only strong check that
+    // needs it is `SQLI_INTO_FILE`, whose match always contains the file
+    // keyword itself; listing those instead keeps the prefilter a superset of
+    // every strong regex while letting "Macintosh" miss.
+    "outfile",
+    "dumpfile",
     "case",
     "to_char",
 ];
@@ -3782,6 +3789,31 @@ mod tests {
         let (hit, fp) = detect_sqli("1 and case when 1=1 then 1 end");
         assert!(hit);
         assert!(fp.contains("blind-probe"));
+    }
+
+    #[test]
+    fn detect_sqli_into_file_survives_prefilter_needle_change() {
+        // The prefilter no longer lists bare `into` (it matched "Macintosh"
+        // and every other word containing it); the file keyword itself keeps
+        // the `INTO OUTFILE`/`INTO DUMPFILE` checks reachable.
+        let (hit, fp) = detect_sqli("1 into outfile '/tmp/x'");
+        assert!(hit);
+        assert!(fp.contains("into-file"));
+
+        let (hit, fp) = detect_sqli("1 INTO DUMPFILE '/tmp/x'");
+        assert!(hit);
+        assert!(fp.contains("into-file"));
+    }
+
+    #[test]
+    fn detect_sqli_user_agent_into_substring_stays_clean() {
+        // `Macintosh` used to hit the `into` prefilter needle and drag the
+        // whole confirmation battery along; the value is not SQLi either way.
+        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+                  AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0";
+        let (hit, fp) = detect_sqli(ua);
+        assert!(!hit);
+        assert!(fp.is_empty());
     }
 
     #[test]

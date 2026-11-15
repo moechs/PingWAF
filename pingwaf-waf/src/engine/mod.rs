@@ -3430,7 +3430,7 @@ mod tests {
         let names: Vec<&str> = req_data
             .decoded_values
             .iter()
-            .map(|v| v.name.as_str())
+            .map(|v| v.name.as_ref())
             .collect();
         // The container string is gone; members are addressed by path.
         assert!(
@@ -3512,7 +3512,7 @@ mod tests {
             .decoded_values
             .iter()
             .filter(|v| v.source == ValueSource::Body && v.field)
-            .map(|v| v.name.as_str())
+            .map(|v| v.name.as_ref())
             .collect();
         assert!(names.contains(&"q"), "values: {names:?}");
         assert!(names.contains(&"page"), "values: {names:?}");

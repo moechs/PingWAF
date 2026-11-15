@@ -5185,7 +5185,7 @@ impl Plugin for WafPlugin {
                         header_block: deferred_header_block,
                         site_id: site_id.clone(),
                         host: host.clone(),
-                        request_data: request_data.clone(),
+                        request_data,
                     }),
                     created_at: Instant::now(),
                     // Per-site stage timeout, snapshotted from the request's
@@ -5228,7 +5228,7 @@ impl Plugin for WafPlugin {
                             header_block: false,
                             site_id: site_id.clone(),
                             host: host.clone(),
-                            request_data: request_data.clone(),
+                            request_data,
                         },
                     ),
                 );

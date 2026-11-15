@@ -629,7 +629,7 @@ fn decoded_value_counts() {
             "{:<14} {:>7} {:>6} {:>8} {:>6} {:>6} {:>6} {:>6} {:>6}",
             kind.name(),
             normalized.decoded_values.len(),
-            normalized.query_params.len(),
+            count(ValueSource::QueryParam),
             normalized.headers.len(),
             normalized.cookies.len(),
             count(ValueSource::Body),

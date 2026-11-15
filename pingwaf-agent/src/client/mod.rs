@@ -954,7 +954,7 @@ impl ControlPlaneClient {
                     match entry {
                         Some(log_entry) => {
                             let proto_entry =
-                                Self::convert_log_entry(agent_id, &log_entry);
+                                Self::convert_log_entry(agent_id, log_entry);
                             batch.push(proto_entry);
 
                             // Flush when batch is full
@@ -1010,7 +1010,7 @@ impl ControlPlaneClient {
                             Ok(entry) => {
                                 batch.push(Self::convert_log_entry(
                                     agent_id,
-                                    &entry,
+                                    entry,
                                 ));
                                 drained += 1;
                             },
@@ -1292,52 +1292,52 @@ impl ControlPlaneClient {
     }
 
     /// Convert a local LogEntry to the proto LogEntry type.
-    fn convert_log_entry(agent_id: &str, entry: &LogEntry) -> proto::LogEntry {
+    fn convert_log_entry(agent_id: &str, entry: LogEntry) -> proto::LogEntry {
         proto::LogEntry {
             agent_id: agent_id.to_string(),
-            site_id: entry.site_id.clone(),
-            request_id: entry.request_id.clone(),
+            site_id: entry.site_id,
+            request_id: entry.request_id,
             timestamp: Some(prost_types::Timestamp {
                 seconds: chrono::Utc::now().timestamp(),
                 nanos: 0,
             }),
-            client_ip: entry.client_ip.clone(),
-            method: entry.method.clone(),
-            scheme: entry.scheme.clone(),
-            host: entry.host.clone(),
-            path: entry.path.clone(),
-            query_string: entry.query_string.clone(),
-            protocol: entry.protocol.clone(),
-            request_headers: entry.request_headers.clone(),
-            request_body: entry.request_body.clone().unwrap_or_default(),
+            client_ip: entry.client_ip,
+            method: entry.method,
+            scheme: entry.scheme,
+            host: entry.host,
+            path: entry.path,
+            query_string: entry.query_string,
+            protocol: entry.protocol,
+            request_headers: entry.request_headers,
+            request_body: entry.request_body.unwrap_or_default(),
             request_body_size: entry.request_body_size,
             request_body_truncated: entry.request_body_truncated,
             response_status: entry.response_status,
-            response_headers: entry.response_headers.clone(),
-            response_body: entry.response_body.clone().unwrap_or_default(),
+            response_headers: entry.response_headers,
+            response_body: entry.response_body.unwrap_or_default(),
             response_body_size: entry.response_body_size,
             response_body_truncated: entry.response_body_truncated,
-            upstream_addr: entry.upstream_addr.clone(),
+            upstream_addr: entry.upstream_addr,
             upstream_latency_ms: entry.upstream_latency_ms,
             upstream_status: entry.upstream_status,
             waf_score: entry.waf_score,
-            waf_action: entry.waf_action.clone(),
-            waf_rule_id: entry.waf_rule_id.clone(),
-            waf_enforced_rule_id: entry.waf_enforced_rule_id.clone(),
-            waf_rule_name: entry.waf_rule_name.clone(),
-            waf_event_type: entry.waf_event_type.clone(),
-            waf_details: entry.waf_details.clone(),
-            waf_matched_tags: entry.waf_matched_tags.clone(),
-            user_identity: entry.user_identity.clone(),
+            waf_action: entry.waf_action,
+            waf_rule_id: entry.waf_rule_id,
+            waf_enforced_rule_id: entry.waf_enforced_rule_id,
+            waf_rule_name: entry.waf_rule_name,
+            waf_event_type: entry.waf_event_type,
+            waf_details: entry.waf_details,
+            waf_matched_tags: entry.waf_matched_tags,
+            user_identity: entry.user_identity,
             total_latency_ms: entry.total_latency_ms,
-            cache_status: entry.cache_status.clone(),
-            tls_version: entry.tls_version.clone(),
-            ja3_hash: entry.ja3_hash.clone(),
-            country_code: entry.country_code.clone(),
-            city: entry.city.clone(),
+            cache_status: entry.cache_status,
+            tls_version: entry.tls_version,
+            ja3_hash: entry.ja3_hash,
+            country_code: entry.country_code,
+            city: entry.city,
             asn: entry.asn,
-            user_agent: entry.user_agent.clone(),
-            referer: entry.referer.clone(),
+            user_agent: entry.user_agent,
+            referer: entry.referer,
         }
     }
 
