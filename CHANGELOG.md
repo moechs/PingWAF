@@ -10,6 +10,8 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+## [PingWAF 0.32.29] — 2026-11-15
+
 ### Security
 
 - **Release artifacts now carry supply-chain metadata.** The release workflow
