@@ -2192,6 +2192,73 @@ fn cap_headers<'a>(
     out
 }
 
+/// Cap a header vector in place to the access-log limits.
+///
+/// Same selection as [`cap_headers`] (first `MAX_LOG_HEADERS` entries while
+/// the running size stays within `MAX_LOG_HEADERS_BYTES`) but without
+/// allocating a second vector: the request's header vector is moved into the
+/// pending entry, so the cap is applied to that buffer directly.
+fn cap_headers_in_place(
+    mut headers: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    headers.truncate(MAX_LOG_HEADERS);
+    let mut total = 0usize;
+    let mut keep = 0usize;
+    for (name, value) in &headers {
+        total += name.len() + value.len();
+        if total > MAX_LOG_HEADERS_BYTES {
+            break;
+        }
+        keep += 1;
+    }
+    headers.truncate(keep);
+    headers
+}
+
+/// Copy the request facts into the pending entry.
+///
+/// Used by the cold paths that answer before the body stage: they still hold
+/// the `RequestData` (and return right after), so the facts are copied rather
+/// than moved. The hot path uses [`backfill_pending_facts_owned`] instead.
+fn backfill_pending_facts(request_id: &str, request: &RequestData) {
+    let Some(mut pending) = PENDING_ACCESS.get_mut(request_id) else {
+        return;
+    };
+    pending.client_ip = request.client_ip.clone();
+    pending.method = request.method.clone();
+    pending.scheme = request.scheme.clone();
+    pending.protocol = request.protocol.clone();
+    pending.path = request.path.clone();
+    pending.query = request.query.clone();
+    pending.country_code = request.country_code.clone().unwrap_or_default();
+    pending.request_headers = cap_headers(
+        request
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str())),
+    );
+}
+
+/// Move the request facts into the pending entry.
+///
+/// The request is not handed to the body stage, so the access log can own the
+/// strings: the copy made at registration (needed only when the body stage
+/// keeps a second `RequestData`) is skipped entirely, and the header vector is
+/// capped in place instead of cloned.
+fn backfill_pending_facts_owned(request_id: &str, request: RequestData) {
+    let Some(mut pending) = PENDING_ACCESS.get_mut(request_id) else {
+        return;
+    };
+    pending.client_ip = request.client_ip;
+    pending.method = request.method;
+    pending.scheme = request.scheme;
+    pending.protocol = request.protocol;
+    pending.path = request.path;
+    pending.query = request.query;
+    pending.country_code = request.country_code.unwrap_or_default();
+    pending.request_headers = cap_headers_in_place(request.headers);
+}
+
 /// Accumulates the request-body prefix kept for logging: at most `limit`
 /// bytes plus a flag telling whether the kept prefix is shorter than the
 /// body the data plane read. The full byte count is tracked regardless of
@@ -4108,6 +4175,9 @@ impl WafPlugin {
         // marker is what makes the origin of the response unambiguous.
         let response =
             stamp_mitigated(response, verdict.action == WafAction::Challenge);
+        // The access entry is emitted here, before `handle_request` gets the
+        // Respond outcome: fill the request facts first.
+        backfill_pending_facts(request_id, request_data);
         emit_generated_access(agent, request_id, &response);
         VerdictOutcome::Respond(response)
     }
@@ -4470,40 +4540,38 @@ impl Plugin for WafPlugin {
             .as_ref()
             .is_some_and(|bypass| bypass.layers.skips("rate_limit"));
         if agent.is_some() {
-            // Only the access log needs this capped copy. Building it before
-            // the `agent.is_some()` gate made a standalone deployment clone
-            // every header for a PendingAccess that was never created.
-            let log_headers = cap_headers(
-                headers
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.as_str())),
-            );
+            // The request facts are left empty here and backfilled once the
+            // engine has run: for a request that never reaches the body stage
+            // they are *moved* from `RequestData` into this entry, so the
+            // access log owns the strings instead of a second copy. Paths that
+            // answer before the body stage backfill by copy (they return
+            // immediately, so the clone is paid only on those cold paths).
             register_pending_access(
                 &request_id,
                 PendingAccess {
                     site_id: site_id.clone(),
-                    client_ip: client_ip.clone(),
-                    method: method.clone(),
-                    scheme: scheme.clone(),
-                    protocol: protocol.clone(),
+                    client_ip: String::new(),
+                    method: String::new(),
+                    scheme: String::new(),
+                    protocol: String::new(),
                     host: host.clone(),
-                    path: path.clone(),
-                    query: query.clone(),
+                    path: String::new(),
+                    query: String::new(),
                     user_agent: user_agent.clone(),
-                    referer,
+                    referer: referer.clone(),
                     tls_version: ctx
                         .conn
                         .tls_version
                         .clone()
                         .unwrap_or_default()
                         .to_string(),
-                    country_code: country.clone().unwrap_or_default(),
+                    country_code: String::new(),
                     // Backfilled by the OIDC plugin
                     // (`amend_pending_access_identity`) once it has validated
                     // a session: this entry is built during the request phase,
                     // which runs before that plugin.
                     user_identity: String::new(),
-                    request_headers: log_headers,
+                    request_headers: Vec::new(),
                     // The body prefix is backfilled by the request-body
                     // filter (`amend_pending_access_body`) once the bytes
                     // have streamed through it.
@@ -4540,6 +4608,7 @@ impl Plugin for WafPlugin {
         // the certificate keeps serving and the traffic remains visible. ──
         if context.as_ref().is_some_and(|site| site.paused) {
             let response = paused_page(&request_id);
+            backfill_pending_facts(&request_id, &request_data);
             emit_generated_access(agent.as_ref(), &request_id, &response);
             return Ok(RequestPluginResult::Respond(with_server_timing(
                 response, ctx, session, started,
@@ -4553,6 +4622,7 @@ impl Plugin for WafPlugin {
         // is reported as a `fail_closed` security event. ──
         if matches!(choice, EngineChoice::FailClosed) {
             let response = fail_closed_page(&request_id);
+            backfill_pending_facts(&request_id, &request_data);
             emit_generated_access(agent.as_ref(), &request_id, &response);
             if let Some(agent) = &agent {
                 Self::log_fail_closed(
@@ -4608,6 +4678,7 @@ impl Plugin for WafPlugin {
                     &request_id,
                     "IP temporarily blocked by WAF defense",
                 );
+                backfill_pending_facts(&request_id, &request_data);
                 emit_generated_access(Some(agent), &request_id, &response);
                 return Ok(RequestPluginResult::Respond(with_server_timing(
                     response, ctx, session, started,
@@ -4662,6 +4733,7 @@ impl Plugin for WafPlugin {
             && let Some(reason) = mtls.denial(ctx)
         {
             let response = block_page(&request_id, reason);
+            backfill_pending_facts(&request_id, &request_data);
             emit_generated_access(agent.as_ref(), &request_id, &response);
             return Ok(RequestPluginResult::Respond(with_server_timing(
                 response, ctx, session, started,
@@ -4707,6 +4779,7 @@ impl Plugin for WafPlugin {
                     } else {
                         format!("{path}?{query}")
                     };
+                    backfill_pending_facts(&request_id, &request_data);
                     return Ok(Self::deny_request(
                         agent.as_ref(),
                         &site_id,
@@ -4764,6 +4837,7 @@ impl Plugin for WafPlugin {
                         "site-wide basic authentication".to_string()
                     });
                 let response = basic_auth_page(&request_id, realm, &reason);
+                backfill_pending_facts(&request_id, &request_data);
                 emit_generated_access(agent.as_ref(), &request_id, &response);
                 return Ok(RequestPluginResult::Respond(with_server_timing(
                     response, ctx, session, started,
@@ -4825,6 +4899,7 @@ impl Plugin for WafPlugin {
                         } else {
                             format!("{path}?{query}")
                         };
+                        backfill_pending_facts(&request_id, &request_data);
                         return Ok(Self::deny_request(
                             agent.as_ref(),
                             &site_id,
@@ -4870,6 +4945,7 @@ impl Plugin for WafPlugin {
                         } else {
                             format!("{path}?{query}")
                         };
+                        backfill_pending_facts(&request_id, &request_data);
                         return Ok(Self::deny_request(
                             agent.as_ref(),
                             &site_id,
@@ -4995,6 +5071,7 @@ impl Plugin for WafPlugin {
                         if let Some(agent) = &agent {
                             agent.record_request(false);
                         }
+                        backfill_pending_facts(&request_id, &request_data);
                         return Ok(RequestPluginResult::Continue);
                     }
                     // Defense in depth: refuse the client at the edge for the
@@ -5025,6 +5102,7 @@ impl Plugin for WafPlugin {
                             tripped.retry_after,
                         )
                     };
+                    backfill_pending_facts(&request_id, &request_data);
                     emit_generated_access(
                         agent.as_ref(),
                         &request_id,
@@ -5045,6 +5123,7 @@ impl Plugin for WafPlugin {
             if let Some(agent) = &agent {
                 agent.record_request(false);
             }
+            backfill_pending_facts(&request_id, &request_data);
             return Ok(RequestPluginResult::Skipped);
         }
 
@@ -5098,11 +5177,22 @@ impl Plugin for WafPlugin {
                 defer_block,
             );
             if let VerdictOutcome::Respond(response) = outcome {
+                backfill_pending_facts(&request_id, &request_data);
                 return Ok(RequestPluginResult::Respond(with_server_timing(
                     response, ctx, session, started,
                 )));
             }
             outcome
+        };
+        // From here on the request may be moved into the body stage, so the
+        // data lives in an Option: whichever exit is taken, the pending entry
+        // is backfilled exactly once (by move on the non-staged tail).
+        let mut request_data = Some(request_data);
+        let verify_endpoint = {
+            let request = request_data
+                .as_ref()
+                .expect("request data is present until the body stage");
+            request.method == "POST" && request.path == VERIFY_ENDPOINT
         };
         // The header phase found a Block/Challenge but a body-based allow
         // rule may still flip it. Record the fallback decision and let the
@@ -5118,12 +5208,7 @@ impl Plugin for WafPlugin {
         // stage so the request-body filter can withhold and inspect the
         // incoming chunks. A request the plugin answered above never
         // reaches the filter and creates no entry.
-        if wants_body
-            && has_body
-            && !bypasses("waf")
-            && !(request_data.method == "POST"
-                && request_data.path == VERIFY_ENDPOINT)
-        {
+        if wants_body && has_body && !bypasses("waf") && !verify_endpoint {
             let engine_runs = match &choice {
                 EngineChoice::Site(_) => true,
                 EngineChoice::Base => self.mode != WafMode::Off,
@@ -5165,6 +5250,12 @@ impl Plugin for WafPlugin {
                     site_id = %site_id,
                     "body stage pool exhausted; rejecting request"
                 );
+                backfill_pending_facts(
+                    &request_id,
+                    request_data
+                        .as_ref()
+                        .expect("request data is present until the body stage"),
+                );
                 return Ok(RequestPluginResult::Respond(with_server_timing(
                     HttpResponse::builder(
                         http::StatusCode::SERVICE_UNAVAILABLE,
@@ -5183,15 +5274,25 @@ impl Plugin for WafPlugin {
                     passthrough: !inspect,
                     inspect,
                     log_prefix: LogBodyPrefix::new(body_limit),
-                    deferred: inspect.then(|| DeferredVerdict {
-                        choice: choice.clone(),
-                        context: context.clone(),
-                        observe,
-                        skip_challenge: bypasses("challenge"),
-                        header_block: deferred_header_block,
-                        site_id: site_id.clone(),
-                        host: host.clone(),
-                        request_data,
+                    deferred: inspect.then(|| {
+                        backfill_pending_facts(
+                            &request_id,
+                            request_data.as_ref().expect(
+                                "request data is present until the body stage",
+                            ),
+                        );
+                        DeferredVerdict {
+                            choice: choice.clone(),
+                            context: context.clone(),
+                            observe,
+                            skip_challenge: bypasses("challenge"),
+                            header_block: deferred_header_block,
+                            site_id: site_id.clone(),
+                            host: host.clone(),
+                            request_data: request_data.take().expect(
+                                "request data is present until the body stage",
+                            ),
+                        }
                     }),
                     created_at: Instant::now(),
                     // Per-site stage timeout, snapshotted from the request's
@@ -5203,10 +5304,7 @@ impl Plugin for WafPlugin {
                         ) as u64),
                 },
             );
-        } else if wants_body
-            && !(request_data.method == "POST"
-                && request_data.path == VERIFY_ENDPOINT)
-        {
+        } else if wants_body && !verify_endpoint {
             // GET/HEAD without CL/TE: h2/h3 may still carry a body. Park the
             // verdict and let the first chunk decide whether to stage it.
             let engine_runs = match &choice {
@@ -5220,12 +5318,23 @@ impl Plugin for WafPlugin {
                         request_id = %request_id,
                         "lazy body stage table full; h2/h3 body cannot be staged"
                     );
+                    backfill_pending_facts(
+                        &request_id,
+                        request_data.as_ref().expect(
+                            "request data is present until the body stage",
+                        ),
+                    );
                     return Ok(RequestPluginResult::Continue);
                 }
                 LAZY_WAF_STAGE.insert(
                     request_id.clone(),
-                    (
-                        Instant::now(),
+                    (Instant::now(), {
+                        backfill_pending_facts(
+                            &request_id,
+                            request_data.as_ref().expect(
+                                "request data is present until the body stage",
+                            ),
+                        );
                         DeferredVerdict {
                             choice: choice.clone(),
                             context: context.clone(),
@@ -5234,11 +5343,17 @@ impl Plugin for WafPlugin {
                             header_block: false,
                             site_id: site_id.clone(),
                             host: host.clone(),
-                            request_data,
-                        },
-                    ),
+                            request_data: request_data.take().expect(
+                                "request data is present until the body stage",
+                            ),
+                        }
+                    }),
                 );
             }
+        }
+
+        if let Some(request) = request_data.take() {
+            backfill_pending_facts_owned(&request_id, request);
         }
 
         Ok(match outcome {
@@ -7334,6 +7449,130 @@ inspect_body = true"###,
         installed
     }
 
+    /// The access-log fact backfill: the hot path moves the request facts
+    /// into the pending entry and caps the header vector in place; the cold
+    /// path copies them. Both must produce the same log fields.
+    #[tokio::test]
+    async fn test_access_log_facts_backfill_helpers() {
+        fn pending() -> PendingAccess {
+            PendingAccess {
+                site_id: "site-1".to_string(),
+                client_ip: String::new(),
+                method: String::new(),
+                scheme: String::new(),
+                protocol: String::new(),
+                host: "example.com".to_string(),
+                path: String::new(),
+                query: String::new(),
+                user_agent: "ua".to_string(),
+                referer: "ref".to_string(),
+                tls_version: String::new(),
+                country_code: String::new(),
+                user_identity: String::new(),
+                request_headers: Vec::new(),
+                request_body: None,
+                request_body_size: 0,
+                request_body_truncated: false,
+                body_limit: 0,
+                response: None,
+                waf_triggered: false,
+                path_bypasses_challenge: false,
+                path_bypasses_rate_limit: false,
+                start: Instant::now(),
+            }
+        }
+        let headers: Vec<(String, String)> = (0..100)
+            .map(|i| (format!("x-h-{i:03}"), format!("v-{i}")))
+            .collect();
+        let expected_headers =
+            cap_headers(headers.iter().map(|(n, v)| (n.clone(), v.as_str())));
+        let request = RequestData {
+            method: "GET".to_string(),
+            path: "/waf-facts".to_string(),
+            query: "probe=1".to_string(),
+            headers: headers.clone(),
+            body: None,
+            client_ip: "203.0.113.9".to_string(),
+            country_code: Some("US".to_string()),
+            scheme: "https".to_string(),
+            protocol: "HTTP/2.0".to_string(),
+        };
+
+        register_pending_access("facts-move", pending());
+        backfill_pending_facts_owned("facts-move", request.clone());
+        {
+            let entry = PENDING_ACCESS.get("facts-move").unwrap();
+            assert_eq!("GET", entry.method);
+            assert_eq!("/waf-facts", entry.path);
+            assert_eq!("probe=1", entry.query);
+            assert_eq!("203.0.113.9", entry.client_ip);
+            assert_eq!("US", entry.country_code);
+            assert_eq!("https", entry.scheme);
+            assert_eq!("HTTP/2.0", entry.protocol);
+            assert_eq!(expected_headers, entry.request_headers);
+        }
+        PENDING_ACCESS.remove("facts-move");
+
+        register_pending_access("facts-copy", pending());
+        backfill_pending_facts("facts-copy", &request);
+        {
+            let entry = PENDING_ACCESS.get("facts-copy").unwrap();
+            assert_eq!("GET", entry.method);
+            assert_eq!("/waf-facts", entry.path);
+            assert_eq!(expected_headers, entry.request_headers);
+        }
+        PENDING_ACCESS.remove("facts-copy");
+    }
+
+    /// Early-answer paths (paused site, fail-closed edge) emit the access row
+    /// before `handle_request` returns; the request facts must still be on it.
+    #[tokio::test]
+    async fn test_access_log_request_facts_survive_early_paths() {
+        let raw = "GET /waf-facts?probe=1 HTTP/1.1\r\nHost: example.com\r\n\
+                   User-Agent: e2e-agent/1.0\r\n\
+                   Referer: https://ref.example/page\r\n\
+                   X-Facts: yes\r\n\r\n";
+
+        {
+            let (_guard, agent, _dir) = install_paused_agent().await;
+            let plugin = WafPlugin::new(
+                &toml::from_str::<PluginConf>(r###"mode = "block""###).unwrap(),
+            )
+            .unwrap();
+            let RequestPluginResult::Respond(resp) =
+                run_request_raw(&plugin, raw, "203.0.113.11").await
+            else {
+                panic!("expected the paused site to answer");
+            };
+            assert_eq!(http::StatusCode::SERVICE_UNAVAILABLE, resp.status);
+            let entry = agent.client.pop_log().await.unwrap();
+            assert_access_request_facts(&entry, "203.0.113.11");
+        }
+
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let config = AgentConfig {
+                cache_dir: dir.path().to_string_lossy().to_string(),
+                fail_open: false,
+                ..Default::default()
+            };
+            let (_guard, agent, _dir) =
+                install_test_agent_with(config, dir).await;
+            let plugin = WafPlugin::new(
+                &toml::from_str::<PluginConf>(r###"mode = "block""###).unwrap(),
+            )
+            .unwrap();
+            let RequestPluginResult::Respond(resp) =
+                run_request_raw(&plugin, raw, "203.0.113.12").await
+            else {
+                panic!("expected the fail-closed edge to refuse");
+            };
+            assert_eq!(http::StatusCode::SERVICE_UNAVAILABLE, resp.status);
+            let entry = agent.client.pop_log().await.unwrap();
+            assert_access_request_facts(&entry, "203.0.113.12");
+        }
+    }
+
     /// A paused site answers with a 503 maintenance page (and a Retry-After
     /// hint) instead of proxying, while still producing an access log row.
     #[tokio::test]
@@ -7799,6 +8038,44 @@ inspect_body = true"###,
 
     /// Builds one request carrying the client certificate facts the TLS layer
     /// would have put on the connection.
+    /// Run one request with a custom raw request (line + headers) and client
+    /// IP, returning the plugin result. Used by the access-log fact tests.
+    async fn run_request_raw(
+        plugin: &WafPlugin,
+        input_header: &str,
+        client_ip: &str,
+    ) -> RequestPluginResult {
+        let mock_io = Builder::new().read(input_header.as_bytes()).build();
+        let mut session = Session::new_h1(Box::new(mock_io));
+        session.read_request().await.unwrap();
+        let mut ctx = Ctx::default();
+        ctx.conn.client_ip = Some(client_ip.to_string());
+        plugin
+            .handle_request(PluginStep::EarlyRequest, &mut session, &mut ctx)
+            .await
+            .unwrap()
+    }
+
+    /// The access-log request facts an early-answer path must still carry.
+    fn assert_access_request_facts(
+        entry: &pingwaf_agent::client::LogEntry,
+        client_ip: &str,
+    ) {
+        assert_eq!("GET", entry.method);
+        assert_eq!("/waf-facts", entry.path);
+        assert_eq!("probe=1", entry.query_string);
+        assert_eq!(client_ip, entry.client_ip);
+        assert_eq!("example.com", entry.host);
+        assert_eq!("http", entry.scheme);
+        assert_eq!("HTTP/1.1", entry.protocol);
+        assert_eq!("e2e-agent/1.0", entry.user_agent);
+        assert_eq!("https://ref.example/page", entry.referer);
+        assert_eq!(
+            Some("yes"),
+            entry.request_headers.get("x-facts").map(String::as_str)
+        );
+    }
+
     async fn run_request_with_cert(
         plugin: &WafPlugin,
         digest: Option<&str>,
