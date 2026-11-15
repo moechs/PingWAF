@@ -4,13 +4,24 @@ import { cn } from '@/lib/utils'
 export type ButtonVariant = 'primary' | 'secondary' | 'danger' | 'ghost' | 'link'
 export type ButtonSize = 'sm' | 'md' | 'lg' | 'icon'
 
-export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+export interface ButtonBaseProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: ButtonVariant
   size?: ButtonSize
   loading?: boolean
   icon?: ReactNode
   fullWidth?: boolean
 }
+
+/**
+ * Icon-only buttons render no text, so they must carry an `aria-label`
+ * (axe `button-name`). The union makes omitting it a type error whenever
+ * `size="icon"` is used, instead of relying on review to catch it.
+ */
+export type ButtonProps = ButtonBaseProps &
+  (
+    | { size: 'icon'; 'aria-label': string }
+    | { size?: Exclude<ButtonSize, 'icon'> }
+  )
 
 const variantClasses: Record<ButtonVariant, string> = {
   primary:
@@ -32,8 +43,10 @@ const sizeClasses: Record<ButtonSize, string> = {
 }
 
 export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
-  (
-    {
+  (props, ref) => {
+    // The public type is a union that enforces `aria-label` for icon buttons;
+    // the implementation works on the flat shape.
+    const {
       className,
       variant = 'secondary',
       size = 'md',
@@ -43,10 +56,8 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
       children,
       disabled,
       type = 'button',
-      ...props
-    },
-    ref,
-  ) => {
+      ...rest
+    } = props as ButtonBaseProps
     return (
       <button
         ref={ref}
@@ -60,7 +71,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
           fullWidth && 'w-full',
           className,
         )}
-        {...props}
+        {...rest}
       >
         {loading ? (
           <span

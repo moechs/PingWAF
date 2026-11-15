@@ -1124,7 +1124,10 @@ mod tests {
         // silently inert cache exclusion.
         let err = validate("static", "", 3600, 300)
             .expect_err("an empty expression must be rejected");
-        assert!(matches!(err, ApiError::BadRequest(_)));
+        // The cache rule path surfaces the shared expression code unchanged,
+        // so the console can render its specific hint here too.
+        assert_eq!(err.code(), "validation.expression_invalid");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert!(err.to_string().contains("must not be empty"), "{err}");
 
         let err = validate(
@@ -1134,7 +1137,8 @@ mod tests {
             300,
         )
         .expect_err("a mistyped operator must be rejected");
-        assert!(matches!(err, ApiError::BadRequest(_)));
+        assert_eq!(err.code(), "validation.expression_invalid");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert!(err.to_string().contains("not valid"), "{err}");
 
         // Every expression the default cache rules ship with must pass: those

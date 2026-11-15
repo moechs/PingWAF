@@ -31,6 +31,7 @@ import { AgentStatusBanner } from '@/components/AgentStatusBanner'
 import { sitesApi, siteKeys } from '@/api/sites'
 import { wafSettingsApi, wafSettingsKeys } from '@/api/wafSettings'
 import { useCanWrite, useSiteDetail } from '@/hooks'
+import { useAnyUnsaved, useUnsavedGuard } from '@/hooks/useUnsavedGuard'
 import { useSiteStore } from '@/stores/siteStore'
 import type { SiteStatus } from '@/api/types'
 
@@ -54,6 +55,11 @@ export function SiteDetailPage() {
   }, [siteId, setCurrentSiteId])
 
   const detail = useSiteDetail(siteId)
+  // UX-07: every site tab registers its unsaved form state with
+  // `useRegisterUnsaved`; the layout owns the single leave-guard dialog so
+  // switching tabs, following a sidebar link or closing the tab cannot silently
+  // drop edits (the Basic page's timeout/trust cards included).
+  const unsavedDialog = useUnsavedGuard(useAnyUnsaved())
   const site = detail.data?.site
   // The per-site detail bundles the SSL state: with a certificate the site is
   // safely reachable over HTTPS, otherwise fall back to plain HTTP.
@@ -274,6 +280,8 @@ export function SiteDetailPage() {
       </div>
 
       <Outlet />
+
+      {unsavedDialog}
 
       <ConfirmDialog
         open={confirmToggle}

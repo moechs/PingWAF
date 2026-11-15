@@ -9,8 +9,8 @@
 
 | 文档 | 内容 |
 | --- | --- |
-| [quick-start.md](../quick-start.md) | 从零到第一个受保护站点：环境要求、安装、首次运行 |
-| [deployment.md](../deployment.md) | Docker Compose、二进制 + systemd、分布式（server + agent）拓扑 |
+| [quick-start.md](./quick-start.md) | 中文摘要：安装、首次运行与安全默认值（完整版见英文 [quick-start.md](../quick-start.md)） |
+| [deployment.md](./deployment.md) | 中文摘要：部署形态、端口、环境变量、TLS、备份与升级回滚（完整版见英文 [deployment.md](../deployment.md)） |
 | [cli.md](./cli.md) | 管理员二进制 CLI——运行模式、运维子命令（`user`/`mode`/`security`/`config`）、故障处置手册 |
 | [user-guide.md](./user-guide.md) | 控制台使用：站点、规则、策略、IP 访问控制、限流（关键章节中文镜像） |
 | [http-lifecycle.md](./http-lifecycle.md) | 请求生命周期中各功能的作用阶段——WAF 检查顺序、缓存、错误页，以及如何据此排查问题 |

@@ -10,6 +10,73 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+### Security
+
+- **The host installer now verifies the release asset before running it.** It
+  downloads the published `.sha256` sidecar, refuses to continue when it is
+  missing or malformed, checks the archive with `sha256sum -c`, and rejects tar
+  members with absolute or `..` paths before extraction. The old "first
+  executable in the archive" fallback is gone, so a compromised release or
+  download cannot become a root-level install.
+
+- **The installer no longer seeds a known administrator password or exposes the
+  control plane by default.** Without `--admin-password` it generates a random
+  password and prints it once; `admin_addr`/`grpc_addr` now default to
+  `127.0.0.1` (opt in with `--listen-public` / `PINGWAF_LISTEN_PUBLIC`). The
+  compose file publishes the admin and gRPC ports on loopback and has no
+  built-in admin password. A `PINGWAF_SECRET_KEY` is generated into
+  `/etc/pingwaf/pingwaf.env` (0600) and read through `EnvironmentFile=`; an
+  existing key is never silently rotated.
+
+- **Hardened install permissions and storage cleanup.** The installed binary is
+  `root:root 0755`, the systemd unit is written `0600` (it can carry an agent
+  API key), the generated unit gains `ProtectKernel*`, `RestrictSUIDSGID`,
+  `LockPersonality` and `UMask=0077`, and `scripts/sweep-host-storage.sh` keeps
+  volumes by default (opt in with `--prune-volumes`, never removing `waf_*`).
+  PostgreSQL connectivity checks no longer put the password in `psql` argv, and
+  failure messages mask the DSN.
+
+- **Security documentation is actionable again.** `SECURITY.md` now points at a
+  real, monitored disclosure mailbox plus GitHub private vulnerability
+  reporting, lists the current `0.32.x` support line, and documents
+  `PINGWAF_SECRET_KEY`, the sensitive data kept in access logs, and the MCP/AI
+  data boundary. Deployment docs correct the CORS default, add backup/rollback
+  steps for upgrades, and warn that Passkeys require HTTPS.
+
+### Fixed
+
+- **The console shows localised, specific errors for the failures operators hit
+  most.** The control plane now returns `auth.invalid_credentials`,
+  `site.domain_conflict` and `validation.expression_invalid` (same status and
+  message, only the envelope's `code` is new), and the console maps them to
+  zh/en/ja copy in the login form, the site create/clone/edit dialogs and cache
+  rule validation instead of printing raw English.
+
+- **Session expiry returns the operator to the login page.** A rejected refresh
+  now clears the query cache and navigates to `/login?next=…`; signing in again
+  returns to the page that was open, instead of leaving stale data on screen.
+
+- **The console is usable with a keyboard and a screen reader.** Sidebar and
+  active-item text now meet WCAG AA contrast in light and dark themes; every
+  switch, icon button and filter select has an accessible name; the closed AI
+  assistant panel is inert instead of `aria-hidden` with focusable children;
+  hard-coded English ARIA labels are localised.
+
+- **Destructive protection changes require confirmation.** Turning the WAF
+  engine off (or downgrading enforcement to monitor/off, or disabling challenge
+  protection) now opens a confirmation dialog that explains the impact and
+  requires an explicit acknowledgement; a disabled engine shows a persistent
+  warning banner with a one-click re-enable.
+
+- **Unsaved site changes can no longer be lost silently.** The site layout
+  aggregates the dirty state of every tab (including the basic page's timeout
+  and proxy-trust cards), so switching tabs, following a sidebar link or closing
+  the tab asks before discarding edits.
+
+- **The site docs gain a Security page** (disclosure channel, supported
+  versions, hardening checklist) in all five locales, routed from the docs hub.
+
+
 ## [PingWAF 0.32.27] — 2026-11-13
 
 ### Fixed

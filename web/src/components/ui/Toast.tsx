@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from 'react'
 import { createPortal } from 'react-dom'
+import { useTranslation } from 'react-i18next'
 import {
   CheckCircle,
   WarningCircle,
@@ -52,6 +53,7 @@ const toneConfig: Record<ToastTone, { icon: ReactNode; accent: string }> = {
 }
 
 export function ToastProvider({ children }: { children: ReactNode }) {
+  const { t } = useTranslation()
   const [toasts, setToasts] = useState<ToastItem[]>([])
   const counter = useRef(0)
 
@@ -109,26 +111,26 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       {children}
       {createPortal(
         <div className="pointer-events-none fixed bottom-4 right-4 z-[100] flex w-[min(360px,calc(100vw-2rem))] flex-col gap-2">
-          {toasts.map((t) => {
-            const cfg = toneConfig[t.tone]
+          {toasts.map((item) => {
+            const cfg = toneConfig[item.tone]
             return (
               <div
-                key={t.id}
+                key={item.id}
                 role="status"
                 className="pointer-events-auto flex animate-toast-in items-start gap-3 rounded-lg border border-line bg-elevated p-3 shadow-lg"
               >
                 <span className={cn('mt-0.5 shrink-0', cfg.accent)}>{cfg.icon}</span>
                 <div className="min-w-0 flex-1">
-                  <p className="text-sm font-medium text-fg-strong">{t.title}</p>
-                  {t.description && (
+                  <p className="text-sm font-medium text-fg-strong">{item.title}</p>
+                  {item.description && (
                     <p className="mt-0.5 text-[13px] leading-relaxed text-fg-subtle">
-                      {t.description}
+                      {item.description}
                     </p>
                   )}
                 </div>
                 <button
-                  onClick={() => dismiss(t.id)}
-                  aria-label="Dismiss"
+                  onClick={() => dismiss(item.id)}
+                  aria-label={t('a11y.dismissNotification')}
                   className="shrink-0 rounded p-0.5 text-fg-subtle transition-colors hover:bg-recessed hover:text-fg"
                 >
                   <X weight="bold" className="h-3.5 w-3.5" />

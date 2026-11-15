@@ -144,6 +144,13 @@ postgres://pingwaf:pingwaf@localhost:5432/pingwaf
 > curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/deploy/compose/install.sh | bash
 > ```
 >
+> The installer generates a random administrator password (printed **once**, at
+> the end) and a `PINGWAF_SECRET_KEY` in `.env` (mode `0600`), keeps the data
+> volumes on `--force`, and publishes the console (9080) / gRPC (9090) on
+> **`127.0.0.1` only** — set `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` to
+> `0.0.0.0` only behind a reverse proxy or for remote agents, after changing the
+> administrator password.
+>
 > Use the steps below when you want to inspect or edit the compose file first.
 > The command generator on the [install page](https://www.pingwaf.com/install/) writes the same flags.
 
@@ -168,6 +175,7 @@ a reachable instance with the built-in defaults.
 ```bash
 export POSTGRES_PASSWORD="$(openssl rand -hex 16)"
 export JWT_SECRET="$(openssl rand -hex 32)"      # must be >= 16 characters
+export PINGWAF_SECRET_KEY="$(openssl rand -hex 32)"  # seals channel/AI/backup secrets
 export ADMIN_PASSWORD="$(openssl rand -hex 16)"
 ```
 
@@ -177,24 +185,36 @@ export ADMIN_PASSWORD="$(openssl rand -hex 16)"
 cat > .env <<EOF
 POSTGRES_PASSWORD=$(openssl rand -hex 16)
 JWT_SECRET=$(openssl rand -hex 32)
+PINGWAF_SECRET_KEY=$(openssl rand -hex 32)
 ADMIN_EMAIL=admin@pingwaf.local
 ADMIN_PASSWORD=$(openssl rand -hex 16)
 ALLOW_REGISTRATION=false
 RUST_LOG=info,sqlx=warn
 EOF
+chmod 600 .env
 ```
 
-> `.env` holds secrets and is **not** covered by the repository `.gitignore`.
-> Keep it out of version control.
+> `.env` holds secrets (the DSN, `PINGWAF_SECRET_KEY`, the JWT secret and the
+> admin password) and is **not** covered by the repository `.gitignore`. Keep it
+> out of version control, `chmod 600` it, and prefer a secret manager (systemd
+> credentials, Kubernetes Secret, Docker secret) over a plain file.
+>
+> **Back up `PINGWAF_SECRET_KEY` separately from the database.** It encrypts
+> notification-channel secrets, the AI provider key and backup-target
+> credentials; without it those fields are stored in clear text. There is no
+> online rotation — read the rotation note in
+> [`SECURITY.md`](../SECURITY.md#credentials-and-secrets) before changing it.
 
 Compose variables you can set:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `POSTGRES_PASSWORD` | `pingwaf` | PostgreSQL password (also used to build the DSN) |
+| `POSTGRES_PASSWORD` | `pingwaf` (development fallback) | PostgreSQL password (also used to build the DSN). Set a random value for any real deployment |
+| `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` | `127.0.0.1` | Host address the console (9080) / gRPC (9090) publish on; loopback by default |
 | `JWT_SECRET` | `change-me-in-production-use-32-chars` | JWT signing secret, **≥ 16 characters** |
+| `PINGWAF_SECRET_KEY` | unset (required for sealing) | Instance key for sealed secrets (channels, AI key, backup targets); **set 32 random bytes**, unset = clear text. The installer generates it into `.env` |
 | `ADMIN_EMAIL` | `admin@pingwaf.local` | Seeded administrator email |
-| `ADMIN_PASSWORD` | `pingwaf123` | Seeded administrator password |
+| `ADMIN_PASSWORD` | **none — required on a fresh database** | Seeded administrator password; empty makes the first boot fail. The installer generates a random one and prints it once (forced change at first login) |
 | `ALLOW_REGISTRATION` | `false` | Allow new user signups |
 | `HEARTBEAT_INTERVAL` | `15` | Agent heartbeat interval (seconds) |
 | `RUST_LOG` | `info,sqlx=warn` | Tracing log level filter |
@@ -207,7 +227,11 @@ docker compose up -d
 ```
 
 By default Compose pulls the pre-built image
-`ghcr.io/shuaizend/pingwaf:latest`. To build from source instead, uncomment the
+`ghcr.io/shuaizend/pingwaf:latest`. **Pin a release for production** — set
+`PINGWAF_TAG=0.32.27` (or the current version) in `.env` instead of tracking a
+mutable tag, and follow [Upgrade Procedure](./deployment.md#upgrade-procedure)
+(take a database snapshot first; roll back by re-pinning the previous tag). To
+build from source instead, uncomment the
 `build:` section in [`docker-compose.yml`](../docker-compose.yml) and run
 `docker compose up -d --build` — the multi-stage [`Dockerfile`](../Dockerfile)
 (Node 26.12.1 frontend build → Rust 1.98 builder with protoc/cmake/nasm → minimal
@@ -248,7 +272,7 @@ Browse to **<https://localhost:9080>** and log in with:
 | Field | Value |
 | --- | --- |
 | Email | `admin@pingwaf.local` (or your `ADMIN_EMAIL`) |
-| Password | the value of `ADMIN_PASSWORD` (`pingwaf123` if you did not set one) |
+| Password | the `ADMIN_PASSWORD` you set in `.env` — the compose file has **no default** (an empty value makes the first boot fail), and the official installer generates a random one and prints it once |
 
 The certificate is self-signed on first boot, so the browser shows a warning
 until you either trust it or upload a real certificate under **Settings →
@@ -266,7 +290,7 @@ your browser and switchable in the header.
 ```bash
 TOKEN=$(curl -sk -X POST https://localhost:9080/api/v1/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"email":"admin@pingwaf.local","password":"pingwaf123"}' \
+  -d '{"email":"admin@pingwaf.local","password":"'"$ADMIN_PASSWORD"'"}' \
   | jq -r .access_token)
 
 curl -sk https://localhost:9080/api/v1/sites \
@@ -472,7 +496,7 @@ The health endpoint answers on both schemes, so a plain-HTTP probe keeps
 working; everything else is served over HTTPS and redirects otherwise.
 
 Then open <https://localhost:9080> and log in with `admin@pingwaf.local` /
-your `--admin-password` (`pingwaf123` if you did not override it).
+the `--admin-password` you passed, or the random password the installer printed once at the end (there is no built-in default).
 
 Stop with `Ctrl-C` in the foreground, or `kill <pid>` when backgrounded.
 
@@ -490,14 +514,24 @@ also ships a hardened unit file, [`pingwaf.service`](../pingwaf.service).
 >
 > - **Interactive** — download the script and run `bash install.sh` on a
 >   terminal: it asks for the deployment mode, the admin credentials (e-mail
->   and password twice; empty keeps the default, forced to change at first
->   login), the PostgreSQL URL, the dashboard certificate SANs and the
->   version, shows an installation plan, and asks for confirmation.
+>   and password twice; leaving the password empty generates a random one,
+>   printed once at the end), the PostgreSQL URL, the dashboard certificate
+>   SANs and the version, shows an installation plan, and asks for
+>   confirmation.
 > - **One line, unattended** —
 >   `curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh | sudo bash -s -- --mode all-in-one`
 >   installs with the given values and defaults and never prompts (piping
 >   means there is no terminal to prompt on; flags go after `-s --`).
 >   `--dry-run` prints the resolved plan without changing anything.
+>
+> The installer is fail-closed: it **verifies the release `.sha256`** and aborts
+> on a missing/mismatched checksum; it **generates `PINGWAF_SECRET_KEY`** and
+> writes it to `/etc/pingwaf/pingwaf.env` (mode `0600`, read by the systemd
+> unit), keeping an existing key on upgrade. The dashboard (9080) and gRPC
+> (9090) bind to **`127.0.0.1`** by default; `--listen-public` (or
+> `PINGWAF_LISTEN_PUBLIC=1`) publishes them on `0.0.0.0` — use that only behind
+> a reverse proxy or for remote agents, and change the administrator password
+> first.
 >
 > On macOS there are no release binaries — build via
 > [Path 2](#path-2-build-from-source), then follow the steps below.
@@ -728,14 +762,14 @@ one:
 | --- | --- | --- | --- |
 | `--jwt-secret` | `PINGWAF_JWT_SECRET` | `change-me-in-production` | JWT signing secret, **≥ 16 characters** |
 | `--admin-email` | `PINGWAF_ADMIN_EMAIL` | `admin@pingwaf.local` | Seeded administrator email |
-| `--admin-password` | `PINGWAF_ADMIN_PASSWORD` | `pingwaf123` | Seeded administrator password |
+| `--admin-password` | `PINGWAF_ADMIN_PASSWORD` | random, printed once | Seeded administrator password; when empty the installer generates one and prints it once |
 | `--serve-frontend` | `PINGWAF_SERVE_FRONTEND` | `true` | Serve the embedded dashboard SPA |
 | — | `PINGWAF_JWT_EXPIRATION_HOURS` | `12` | Access-token lifetime |
 | — | `PINGWAF_ALLOW_REGISTRATION` | `true` (code); compose sets `false` | Allow new user signups |
 | — | `PINGWAF_HEARTBEAT_INTERVAL` | `15` | Heartbeat interval handed to agents (the agent-side `--heartbeat-interval-secs` flag reads the same variable and falls back to `30`) |
 | — | `PINGWAF_DB_MAX_CONNECTIONS` | `20` | Connection pool maximum |
 | — | `PINGWAF_METRIC_RETENTION_DAYS` | `7` | Days of edge-metric samples kept |
-| — | `PINGWAF_CORS_ORIGINS` | `[]` (all) | Allowed CORS origins, comma-separated |
+| — | `PINGWAF_CORS_ORIGINS` | `[]` (same-origin only) | Allowed CORS origins, comma-separated; empty sends no CORS headers |
 | — | `PINGWAF_PASSKEY_ENABLED` / `_RP_NAME` / `_RP_ID` / `_ORIGIN` / `_TRUST_FORWARDED_PROTO` | see [deployment guide](./deployment.md#server-configuration-server) | Passkey (WebAuthn) settings |
 
 A dash means the setting has no counterpart in that column: the server rows

@@ -93,3 +93,23 @@ pingwaf agent
 同梱のユニットは `pingwaf` ユーザーで実行され、`Restart=always`、`LimitNOFILE=65536`、`ProtectSystem=strict` を設定し、書き込みは `/var/lib/pingwaf` と `/etc/pingwaf` に限定します。reload シグナルはなく、設定変更はコントロールプレーン経由、バイナリやユニットの変更は `systemctl restart pingwaf` が必要です。
 
 コンソールは初回起動から自己署名証明書で HTTPS を提供します。生成前に `PINGWAF_TLS_SANS` に実際のホスト名を設定するか、**設定 → コントロールプレーン HTTPS** で証明書をアップロードしてください。TLS 終端プロキシの背後に置く場合は `PINGWAF_TLS_ENABLED=false` を設定します。
+
+## セキュリティ
+
+コンソールを localhost 以外へ公開する前に、
+[SECURITY.md の強化チェックリスト](https://github.com/shuaiZend/PingWAF/blob/main/SECURITY.md#hardening-checklist)
+を順に実施してください。要点は、既定の管理者パスワードの変更、
+`PINGWAF_JWT_SECRET` と `PINGWAF_SECRET_KEY` をそれぞれ 32 バイトの乱数に設定、
+セルフサービス登録を無効のままにする（`PINGWAF_ALLOW_REGISTRATION=false`）、
+`9080`/`9090` を信頼できるネットワークのみに公開、gRPC TLS を有効のまま維持、
+各サイトで HTTPS と HSTS を有効化、です。
+
+アクセスログはリクエスト/レスポンスヘッダ（`Authorization`、`Cookie`、
+`Set-Cookie` を含む）と最大 8 KiB のボディをそのまま保持し、既定の保持期間は
+180 日です。PostgreSQL と Elasticsearch を認証情報ストアとして扱ってください。
+MCP の `write` キーは fleet-wide の管理者資格情報であり、内蔵 AI アシスタントは
+ツール結果（サイト、ログ、WAF イベント、監査エントリ）を設定した外部プロバイダへ
+送信します。そのデータがデプロイ外へ出てよい場合にのみ有効化してください。
+脆弱性は
+[GitHub Security Advisories](https://github.com/shuaiZend/PingWAF/security/advisories/new)
+または `security@pingwaf.com` へ非公開で報告してください。

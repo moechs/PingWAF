@@ -212,6 +212,7 @@ export function IpGroupsPage() {
                 <Switch
                   size="sm"
                   checked={row.subscription_enabled}
+                  ariaLabel={t('a11y.toggleSubscription', { name: row.name })}
                   onCheckedChange={(value) =>
                     subscriptionToggleMutation.mutate({
                       id: row.id,
@@ -326,6 +327,7 @@ export function IpGroupsPage() {
         <CardBody>
           <div className="mb-4 flex flex-wrap items-center gap-3">
             <Select
+              aria-label={t('a11y.filterByAction')}
               value={actionFilter}
               onChange={(e) => setActionFilter(e.target.value)}
               options={[
@@ -337,6 +339,7 @@ export function IpGroupsPage() {
               ]}
             />
             <Select
+              aria-label={t('a11y.filterByScope')}
               value={scopeFilter}
               onChange={(e) => setScopeFilter(e.target.value)}
               options={[

@@ -4,11 +4,11 @@ const docs = {
   meta: {
     title: "文档 — PingWAF",
     description:
-      "架构、部署、WAF 引擎与 REST/gRPC API：在生产环境运行 PingWAF 所需的四篇文档。",
+      "架构、部署、WAF 引擎与 REST/gRPC API：在生产环境运行 PingWAF 所需的六篇文档。",
   },
   hero: {
     eyebrow: "文档",
-    title: "读懂 PingWAF 的四篇文档",
+    title: "读懂 PingWAF 的六篇文档",
     lead: "做选型先从架构看起，要安装就看部署，调规则则从 WAF 引擎开始。",
   },
   cards: [
@@ -51,6 +51,14 @@ const docs = {
       lead: "用于自动化的 REST 接口、面向 Agent 的 gRPC 契约与认证方式。",
       minutes: 7,
       topics: ["REST", "gRPC", "认证", "自动化"],
+    },
+    {
+      slug: "security",
+      icon: "lock",
+      title: "安全",
+      lead: "私密报告漏洞、支持版本与上线前的加固清单。",
+      minutes: 8,
+      topics: ["漏洞披露", "支持版本", "加固", "密钥"],
     },
   ],
   sidebarLabel: "文档",

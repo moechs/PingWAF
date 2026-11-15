@@ -23,6 +23,15 @@ use crate::models::{action, mode};
 /// memory lever. 8 KiB is far above anything a hand-written rule needs.
 pub(crate) const MAX_EXPRESSION_LEN: usize = 8 * 1024;
 
+/// Specific machine-readable code for an expression the data plane cannot
+/// compile (empty, oversized or unparsable).
+///
+/// The console keys its localised hint on it; every other validation failure
+/// keeps the default `bad_request` code. Shared with the callers that surface
+/// the error unchanged (`rules`, `rate_limiting`, `cache`).
+pub(crate) const EXPRESSION_INVALID_CODE: &str =
+    "validation.expression_invalid";
+
 /// Upper bound on a PEM bundle handed to the API (bytes, 1 MiB).
 ///
 /// A certificate chain plus key is a few KiB; the cap keeps a pathological
@@ -36,18 +45,27 @@ pub(crate) const MAX_PEM_LEN: usize = 1024 * 1024;
 /// expression fails to parse, so without this check a rule looks enabled in
 /// the console while enforcing nothing.
 pub(crate) fn validate_expression(expression: &str) -> Result<(), ApiError> {
+    // Every rejection below is the same client-facing failure — this
+    // expression cannot be compiled — so they all carry the specific code the
+    // console renders its localised hint from. Status (`400`) and message are
+    // unchanged.
     if expression.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "expression must not be empty".to_string(),
-        ));
+        )
+        .with_code(EXPRESSION_INVALID_CODE));
     }
     if expression.len() > MAX_EXPRESSION_LEN {
         return Err(ApiError::BadRequest(format!(
             "expression must be at most {MAX_EXPRESSION_LEN} bytes"
-        )));
+        ))
+        .with_code(EXPRESSION_INVALID_CODE));
     }
     pingwaf_waf::rules::expression::parse_expression(expression).map_err(
-        |err| ApiError::BadRequest(format!("expression is not valid: {err}")),
+        |err| {
+            ApiError::BadRequest(format!("expression is not valid: {err}"))
+                .with_code(EXPRESSION_INVALID_CODE)
+        },
     )?;
     Ok(())
 }
@@ -298,6 +316,25 @@ mod tests {
         assert!(validate_expression("").is_err());
         assert!(validate_expression("   ").is_err());
         assert!(validate_expression("(http.host eq \"x\"").is_err());
+    }
+
+    /// The console maps this specific code to its localised hint; status and
+    /// message stay what they were (`400`, the parser/limit text).
+    #[test]
+    fn invalid_expressions_carry_their_specific_code() {
+        for bad in ["", "   ", "ip.src == 1.2.3.4"] {
+            let err = validate_expression(bad).expect_err("must be rejected");
+            assert_eq!(err.code(), EXPRESSION_INVALID_CODE, "{bad:?}");
+            assert_eq!(
+                err.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{bad:?}"
+            );
+            assert!(!err.to_string().is_empty(), "{bad:?}");
+        }
+        // A blank *optional* expression stays legal (rate limits treat it as
+        // "every request") and never carries the code.
+        assert!(validate_optional_expression("").is_ok());
     }
 
     #[test]

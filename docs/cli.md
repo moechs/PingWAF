@@ -65,10 +65,24 @@ variable.
 
 Server-only options (`server` / `all-in-one`): `--jwt-secret`
 (`PINGWAF_JWT_SECRET`, default `change-me-in-production`, must be ≥ 16
-characters), `--admin-email` (`PINGWAF_ADMIN_EMAIL`, default
+characters; a placeholder value is replaced by a random secret persisted on
+first boot), `--admin-email` (`PINGWAF_ADMIN_EMAIL`, default
 `admin@pingwaf.local`), `--admin-password` (`PINGWAF_ADMIN_PASSWORD`, default
-`pingwaf123`) and `--serve-frontend` (`PINGWAF_SERVE_FRONTEND`, default
+`pingwaf123` — the compose file and the installers require an explicit password
+or generate a random one) and `--serve-frontend` (`PINGWAF_SERVE_FRONTEND`, default
 `true`).
+
+`--admin-email` / `--admin-password` only **seed** the first administrator when
+the `users` table is empty, and that account is created with a forced password
+change. Changing the flags later does not rotate an existing account — use
+`pingwaf user reset-password` (which also revokes every session).
+
+`PINGWAF_SECRET_KEY` has no flag and is read from the environment only. It
+seals notification-channel secrets, the AI provider API key and backup-target
+credentials at rest; set it to 32 random bytes (`openssl rand -hex 32`), because
+without it those fields are stored in clear text (only a warning is logged).
+Back the key up separately — there is no online rotation. See
+[`SECURITY.md`](../SECURITY.md#credentials-and-secrets).
 
 Agent-only options (`agent` / the agent half of `all-in-one`): `--server-url`
 (`PINGWAF_SERVER_URL`, default `http://localhost:9090`), `--server-ca-cert`
@@ -87,6 +101,29 @@ an earlier one. An argument repeated on the command line wins over the value
 injected from the file, so
 `pingwaf all-in-one --config /etc/pingwaf/pingwaf.toml --tls-enabled false`
 always disables TLS regardless of what the file says.
+
+## Host installer (`install.sh`)
+
+The release installer (not the binary itself) writes the unit, the config and
+the instance secrets. Its security-relevant behaviour:
+
+- **Release checksum** — the release asset's `.sha256` sidecar is downloaded and
+  verified; a missing, malformed or mismatching checksum aborts the install.
+- **Administrator password** — when `--admin-password` / `PINGWAF_ADMIN_PASSWORD`
+  is empty, a random password is generated and printed **once** at the end.
+  There is no built-in default password.
+- **`PINGWAF_SECRET_KEY`** — generated when unset and written to
+  `/etc/pingwaf/pingwaf.env` (mode `0600`, owned by `pingwaf`); the shipped unit
+  reads it via `EnvironmentFile=-/etc/pingwaf/pingwaf.env`. An existing key is
+  kept on upgrade — rotating it silently would make sealed channel/AI/backup
+  credentials unreadable.
+- **Listen addresses** — `--listen-public` (`PINGWAF_LISTEN_PUBLIC=1`) binds the
+  dashboard (`9080`) and gRPC (`9090`) on `0.0.0.0`; **without it both bind
+  `127.0.0.1` only**. Expose them through a TLS reverse proxy (or a private
+  interface plus firewall) and change the administrator password first.
+
+See [deployment.md → Manual Installation](./deployment.md#manual-installation-binary--systemd)
+for the full option table.
 
 ## Maintenance commands
 

@@ -4,11 +4,11 @@ const docs = {
   meta: {
     title: "ドキュメント — PingWAF",
     description:
-      "アーキテクチャ、デプロイ、WAF エンジン、REST/gRPC API。PingWAF を本番運用するための 4 つのドキュメント。",
+      "アーキテクチャ、デプロイ、WAF エンジン、REST/gRPC API。PingWAF を本番運用するための 6 つのドキュメント。",
   },
   hero: {
     eyebrow: "ドキュメント",
-    title: "PingWAF を理解する 4 つのドキュメント",
+    title: "PingWAF を理解する 6 つのドキュメント",
     lead: "評価ならアーキテクチャ、導入ならデプロイ、ルール調整なら WAF エンジンから読み始めてください。",
   },
   cards: [
@@ -51,6 +51,14 @@ const docs = {
       lead: "自動化向け REST、エージェント向け gRPC 契約、認証方式。",
       minutes: 7,
       topics: ["REST", "gRPC", "認証", "自動化"],
+    },
+    {
+      slug: "security",
+      icon: "lock",
+      title: "セキュリティ",
+      lead: "脆弱性の非公開報告、サポートバージョン、公開前の hardening 手順。",
+      minutes: 8,
+      topics: ["脆弱性報告", "サポートバージョン", "hardening", "シークレット"],
     },
   ],
   sidebarLabel: "ドキュメント",

@@ -241,7 +241,8 @@ async fn login(
         )
         .await;
         tracing::debug!(%email, "login failed: unknown account");
-        return Err(ApiError::Unauthorized(INVALID_CREDENTIALS.to_string()));
+        return Err(ApiError::Unauthorized(INVALID_CREDENTIALS.to_string())
+            .with_code("auth.invalid_credentials"));
     };
 
     let valid = verify_password_offloaded(
@@ -252,7 +253,8 @@ async fn login(
     .map_err(|err| ApiError::Internal(err.to_string()))?;
     if !valid {
         tracing::debug!(%email, "login failed: wrong password");
-        return Err(ApiError::Unauthorized(INVALID_CREDENTIALS.to_string()));
+        return Err(ApiError::Unauthorized(INVALID_CREDENTIALS.to_string())
+            .with_code("auth.invalid_credentials"));
     }
     if account.disabled {
         tracing::debug!(%email, "login failed: account disabled");

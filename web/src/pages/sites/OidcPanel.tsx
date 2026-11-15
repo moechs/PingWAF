@@ -12,7 +12,7 @@ import {
   Trash,
 } from '@phosphor-icons/react'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
-import { useUnsavedGuard } from '@/hooks/useUnsavedGuard'
+import { useRegisterUnsaved } from '@/hooks/useUnsavedGuard'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Switch } from '@/components/ui/Switch'
@@ -238,7 +238,7 @@ export function OidcPanel() {
     },
   })
 
-  const unsavedDialog = useUnsavedGuard(dirty)
+  useRegisterUnsaved(dirty)
 
   // Mirrors the control plane's enabled guard, in the same order.
   const effectiveCookieSecret = cookieSecret.cleared
@@ -275,7 +275,6 @@ export function OidcPanel() {
 
   return (
     <div>
-      {unsavedDialog}
       <div className="mb-4 flex items-center justify-end gap-2">
         <Button
           variant="secondary"

@@ -177,10 +177,13 @@ docker compose up -d
 git clone https://github.com/shuaiZend/PingWAF.git && cd PingWAF
 cd web && npm ci && npm run build && cd ..
 cargo build --release --bin pingwaf --features full
+# 首次启动前：关闭自助注册，并设置静态加密主密钥
+PINGWAF_ALLOW_REGISTRATION=false \
+PINGWAF_SECRET_KEY="$(openssl rand -hex 32)" \
 ./target/release/pingwaf all-in-one --db-url "postgres://pingwaf:pingwaf@localhost:5432/pingwaf"
 ```
 
-随后打开控制台 **https://localhost:9080**（HTTPS，首次启动自动生成自签名证书），使用 `admin@pingwaf.local` / `pingwaf123` 登录——**生产环境务必修改默认密码与 `PINGWAF_JWT_SECRET`**。
+随后打开控制台 **https://localhost:9080**（HTTPS，首次启动自动生成自签名证书），使用 `admin@pingwaf.local` / `pingwaf123` 登录——首次登录会强制修改密码。生产环境还必须**设置 `PINGWAF_JWT_SECRET`、备份好生成的 `PINGWAF_SECRET_KEY`、并保持 `PINGWAF_ALLOW_REGISTRATION=false`**——详见[安全加固清单](./SECURITY.md#hardening-checklist)。
 
 👉 完整安装向导、交互式安装器、TLS/端口参数说明见**[官网安装页](https://www.pingwaf.com/zh/install/)**；分步上手见**[官网快速上手页](https://www.pingwaf.com/zh/quickstart/)**；仓库内完整流程（数据库准备、首个站点、分布式 Agent、systemd）见 **[docs/quick-start.md](./docs/quick-start.md)**。
 
@@ -274,7 +277,7 @@ PINGWAF_CONFIG=/etc/pingwaf/pingwaf.toml pingwaf all-in-one   # 等价写法
 
 ## 🤝 参与贡献
 
-欢迎贡献代码！在提交 Pull Request 前，请先阅读 **[CONTRIBUTING.md](./CONTRIBUTING.md)**；如需负责任地报告安全漏洞，请见 **[SECURITY.md](./SECURITY.md)**。
+欢迎贡献代码！在提交 Pull Request 前，请先阅读 **[CONTRIBUTING.md](./CONTRIBUTING.md)**；如需负责任地报告安全漏洞，请见 **[SECURITY.md](./SECURITY.md)**——请通过 [GitHub 私密漏洞报告](https://github.com/shuaiZend/PingWAF/security/advisories/new) 或 `security@pingwaf.com` 私密提交，切勿在公开 Issue 中披露漏洞细节。
 
 ---
 

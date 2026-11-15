@@ -191,6 +191,27 @@ async function readError(response: Response): Promise<ApiError> {
   return new ApiError(message, response.status, code)
 }
 
+/**
+ * Ends a session the server has rejected (UX-06).
+ *
+ * Besides clearing the stored credentials, the browser is sent to the login
+ * page with `?next=<current location>` so signing back in returns the operator
+ * to the page they were on. This is a full navigation rather than a router
+ * push on purpose: it drops the in-memory TanStack Query cache, so data
+ * fetched under the expired identity can never be rendered again (the audit
+ * found the old site list still visible after the token was invalidated).
+ */
+function endExpiredSession(): void {
+  useAuthStore.getState().logout()
+  if (typeof window === 'undefined' || !window.location) return
+  const { pathname, search, hash } = window.location
+  // Already on the login page: `logout()` re-renders the form, no navigation
+  // needed (and a redirect here would loop).
+  if (pathname === '/login') return
+  const next = encodeURIComponent(`${pathname}${search}${hash}`)
+  window.location.replace(`/login?next=${next}`)
+}
+
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { skipAuth } = options
 
@@ -226,8 +247,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   if (!response.ok) {
     const apiError = await readError(response)
     if (apiError.status === 401 && !skipAuth) {
-      // Session is truly over — drop credentials so the router redirects.
-      useAuthStore.getState().logout()
+      // Session is truly over — drop credentials and return to the login page
+      // with the current location so the operator can resume where they were.
+      endExpiredSession()
     }
     throw apiError
   }

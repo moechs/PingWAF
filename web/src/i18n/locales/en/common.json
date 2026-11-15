@@ -1,4 +1,15 @@
 {
+  "a11y": {
+    "breadcrumb": "Breadcrumb",
+    "openNavigation": "Open navigation",
+    "dismissNotification": "Dismiss notification",
+    "filterByAction": "Filter by action",
+    "filterByScope": "Filter by scope",
+    "filterByEventType": "Filter by event type",
+    "filterBySite": "Filter by site",
+    "retentionWindow": "Retention window",
+    "toggleSubscription": "Toggle subscription for {{name}}"
+  },
   "system": {
     "title": "System observability",
     "subtitle": "Wall-clock time attribution for the control plane — shares are elapsed-time percentages, not CPU.",
@@ -303,7 +314,10 @@
     "networkTitle": "Connection lost",
     "networkHint": "Cannot reach the server. Check your network connection.",
     "unknownTitle": "Unknown error",
-    "unknownHint": "An unexpected error occurred. Please try again."
+    "unknownHint": "An unexpected error occurred. Please try again.",
+    "invalidCredentials": "Invalid email or password. Check the address and password, then try again.",
+    "domainConflict": "This domain is already used by another site. Choose a different domain, or edit the existing site.",
+    "expressionInvalid": "The expression is not valid. Check the syntax and field names, then try again."
   },
   "auth": {
     "loginTitle": "Sign in to PingWAF",
@@ -822,6 +836,9 @@
       "general": "General",
       "enable": "Enable CC protection",
       "enableHint": "Challenge clients that exceed the rate threshold.",
+      "disableConfirmTitle": "Turn off challenge protection?",
+      "disableConfirmDescription": "Visitors will no longer be challenged and automatic CC mitigation stops for this site. Only turn it off when the challenge breaks legitimate traffic.",
+      "disableAck": "I understand the challenge will stop protecting this site",
       "challengeLevel": "Challenge level",
       "clearanceDuration": "Clearance duration",
       "minutes": "Minutes a solved challenge stays valid.",
@@ -857,6 +874,15 @@
       "engineHint": "Master switch for this site's WAF engine.",
       "engineCardHint": "When off, the site skips all WAF evaluation: managed rules, custom rules and monitor downgrades are all inert.",
       "engineOffWarn": "The WAF engine is off — requests are not inspected or blocked.",
+      "engineOffConfirmCta": "Turn off WAF engine",
+      "engineOffBannerTitle": "The WAF engine is off",
+      "engineOffConfirmTitle": "Turn off the WAF engine?",
+      "engineOffConfirmDescription": "All requests to {{domain}} stop being inspected, matched against rules or blocked until the engine is turned back on. Only disable it to diagnose a false positive.",
+      "engineOffAck": "I understand this site will run without WAF protection",
+      "engineOffBannerAction": "Turn protection back on",
+      "modeDowngradeTitle": "Switch protection to {{mode}}?",
+      "modeDowngradeDescription": "The site-level mode is what makes the WAF enforce. In {{mode}} mode attacks are no longer blocked; the rules stay configured and take effect again once the mode returns to Block.",
+      "modeDowngradeAck": "I understand attacks will no longer be blocked",
       "detectionTitle": "Detection",
       "detectionHint": "Stricter detection modes, enabled as needed.",
       "enforcementTitle": "Enforcement",

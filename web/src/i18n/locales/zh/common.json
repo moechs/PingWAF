@@ -1,4 +1,15 @@
 {
+  "a11y": {
+    "breadcrumb": "面包屑导航",
+    "openNavigation": "打开导航",
+    "dismissNotification": "关闭通知",
+    "filterByAction": "按动作筛选",
+    "filterByScope": "按作用域筛选",
+    "filterByEventType": "按事件类型筛选",
+    "filterBySite": "按站点筛选",
+    "retentionWindow": "保留时长",
+    "toggleSubscription": "切换 {{name}} 的订阅"
+  },
   "system": {
     "title": "System 观测",
     "subtitle": "控制面的墙钟耗时归因——占比为墙钟耗时占比，非 CPU 占比。",
@@ -303,7 +314,10 @@
     "networkTitle": "连接丢失",
     "networkHint": "无法连接服务器，请检查网络连接。",
     "unknownTitle": "未知错误",
-    "unknownHint": "发生意外错误，请重试。"
+    "unknownHint": "发生意外错误，请重试。",
+    "invalidCredentials": "邮箱或密码不正确。请检查邮箱与密码后重试。",
+    "domainConflict": "该域名已被其他站点使用。请更换域名，或编辑现有站点。",
+    "expressionInvalid": "表达式不合法。请检查语法与字段名后重试。"
   },
   "auth": {
     "loginTitle": "登录 PingWAF",
@@ -822,6 +836,9 @@
       "general": "常规",
       "enable": "启用 CC 防护",
       "enableHint": "对超过速率阈值的客户端发起质询。",
+      "disableConfirmTitle": "关闭质询防护？",
+      "disableConfirmDescription": "关闭后访客不再被质询，本站点的 CC 自动缓解也会停止。仅在质询影响正常访客时关闭。",
+      "disableAck": "我了解质询将不再保护该站点",
       "challengeLevel": "质询级别",
       "clearanceDuration": "放行时长",
       "minutes": "已解决的质询保持有效的分钟数。",
@@ -857,6 +874,15 @@
       "engineHint": "本站点 WAF 引擎的总开关。",
       "engineCardHint": "关闭后本站点跳过所有 WAF 评估：托管规则、自定义规则与监听降级均不生效。",
       "engineOffWarn": "WAF 引擎已关闭——请求不会被检测或拦截。",
+      "engineOffConfirmCta": "关闭 WAF 引擎",
+      "engineOffBannerTitle": "WAF 引擎已关闭",
+      "engineOffConfirmTitle": "关闭 WAF 引擎？",
+      "engineOffConfirmDescription": "关闭后，{{domain}} 的全部请求将不再被检测、匹配规则或拦截，直到重新开启。仅在排查误拦截时临时关闭。",
+      "engineOffAck": "我了解该站点将失去 WAF 防护",
+      "engineOffBannerAction": "重新开启防护",
+      "modeDowngradeTitle": "将防护模式切换为{{mode}}？",
+      "modeDowngradeDescription": "站点级模式决定 WAF 是否实际拦截。切换后该站点不再拦截攻击；规则仍保留，切回“拦截”模式后恢复生效。",
+      "modeDowngradeAck": "我了解攻击将不再被拦截",
       "detectionTitle": "检测",
       "detectionHint": "更严格的检测模式，按需开启。",
       "enforcementTitle": "强制执行",

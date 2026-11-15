@@ -13,7 +13,14 @@ REF="${PINGWAF_REF:-}"
 TAG="${PINGWAF_TAG:-latest}"
 DIR="${PINGWAF_COMPOSE_DIR:-pingwaf}"
 ADMIN_EMAIL="${PINGWAF_ADMIN_EMAIL:-admin@pingwaf.local}"
-ADMIN_PASSWORD="${PINGWAF_ADMIN_PASSWORD:-pingwaf123}"
+# No built-in default password: an empty value is replaced below by a random
+# password, printed exactly once (or reused from an existing .env on --force).
+ADMIN_PASSWORD="${PINGWAF_ADMIN_PASSWORD:-}"
+# Instance key that seals notification/AI/backup credentials at rest. It is
+# generated once into .env and must never be rotated silently: previously
+# sealed credentials cannot be opened with a new key.
+PINGWAF_SECRET_KEY="${PINGWAF_SECRET_KEY:-}"
+ADMIN_PASSWORD_GENERATED=false
 TLS_SANS="${PINGWAF_TLS_SANS:-}"
 HTTP_PORT="${PINGWAF_HTTP_PORT:-80}"
 HTTPS_PORT="${PINGWAF_HTTPS_PORT:-443}"
@@ -35,7 +42,8 @@ Options:
                            (default: v<tag> for a release tag, otherwise main)
   --dir <path>             Directory to create/use (default: ./pingwaf)
   --admin-email <email>    Initial administrator e-mail
-  --admin-password <pw>    Initial administrator password (default: pingwaf123)
+  --admin-password <pw>    Initial administrator password (default: a random
+                           password generated once and printed at the end)
   --tls-sans <list>        Comma-separated SANs for the self-signed dashboard cert
   --http-port <port>       Host port for HTTP (default: 80)
   --https-port <port>      Host port for HTTPS (default: 443)
@@ -47,7 +55,8 @@ Options:
 
 Every option also has a PINGWAF_* environment variable (PINGWAF_TAG,
 PINGWAF_COMPOSE_DIR, PINGWAF_ADMIN_EMAIL, ...), which keeps secrets out of the
-command line and shell history.
+command line and shell history. PINGWAF_SECRET_KEY is generated into .env when
+unset and reused on --force; rotating it breaks previously sealed credentials.
 EOF
 }
 
@@ -72,6 +81,28 @@ require_value() { # $1 option, $2 next argument
 validate_port() { # $1 option, $2 value
     [[ "$2" =~ ^[0-9]+$ ]] || die "$1 must be a number"
     (( 10#$2 >= 1 && 10#$2 <= 65535 )) || die "$1 must be between 1 and 65535"
+}
+
+random_hex() { # $1 bytes (default 32) -> lowercase hex
+    local bytes="${1:-32}"
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex "$bytes"
+    else
+        od -An -tx1 -N "$bytes" /dev/urandom | tr -d ' \n'
+    fi
+}
+
+random_password() { # $1 length (default 32) -> alphanumeric password
+    local length="${1:-32}" raw=""
+    if command -v openssl >/dev/null 2>&1; then
+        raw="$(openssl rand -base64 48 2>/dev/null | tr -dc 'A-Za-z0-9' || true)"
+    else
+        raw="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' || true)"
+    fi
+    if (( ${#raw} < length )); then
+        raw="${raw}$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' || true)"
+    fi
+    printf '%s' "${raw:0:length}"
 }
 
 reject_control_chars() { # $1 label, $2 value
@@ -135,7 +166,8 @@ PingWAF Docker Compose install plan
   directory    : $(cd "$(dirname "$DIR")" 2>/dev/null && pwd || pwd)/$(basename "$DIR")
   image tag    : ${TAG}
   admin e-mail : ${ADMIN_EMAIL}
-  admin passwd : $([[ "$ADMIN_PASSWORD" == "pingwaf123" ]] && echo "default (forced change on first login)" || echo "custom")
+  admin passwd : $([[ -n "$ADMIN_PASSWORD" ]] && echo "custom" || echo "random (generated at install, printed once)")
+  instance key : $([[ -n "$PINGWAF_SECRET_KEY" ]] && echo "from environment" || echo "generated into .env (0600)")
   tls sans     : ${TLS_SANS:-none (covers the hostname used to reach the console)}
   ports        : http ${HTTP_PORT}, https ${HTTPS_PORT}, admin ${ADMIN_PORT}, grpc ${GRPC_PORT}
 EOF
@@ -152,11 +184,49 @@ if [[ -f .env && "$FORCE" != "true" ]]; then
     die "$(pwd)/.env already exists; re-run with --force to rewrite it (data volumes are kept)"
 fi
 
+# Reuse the secrets of an existing .env when --force rewrites it. Rotating the
+# instance key would make every sealed notification/AI/backup credential
+# unreadable (there is no automatic re-encryption).
+existing_secret_key=""
+existing_admin_password=""
+if [[ -f .env ]]; then
+    existing_secret_key="$(sed -n 's/^PINGWAF_SECRET_KEY=//p' .env | head -n1)"
+    existing_admin_password="$(sed -n 's/^ADMIN_PASSWORD=//p' .env | head -n1)"
+    # A .env written by an older installer carries the public default password;
+    # do not keep it (the seeded account already exists, so a fresh random
+    # value here is safe and stops the known default from staying on disk).
+    if [[ "$existing_admin_password" == "pingwaf123" ]]; then
+        existing_admin_password=""
+    fi
+fi
+if [[ -z "$ADMIN_PASSWORD" && -n "$existing_admin_password" ]]; then
+    ADMIN_PASSWORD="$existing_admin_password"
+fi
+if [[ -z "$ADMIN_PASSWORD" ]]; then
+    ADMIN_PASSWORD="$(random_password)"
+    ADMIN_PASSWORD_GENERATED=true
+fi
+if [[ -z "$PINGWAF_SECRET_KEY" ]]; then
+    PINGWAF_SECRET_KEY="$existing_secret_key"
+fi
+if [[ -z "$PINGWAF_SECRET_KEY" ]]; then
+    PINGWAF_SECRET_KEY="$(random_hex 32)"
+fi
+
 printf 'Downloading %s\n' "$COMPOSE_URL"
 if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$COMPOSE_URL" -o docker-compose.yml
+    curl -fsSL --proto '=https' "$COMPOSE_URL" -o docker-compose.yml
 else
     die "curl is required to download the compose file"
+fi
+
+# The compose file is taken from the release tag, so an older tag does not yet
+# carry the hardening this installer assumes. Say so instead of pretending the
+# instance key is in use.
+if ! grep -q 'PINGWAF_SECRET_KEY' docker-compose.yml; then
+    warn "the compose file for tag ${TAG} does not pass PINGWAF_SECRET_KEY to the container;"
+    warn "at-rest sealing of notification/AI/backup credentials stays disabled until"
+    warn "you upgrade to a release whose compose file includes it (or set it in the service)."
 fi
 
 umask 077
@@ -164,6 +234,7 @@ umask 077
     printf 'PINGWAF_TAG=%s\n' "$(env_value "$TAG")"
     printf 'ADMIN_EMAIL=%s\n' "$(env_value "$ADMIN_EMAIL")"
     printf 'ADMIN_PASSWORD=%s\n' "$(env_value "$ADMIN_PASSWORD")"
+    printf 'PINGWAF_SECRET_KEY=%s\n' "$(env_value "$PINGWAF_SECRET_KEY")"
     [[ -n "$TLS_SANS" ]] && printf 'PINGWAF_TLS_SANS=%s\n' "$(env_value "$TLS_SANS")"
     [[ "$HTTP_PORT" != "80" ]] && printf 'PINGWAF_HTTP_PORT=%s\n' "$HTTP_PORT"
     [[ "$HTTPS_PORT" != "443" ]] && printf 'PINGWAF_HTTPS_PORT=%s\n' "$HTTPS_PORT"
@@ -180,8 +251,11 @@ cat <<EOF
 PingWAF is starting.
 
   Console : https://localhost:${ADMIN_PORT}  (self-signed certificate)
+            the admin/gRPC ports are published on 127.0.0.1 by default; set
+            PINGWAF_ADMIN_BIND/PINGWAF_GRPC_BIND to 0.0.0.0 only when a proxy or
+            remote agents need them, and only after changing the password
   Account : ${ADMIN_EMAIL}
-  Password: $([[ "$ADMIN_PASSWORD" == "pingwaf123" ]] && echo "pingwaf123 (forced change at first sign-in)" || echo "the value you supplied (stored in $(pwd)/.env)")
+  Password: $([[ "$ADMIN_PASSWORD_GENERATED" == "true" ]] && echo "${ADMIN_PASSWORD} (generated — shown once, store it now)" || echo "stored in $(pwd)/.env")
 
 The first boot pulls the image and initialises PostgreSQL; the console can take
 a minute to answer. Follow it with:

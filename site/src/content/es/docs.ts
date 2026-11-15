@@ -4,11 +4,11 @@ const docs = {
   meta: {
     title: "Documentación — PingWAF",
     description:
-      "Arquitectura, despliegue, motor WAF y API REST/gRPC: los cuatro documentos necesarios para operar PingWAF en producción.",
+      "Arquitectura, despliegue, motor WAF y API REST/gRPC: los seis documentos necesarios para operar PingWAF en producción.",
   },
   hero: {
     eyebrow: "Documentación",
-    title: "Los cuatro documentos que explican PingWAF",
+    title: "Los seis documentos que explican PingWAF",
     lead: "Empieza por la arquitectura si estás evaluando, por el despliegue si vas a instalar y por el motor WAF si vas a ajustar reglas.",
   },
   cards: [
@@ -51,6 +51,14 @@ const docs = {
       lead: "Endpoints REST para automatización, contrato gRPC para agentes y autenticación.",
       minutes: 7,
       topics: ["REST", "gRPC", "auth", "automatización"],
+    },
+    {
+      slug: "security",
+      icon: "lock",
+      title: "Seguridad",
+      lead: "Cómo reportar vulnerabilidades en privado, qué versiones reciben correcciones y cómo endurecer la instancia antes de exponerla.",
+      minutes: 8,
+      topics: ["divulgación", "versiones", "endurecimiento", "secretos"],
     },
   ],
   sidebarLabel: "Documentación",

@@ -8,11 +8,12 @@ import {
   Gauge,
 } from '@phosphor-icons/react'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
-import { useUnsavedGuard } from '@/hooks/useUnsavedGuard'
+import { useRegisterUnsaved } from '@/hooks/useUnsavedGuard'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Select } from '@/components/ui/Select'
 import { Switch } from '@/components/ui/Switch'
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { TagInput } from '@/components/ui/MultiSelect'
 import { SkeletonCard } from '@/components/ui/Skeleton'
 import { useToast } from '@/components/ui/Toast'
@@ -120,6 +121,10 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
 
   const [config, setConfig] = useState<ChallengeConfig | null>(null)
   const [dirty, setDirty] = useState(false)
+  // UX-04: the challenge gate is the site's CC protection; turning it off is a
+  // protection downgrade, so it needs an explicit acknowledgement.
+  const [confirmDisable, setConfirmDisable] = useState(false)
+  const [disableAck, setDisableAck] = useState(false)
 
   const configQuery = useQuery({
     queryKey: challengeKeys.config(siteId),
@@ -172,7 +177,7 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
     },
   })
 
-  const unsavedDialog = useUnsavedGuard(dirty)
+  useRegisterUnsaved(dirty)
 
   if (configQuery.isPending) {
     return <SkeletonCard className="h-64" />
@@ -191,7 +196,6 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
 
   return (
     <div>
-      {unsavedDialog}
       {config ? (
         <div className="flex flex-col gap-4">
           {/* Under-attack mode is managed from the page-level banner; keep it
@@ -228,7 +232,14 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
               <Switch
                 checked={config.enabled}
                 disabled={!canWrite}
-                onCheckedChange={(enabled) => patch({ enabled })}
+                onCheckedChange={(enabled) => {
+                  if (enabled) {
+                    patch({ enabled: true })
+                    return
+                  }
+                  setDisableAck(false)
+                  setConfirmDisable(true)
+                }}
                 label={t('pages.cc.enable')}
                 description={t('pages.cc.enableHint')}
               />
@@ -323,6 +334,34 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
           </Card>
         </div>
       ) : null}
+
+      <ConfirmDialog
+        open={confirmDisable}
+        onClose={() => {
+          setConfirmDisable(false)
+          setDisableAck(false)
+        }}
+        onConfirm={() => {
+          setConfirmDisable(false)
+          setDisableAck(false)
+          patch({ enabled: false })
+        }}
+        tone="danger"
+        title={t('pages.cc.disableConfirmTitle')}
+        description={t('pages.cc.disableConfirmDescription')}
+        confirmLabel={t('pages.cc.disableConfirmTitle')}
+        disabled={!disableAck}
+      >
+        <label className="flex items-start gap-2.5 text-[13px]">
+          <input
+            type="checkbox"
+            className="mt-0.5 rounded border-border accent-brand"
+            checked={disableAck}
+            onChange={(e) => setDisableAck(e.target.checked)}
+          />
+          <span>{t('pages.cc.disableAck')}</span>
+        </label>
+      </ConfirmDialog>
     </div>
   )
 }

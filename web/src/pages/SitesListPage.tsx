@@ -29,7 +29,11 @@ import { useToast } from '@/components/ui/Toast'
 import { ErrorState } from '@/components/ErrorState'
 import { sitesApi, siteKeys } from '@/api/sites'
 import { ApiError } from '@/api/client'
-import { errorMessage } from '@/api/errors'
+import {
+  isDomainConflictError,
+  localizedErrorMessage,
+  messageForErrorCode,
+} from '@/lib/errorMessages'
 import { analyticsApi, analyticsKeys } from '@/api/analytics'
 import { useCanWrite, useDebouncedValue } from '@/hooks'
 import { formatCompactNumber, formatDateTime, formatNumber } from '@/lib/format'
@@ -239,6 +243,22 @@ export function SitesListPage() {
       invalidate()
       navigate(`/sites/${site.id}/basic`)
     },
+    onError: (err) => {
+      // The backend names the exact failure with a stable code (UX-05); show
+      // the translated hint under the field instead of a raw English toast.
+      if (isDomainConflictError(err)) {
+        setFormErrors((e) => ({
+          ...e,
+          domain:
+            messageForErrorCode('site.domain_conflict') ??
+            t('errors.domainConflict'),
+        }))
+        return
+      }
+      setFormErrors((e) => ({ ...e, top: localizedErrorMessage(err) }))
+    },
+    // Inline error above; suppress the duplicate English toast.
+    meta: { silentToast: true },
   })
 
   const updateSite = useMutation({
@@ -249,6 +269,19 @@ export function SitesListPage() {
       closeDialog()
       invalidate()
     },
+    onError: (err) => {
+      if (isDomainConflictError(err)) {
+        setFormErrors((e) => ({
+          ...e,
+          domain:
+            messageForErrorCode('site.domain_conflict') ??
+            t('errors.domainConflict'),
+        }))
+        return
+      }
+      setFormErrors((e) => ({ ...e, top: localizedErrorMessage(err) }))
+    },
+    meta: { silentToast: true },
   })
 
   /** Pausing takes a site off the air, so it always goes through a confirm. */
@@ -316,25 +349,27 @@ export function SitesListPage() {
       clearSelection()
     },
     onError: (err) => {
-      // 后端域名冲突返回 bad_request，message 含 "already in use by another site"。
-      const isDomainConflict =
-        err instanceof ApiError &&
-        (err.code === 'domain_conflict' || /already in use|conflict/i.test(err.message || ''))
-      if (isDomainConflict) {
+      // The backend names the conflict with `site.domain_conflict`; the shared
+      // classifier also understands the older English message.
+      if (isDomainConflictError(err)) {
         // Localized message under the Domain field; the backend's raw message
         // (English) is kept as a collapsed detail line, not as the alert.
         setCloneConflictDetail(err instanceof ApiError ? err.message || null : null)
         setCloneErrors((e) => ({
           ...e,
-          domain: t('pages.sites.cloneDomainConflict', t('pages.sites.domainConflict')),
+          domain:
+            messageForErrorCode('site.domain_conflict') ??
+            t('pages.sites.cloneDomainConflict', t('pages.sites.domainConflict')),
         }))
       } else {
         setCloneErrors((e) => ({
           ...e,
-          top: errorMessage(err) || t('pages.sites.cloneFailed'),
+          top: localizedErrorMessage(err) || t('pages.sites.cloneFailed'),
         }))
       }
     },
+    // The dialog renders the localized message inline (UX-05).
+    meta: { silentToast: true },
   })
 
   const submitClone = () => {
@@ -784,6 +819,14 @@ export function SitesListPage() {
         }
       >
         <div className="flex flex-col gap-4">
+          {formErrors.top && (
+            <p
+              role="alert"
+              className="rounded-md border border-danger/40 bg-danger/8 px-3 py-2 text-[13px] text-fg-danger"
+            >
+              {formErrors.top}
+            </p>
+          )}
           <Input
             label={t('common.name')}
             value={form.name}

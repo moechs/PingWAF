@@ -19,10 +19,32 @@ curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/deploy/compo
 ```
 
 It creates `./pingwaf`, downloads [`docker-compose.yml`](../docker-compose.yml),
-writes a private `.env` and starts the stack. Re-run it to upgrade (an existing
-`.env` is never overwritten). Add `--tag`, `--admin-email`, `--tls-sans` or the
-port flags to customise, or use the generator at
-<https://www.pingwaf.com/install/> (Chinese: <https://www.pingwaf.com/zh/install/>).
+writes a private `.env` (mode `0600`) and starts the stack. Re-run it to upgrade
+(an existing `.env` is never overwritten without `--force`, and the data volumes
+are kept). The installer:
+
+- **generates a random administrator password** when none is given and prints it
+  **once**, at the end — store it before closing the terminal;
+- **generates `PINGWAF_SECRET_KEY`** into `.env` and reuses it on `--force`;
+  rotating it silently would make every sealed notification/AI/backup credential
+  unreadable;
+- **publishes the console (9080) and gRPC (9090) on `127.0.0.1` only.** Set
+  `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` to `0.0.0.0` (or a private
+  interface) only when a reverse proxy or remote agents need them, and change
+  the administrator password first;
+- **never deletes data volumes.** `--force` rewrites `.env` but keeps
+  `postgres-data` / `pingwaf-data` / `pingwaf-certs`; volume pruning is a
+  separate, explicit action (see [Upgrade Procedure](#upgrade-procedure)).
+
+Add `--tag`, `--admin-email`, `--tls-sans` or the port flags to customise, or use
+the generator at <https://www.pingwaf.com/install/> (Chinese:
+<https://www.pingwaf.com/zh/install/>).
+
+> The compose file is downloaded from the release tag. A tag whose compose file
+> predates the install hardening (no `PINGWAF_SECRET_KEY` pass-through, public
+> 9080/9090 binds, default admin password) prints a warning — upgrade to a
+> release whose compose file includes the hardening instead of assuming the
+> installer's guarantees apply.
 
 Prefer to inspect the files first? Clone the repository and run the same compose
 file manually:
@@ -31,10 +53,11 @@ file manually:
 git clone https://github.com/shuaiZend/PingWAF.git
 cd PingWAF
 
-# Set secrets (recommended)
+# Set secrets (required — there is no built-in default password any more)
 export JWT_SECRET=$(openssl rand -hex 32)
 export ADMIN_PASSWORD=$(openssl rand -hex 16)
 export POSTGRES_PASSWORD=$(openssl rand -hex 16)
+export PINGWAF_SECRET_KEY=$(openssl rand -hex 32)
 
 docker compose up -d
 
@@ -46,7 +69,9 @@ Dashboard: `https://localhost:9080` — served over TLS with a self-signed
 certificate generated on first boot, so the browser warns until it is trusted
 or replaced (**Settings → Control plane HTTPS**). Set `TLS_SANS` to the hostname
 you use if it is not `localhost`.  
-Default credentials: `admin@pingwaf.local` / value of `$ADMIN_PASSWORD`
+Account: `admin@pingwaf.local` / the `ADMIN_PASSWORD` you set. `ADMIN_PASSWORD`
+has **no default**: an empty value makes the first boot fail instead of seeding
+a known account, and the dashboard forces a password change at first login.
 
 ### Binding Ports 80/443 in Containers
 
@@ -128,20 +153,27 @@ The systemd path solves the same problem a different way — the unit grants
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PINGWAF_TAG` | `latest` | PingWAF image tag — pin a release in production |
+| `PINGWAF_TAG` | `latest` | PingWAF image tag — pin a release (or a digest) in production |
 | `PINGWAF_HTTP_PORT` / `PINGWAF_HTTPS_PORT` | `80` / `443` | Host ports for proxied traffic |
 | `PINGWAF_ADMIN_PORT` / `PINGWAF_GRPC_PORT` | `9080` / `9090` | Host ports for the console/API and the agent gRPC endpoint |
+| `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` | `127.0.0.1` | Host address the console/API and the agent gRPC endpoint publish on. **Loopback by default** — a fresh install still has a just-generated administrator password. Set `0.0.0.0` (or a private interface) only behind a reverse proxy / for remote agents, and restrict it with a firewall |
 | `PINGWAF_TLS_SANS` | empty | Comma-separated SANs for the self-signed console certificate |
 | `TLS_ENABLED` | `true` | Serve the console over HTTPS |
-| `POSTGRES_PASSWORD` | `pingwaf` | PostgreSQL password |
+| `POSTGRES_PASSWORD` | `pingwaf` (development fallback) | PostgreSQL password. **Set a random value in `.env`** (`openssl rand -hex 16`) for any real deployment: the compose file still falls back to `pingwaf` when unset, and the compose installer does not generate this one |
 | `POSTGRES_BIND` | `127.0.0.1` | Host address the PostgreSQL port publishes on (`0.0.0.0` exposes it to the network) |
 | `POSTGRES_PORT` | `5432` | Host port for PostgreSQL |
 | `JWT_SECRET` | placeholder | JWT signing secret — leaving the placeholder is safe: a random secret is generated on first boot and persisted (≥16 chars when set) |
+| `PINGWAF_SECRET_KEY` | unset (required for sealing) | Instance key that seals notification-channel secrets, the AI provider key and backup-target credentials at rest. **Set it to 32 random bytes** (`openssl rand -hex 32`); without it those fields are stored in clear text (only a warning is logged). The official installers generate it (`deploy/compose/install.sh` into `.env`; the host installer into `/etc/pingwaf/pingwaf.env`, mode `0600`). Back it up separately and read the rotation note in [`SECURITY.md`](../SECURITY.md#credentials-and-secrets) — there is no online rotation |
 | `ADMIN_EMAIL` | `admin@pingwaf.local` | Initial admin email |
-| `ADMIN_PASSWORD` | `pingwaf123` | Initial admin password (the dashboard forces a change at first login) |
+| `ADMIN_PASSWORD` | **none — required on a fresh database** | Initial admin password. An empty value makes the first boot fail instead of seeding a known account; `deploy/compose/install.sh` generates a random one and prints it once. The dashboard forces a change at first login |
 | `ALLOW_REGISTRATION` | `false` | Allow new user signups |
 | `HEARTBEAT_INTERVAL` | `15` | Agent heartbeat interval (seconds) |
 | `RUST_LOG` | `info,sqlx=warn` | Log level filter |
+
+> `.env` holds the DSN, `PINGWAF_SECRET_KEY`, the JWT secret and the admin
+> password. Keep it `chmod 600`, out of version control, and prefer a secret
+> manager (systemd credentials, Kubernetes Secret, Docker secret) over a plain
+> file.
 
 ## Manual Installation (Binary + systemd)
 
@@ -153,11 +185,10 @@ The installer runs in two modes:
   no arguments it asks, in order: deployment mode (all-in-one / server /
   agent), then for agent mode the control-plane gRPC URL and enrollment API
   key, or for server/all-in-one the administrator e-mail, the administrator
-  password twice (leaving it empty keeps the default, which the dashboard
-  forces to change at first login), the PostgreSQL URL, the certificate SAN
-  list of the dashboard, and the version to install. It then prints an
-  **Installation plan** summary and asks `Continue? [Y/n]` before touching
-  anything.
+  password twice (leaving it empty generates a random password, printed once at
+  the end), the PostgreSQL URL, the certificate SAN list of the dashboard, and
+  the version to install. It then prints an **Installation plan** summary and
+  asks `Continue? [Y/n]` before touching anything.
 - **One-line unattended install** — any argument switches the script to
   fully non-interactive: it installs with the given values and defaults and
   never prompts. Because `curl | bash` has no terminal on stdin, piping the
@@ -186,7 +217,8 @@ and `--no-systemd`:
 | Option | Environment variable | Purpose |
 | --- | --- | --- |
 | `--admin-email` | `PINGWAF_ADMIN_EMAIL` | Seed administrator e-mail (server / all-in-one) |
-| `--admin-password` | `PINGWAF_ADMIN_PASSWORD` | Seed administrator password (server / all-in-one) |
+| `--admin-password` | `PINGWAF_ADMIN_PASSWORD` | Seed administrator password (server / all-in-one); when empty a random password is generated and printed once |
+| `--listen-public` | `PINGWAF_LISTEN_PUBLIC` | Bind the dashboard (9080) and gRPC (9090) on `0.0.0.0` instead of the default `127.0.0.1`. Use it only behind a reverse proxy or for remote agents, and change the administrator password first |
 | `--tls-sans` | `PINGWAF_TLS_SANS` | Comma-separated SANs of the dashboard certificate |
 | `--server-ca-cert` | `PINGWAF_SERVER_CA_CERT` | PEM file with the CA that signed the control plane's gRPC certificate (agent mode, https); readability is verified before installing |
 | `--server-tls-name` | `PINGWAF_SERVER_TLS_NAME` | Name used for SNI and certificate verification when the certificate has no SAN for the URL host (agent mode; requires a release that knows the flag) |
@@ -199,6 +231,25 @@ over as environment variables (`PINGWAF_ADMIN_EMAIL` /
 `PINGWAF_ADMIN_PASSWORD` / `PINGWAF_TLS_SANS`) or as flags — not typed into a
 prompt that will never appear. Run with `--dry-run` first to check the plan
 the script resolved from your options.
+
+**What the installer verifies and generates** (fail-closed where noted):
+
+- **Release checksum** — every release asset ships a `.sha256` sidecar. The
+  installer downloads it and **aborts** when the sidecar is missing, malformed
+  or does not match the archive; a tampered or truncated download is never
+  installed.
+- **Administrator password** — when `--admin-password` /
+  `PINGWAF_ADMIN_PASSWORD` is empty, a random password is generated and printed
+  **once** at the end of the run. There is no built-in default password.
+- **`PINGWAF_SECRET_KEY`** — generated when unset and written to
+  `/etc/pingwaf/pingwaf.env` (mode `0600`, owned by `pingwaf`); the shipped
+  systemd unit reads it through `EnvironmentFile=-/etc/pingwaf/pingwaf.env`.
+  An existing key is kept on upgrade: rotating it silently would make every
+  sealed notification/AI/backup credential unreadable.
+- **Listen addresses** — `127.0.0.1:9080` (console) and `127.0.0.1:9090`
+  (gRPC) by default. `--listen-public` (or `PINGWAF_LISTEN_PUBLIC=1`) publishes
+  them on `0.0.0.0` and prints a reminder to change the administrator password
+  first; prefer a TLS reverse proxy over exposing the console directly.
 
 > Prebuilt release assets are published for **Linux** (amd64/arm64) only; on
 > macOS, [build from source](./quick-start.md#path-2-build-from-source).
@@ -297,7 +348,7 @@ file and in the environment is taken from the environment.
 | `public_host` | string | — | Host the dashboard is reached under from the outside (optionally with port); pinned into the HTTP-to-HTTPS redirect instead of the client's `Host` header |
 | `jwt_secret` | string | `change-me-in-production` | JWT signing secret (≥16 chars, required) |
 | `admin_email` | string | `admin@pingwaf.local` | Seeded admin email |
-| `admin_password` | string | `pingwaf123` | Seeded admin password |
+| `admin_password` | string | `pingwaf123` | Seeded admin password. Only used to seed an empty `users` table; the compose file sets no default and the installers generate a random password when unset |
 | `serve_frontend` | bool | `true` | Serve the embedded dashboard SPA for non-API routes |
 | `tls_enabled` | bool | `true` | Serve the REST API + dashboard over HTTPS; cleartext requests get a `308` redirect, health probes are exempt. Turn off behind a TLS-terminating proxy |
 | `tls_sans` | string[] | hostname, `localhost`, `127.0.0.1` | Subject alternative names of the generated self-signed certificate |
@@ -312,13 +363,21 @@ and therefore no file key:
 | `PINGWAF_HEARTBEAT_INTERVAL` | `15` | Heartbeat interval handed to agents at registration. The agent-side `--heartbeat-interval-secs` flag reads the same variable and falls back to `30` |
 | `PINGWAF_DB_MAX_CONNECTIONS` | `20` | Connection pool maximum |
 | `PINGWAF_METRIC_RETENTION_DAYS` | `7` | Days of edge-metric samples kept in `agent_metrics` |
-| `PINGWAF_CORS_ORIGINS` | `[]` (all) | Allowed CORS origins, comma-separated |
-| `PINGWAF_PASSKEY_ENABLED` | `true` | Offer passkey (WebAuthn) registration and login |
+| `PINGWAF_CORS_ORIGINS` | `[]` (same-origin only) | Allowed CORS origins, comma-separated. With no value the API sends **no** CORS headers, so only same-origin callers work |
+| `PINGWAF_SECRET_KEY` | unset | Instance key for sealed secrets (notification channels, AI provider key, backup-target credentials). Set 32 random bytes; unset = clear text. No online rotation — see [`SECURITY.md`](../SECURITY.md#credentials-and-secrets) |
+| `PINGWAF_PASSKEY_ENABLED` | `true` | Offer passkey (WebAuthn) registration and login. Passkeys need a secure context: HTTPS under a hostname, or `localhost` |
 | `PINGWAF_PASSKEY_RP_NAME` | `PingWAF` | Relying party name shown by the authenticator |
 | `PINGWAF_PASSKEY_RP_ID` | derived from the request | Relying party ID, i.e. the effective domain |
 | `PINGWAF_PASSKEY_ORIGIN` | derived from the request | Origin the dashboard is served from |
 | `PINGWAF_PASSKEY_TRUST_FORWARDED_PROTO` | `false` | Believe `X-Forwarded-Proto` when deriving the origin |
 | `PINGWAF_MALLOC_PURGE_DELAY_MS` | derived from memory ceiling | Allocator purge delay in **milliseconds** (mimalloc `mi_option_purge_delay`). Overrides the automatic bucketing (<1 GB → 0, 1-4 GB → 250, 4-16 GB → 500, >16 GB → 1000); `-1` disables purging. The standard `MIMALLOC_PURGE_DELAY` is honoured as a fallback |
+
+> **Passkeys need a secure context.** WebAuthn only works over HTTPS under a
+> hostname (or `localhost`), never plain `http://` or a bare IP. Behind a
+> TLS-terminating proxy set `PINGWAF_PASSKEY_ORIGIN` to the public origin, and
+> `PINGWAF_PASSKEY_TRUST_FORWARDED_PROTO=true` only when that proxy is the one
+> terminating TLS. Ceremony state lives in the database, so several replicas can
+> serve one ceremony without sticky sessions.
 
 The refresh-token lifetime (30 days), the minimum pool size (`1`) and the
 server-side log batch size (`500`) are compiled-in constants with no override.
@@ -899,15 +958,24 @@ A hardening pass before exposing the control plane beyond localhost:
   password is active, and the dashboard forces a password change on first
   login, but do not leave the seed in place. `pingwaf user add-admin` can
   create administrators before boot instead.
+- **Set `PINGWAF_SECRET_KEY`.** 32 random bytes (`openssl rand -hex 32`); it
+  seals notification-channel secrets, the AI provider key and backup-target
+  credentials. Without it those fields are stored in clear text. Back it up
+  separately and read the rotation note in
+  [`SECURITY.md`](../SECURITY.md#credentials-and-secrets) before changing it —
+  there is no online rotation.
+- **Protect the secrets file.** `.env` (DSN, `PINGWAF_SECRET_KEY`, JWT secret,
+  admin password) must be `chmod 600` and out of version control; prefer a
+  secret manager (systemd credentials, Kubernetes Secret, Docker secret).
 - **Give the control plane a real JWT secret.** A placeholder secret (the
   `change-me-…` default or the compose value) makes the server generate and
   persist a random one on first boot, which is safe but rotates whenever the
   persisted copy is lost; set `PINGWAF_JWT_SECRET` explicitly when tokens
   must survive re-provisioning or be shared across instances.
-- **Restrict CORS.** With no `PINGWAF_CORS_ORIGINS` the API answers
-  cross-origin requests from any origin — acceptable when the embedded
-  dashboard is the only client and served from the same origin, but list
-  your dashboard origin(s) explicitly when anything else calls the API.
+- **Restrict CORS.** With no `PINGWAF_CORS_ORIGINS` the API sends no CORS
+  headers at all, so only same-origin callers work — the safe default when the
+  embedded dashboard is the only client. When a split-origin client must call
+  the API, list its exact origin(s) explicitly; never use a wildcard.
 - **Keep gRPC TLS on for cross-network agents.** It is the default: a
   self-signed CA + server certificate is generated on first boot and agents
   verify against it. Replace it with a publicly trusted certificate where
@@ -1029,11 +1097,24 @@ change has to reach the fleet immediately.
 
 ## Upgrade Procedure
 
+Take a backup before every upgrade, and pin the exact version you deploy —
+`:latest` makes an upgrade an unauditable drift and leaves you without a known
+rollback target.
+
 ### Docker
 
 ```bash
-docker compose pull
-docker compose up -d
+cd /path/to/compose            # the directory holding docker-compose.yml and .env
+# 1) Snapshot: database, environment (secrets) and the compose file.
+docker compose exec -T postgres pg_dump -U pingwaf -d pingwaf -Fc > pre-upgrade.dump
+cp .env pre-upgrade.env && chmod 600 pre-upgrade.env
+cp docker-compose.yml pre-upgrade-compose.yml
+# 2) Pin the new version (edit PINGWAF_TAG in .env) and recreate only the app.
+docker compose pull pingwaf
+docker compose up -d pingwaf
+# 3) Verify.
+docker compose ps
+curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # expect 200
 ```
 
 ### Binary
@@ -1047,6 +1128,43 @@ sudo systemctl restart pingwaf
 ```
 
 Database migrations run automatically on startup.
+
+### Rollback
+
+A failed upgrade is recovered by going back to the previous version, not by
+forward-fixing in place:
+
+```bash
+# Docker: put the previous tag back in .env, then recreate the app.
+#   PINGWAF_TAG=<previous-version>
+docker compose up -d pingwaf
+# Binary: reinstall the previous version and restart.
+./install.sh --version PREVIOUS_VERSION && sudo systemctl restart pingwaf
+```
+
+Migrations are **forward-only**: the previous binary may refuse to start against
+a database a newer release has already migrated. If that happens, restore the
+`pre-upgrade.dump` taken above (and the matching `.env`) before starting the old
+version. Keep the dump until the new version has served traffic for a full day.
+
+> **Installer upgrades keep your secrets and volumes.** The compose installer
+> reuses the administrator password and `PINGWAF_SECRET_KEY` from the existing
+> `.env` on `--force`, and never deletes `postgres-data` / `pingwaf-data` /
+> `pingwaf-certs`; the binary installer keeps `/etc/pingwaf/pingwaf.env` (the
+> instance key). If you need to reclaim host disk, the only volume-pruning path
+> is `scripts/sweep-host-storage.sh --prune-volumes`, which removes unused
+> **non-PingWAF** volumes only — names starting `waf_` are never touched.
+>
+> A compose file downloaded from an **older release tag** does not carry the
+> install hardening (loopback binds, `PINGWAF_SECRET_KEY` pass-through, no
+> default admin password). The installer warns about it; upgrade to a release
+> whose compose file includes those changes rather than assuming the
+> guarantees apply.
+
+> The control plane and its embedded agent are one process in `all-in-one` mode,
+> so an upgrade briefly interrupts the data plane (seconds). Distributed
+> deployments upgrade the control plane first, then let agents pick up the new
+> bundle; see [Agent Self-Upgrade](#agent-self-upgrade).
 
 ### Agent Self-Upgrade
 

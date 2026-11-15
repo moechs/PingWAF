@@ -5504,6 +5504,16 @@ Because the route hangs off the root router, the 9080 self-protection stack —
 access log, IP allowlist, WAF ([see API protection](#get-settingsapi-protection))
 — applies to `/mcp` exactly as it does to the REST API.
 
+**Data boundary.** A `write` key whose owner is an administrator is fleet-wide
+and can call the admin-only tools (control-plane audit log, defense settings,
+site pause); a `read` key only sees the sites its owner owns. The built-in AI
+assistant calls these same tools, and sends your messages plus the tool results
+— site metadata, access logs, WAF events and, for an administrator, audit
+entries — to the OpenAI-compatible provider configured under **Settings → AI
+assistant**. Enable it only where that data may leave the deployment, and keep
+`allow_write_tools` off unless you accept that a prompt-injected model could
+change live configuration.
+
 ### GET /settings/mcp
 
 Introspection for the MCP endpoint, used by the Settings card: where the

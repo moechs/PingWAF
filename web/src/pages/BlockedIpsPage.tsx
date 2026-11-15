@@ -359,6 +359,7 @@ export function BlockedIpsPage() {
         <CardBody>
           <div className="mb-4 flex flex-wrap items-center gap-3">
             <Select
+              aria-label={t('a11y.filterBySite')}
               value={siteFilter}
               onChange={(e) => setSiteFilter(e.target.value)}
               options={[

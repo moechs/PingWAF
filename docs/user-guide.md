@@ -8,7 +8,7 @@
    until you upload a real one under Settings → Control plane HTTPS)
 2. Log in with the seeded credentials:
    - Email: `admin@pingwaf.local`
-   - Password: `pingwaf123`
+   - Password: the one the deployment was seeded with — the `ADMIN_PASSWORD` you configured, or the random password the installer printed once. Only a bare binary started without `PINGWAF_ADMIN_PASSWORD` falls back to the shipped `pingwaf123`; compose and the installers have no default password
 3. **Change your password when prompted**: the console blocks the whole UI
    behind a change-password dialog on the first sign-in (the server refuses
    every authenticated request except the auth endpoints). Changing the
@@ -842,7 +842,7 @@ branded answer instead of the gateway's plain default 404.
 **Access Logs**: `Logs → Access`
 - All proxied requests with timing information
 - Filter by status code, path, client IP
-- Request headers and a body preview (first 1 KiB) are stored in PostgreSQL, so requests can be inspected from the dashboard without Elasticsearch
+- Request headers and a body preview (up to 8 KiB by default — `--max-body-log-size`, `0` disables body capture) are stored in PostgreSQL, so requests can be inspected from the dashboard without Elasticsearch. Headers are kept **verbatim**, including `Authorization`, `Cookie` and `Set-Cookie`, so treat the log store as a credential store: restrict database/Elasticsearch access, encrypt their backups, and keep the retention window as short as investigations allow — see [Log Retention](#log-retention).
 - Static-asset requests (path ending in a configured suffix) that triggered no security rule are not recorded when the deployment-wide filter is on — see [Log Retention](#log-retention). Requests that did trigger a rule always appear here
 
 #### Unassigned (no Host header) traffic
@@ -960,6 +960,20 @@ Roles:
 Self-lockout is prevented: an administrator can neither downgrade nor disable
 their own account, and the last enabled administrator can never lose admin
 access.
+
+### Passkeys (WebAuthn)
+
+Passkeys add a phishing-resistant way to sign in. Register one from **Profile**
+(the account page at `/profile`, which also lists and renames existing
+passkeys), then use the authenticator — Touch ID, Windows Hello or a hardware
+security key — on the login page instead of typing the password. Passkeys
+require a **secure context**: HTTPS under a hostname, or `localhost`. They do
+not work over plain `http://` or a bare IP, and behind a TLS-terminating proxy
+`PINGWAF_PASSKEY_ORIGIN` must name the public origin (see
+[deployment.md](./deployment.md)). A lost device is not a lockout: sign in with
+the password, delete the old passkey on **Profile**, and register the new
+device. Administrators can turn the feature off deployment-wide with
+`PINGWAF_PASSKEY_ENABLED=false`.
 
 ### Forced First-Sign-In Password Change
 
@@ -1172,6 +1186,8 @@ The console embeds an AI assistant that answers questions about your deployment 
 
 **Test draft** verifies the provider without saving. Once enabled, ask a question on the AI Assistant page and watch tool calls appear inline as the answer streams. Conversations are stored server-side, so history survives reloads, and the assistant is administrator-only.
 
+**Data boundary:** the assistant calls the same MCP tools as external clients. Every question and every tool result it receives — site metadata, access logs, WAF events and, for an administrator, control-plane audit entries — is sent to the provider configured above. Enable it only where that data may leave your deployment, and review the provider's retention and data-processing terms. **Allow write tools** is off by default; leave it off unless you accept that a prompt-injected model could change live configuration.
+
 ## MCP Server
 
 ```
@@ -1187,7 +1203,7 @@ claude mcp add --transport http pingwaf https://waf.example.com:9080/mcp \
   --header "Authorization: Bearer pwk_YOUR_KEY"
 ```
 
-Read-only credentials see only the read tools; administrators with a `write` key may also call `set_observation_mode` and `set_site_status`. The endpoint sits behind the same API protection as the console (access log, IP allowlist, WAF), so it obeys whatever **Settings → API protection** allows.
+**Scope:** a `read` key is accepted but narrowed to the sites its owner owns; only a `write` key whose owner is an administrator is fleet-wide and can call the admin-only tools (the control-plane audit log, defense settings, site pause). Read-only credentials see only the read tools; administrators with a `write` key may also call `set_observation_mode` and `set_site_status`. Treat a `write` key like a dashboard administrator credential — do not hand it to an AI client you do not control. The endpoint sits behind the same API protection as the console (access log, IP allowlist, WAF), so it obeys whatever **Settings → API protection** allows.
 
 When the console is behind a load balancer or reverse proxy, enable **Settings →
 API protection → Trust reverse proxy headers**, name the forwarded header

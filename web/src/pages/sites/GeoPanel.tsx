@@ -21,7 +21,7 @@ import {
   ResponsiveContainer,
 } from 'recharts'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
-import { useUnsavedGuard } from '@/hooks/useUnsavedGuard'
+import { useRegisterUnsaved } from '@/hooks/useUnsavedGuard'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Select } from '@/components/ui/Select'
@@ -119,7 +119,7 @@ export function GeoPanel() {
     },
   })
 
-  const unsavedDialog = useUnsavedGuard(dirty)
+  useRegisterUnsaved(dirty)
 
   const statsData = useMemo(
     () =>
@@ -156,7 +156,6 @@ export function GeoPanel() {
 
   return (
     <div>
-      {unsavedDialog}
       <div className="mb-4 flex items-center justify-end gap-2">
         <Button
           variant="secondary"

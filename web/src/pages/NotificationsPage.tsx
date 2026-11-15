@@ -183,6 +183,7 @@ export function NotificationsPage() {
               size="sm"
               variant="ghost"
               onClick={() => testMutation.mutate(row.id)}
+              aria-label={t('pages.notifications.test')}
               title={t('pages.notifications.test')}
             >
               <PaperPlaneTilt className="h-4 w-4" />
@@ -193,6 +194,7 @@ export function NotificationsPage() {
                   size="sm"
                   variant="ghost"
                   onClick={() => setEditing(row)}
+                  aria-label={t('common.edit')}
                   title={t('common.edit')}
                 >
                   <Pencil className="h-4 w-4" />
@@ -201,6 +203,7 @@ export function NotificationsPage() {
                   size="sm"
                   variant="ghost"
                   onClick={() => setPendingDelete(row)}
+                  aria-label={t('common.delete')}
                   title={t('common.delete')}
                 >
                   <Trash className="h-4 w-4 text-danger" />
@@ -278,6 +281,7 @@ export function NotificationsPage() {
               </h3>
               <Select
                 className="w-56"
+                aria-label={t('a11y.filterByEventType')}
                 value={eventTypeFilter}
                 onChange={(e) => {
                   setEventTypeFilter(e.target.value)
@@ -305,6 +309,7 @@ export function NotificationsPage() {
                   <div className="flex items-center gap-1">
                     <Select
                       className="w-32"
+                      aria-label={t('a11y.retentionWindow')}
                       value={String(purgeDays)}
                       onChange={(e) => setPurgeDays(Number(e.target.value))}
                       options={[7, 30, 90].map((d) => ({

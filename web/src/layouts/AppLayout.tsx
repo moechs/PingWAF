@@ -227,7 +227,7 @@ export function AppLayout() {
             size="icon"
             variant="ghost"
             className="md:hidden"
-            aria-label="Open navigation"
+            aria-label={t('a11y.openNavigation')}
             onClick={() => setMobileOpen(true)}
             icon={<List weight="bold" className="h-5 w-5" />}
           />
@@ -239,7 +239,7 @@ export function AppLayout() {
             <button
               type="button"
               onClick={() => setPaletteOpen(true)}
-              className="relative hidden h-9 w-64 cursor-pointer rounded-md border border-line bg-recessed text-left text-sm text-fg-subtle/70 transition-colors hover:border-focus focus:border-focus focus:outline-none lg:block"
+              className="relative hidden h-9 w-64 cursor-pointer rounded-md border border-line bg-recessed text-left text-sm text-fg-subtle transition-colors hover:border-focus focus:border-focus focus:outline-none lg:block"
             >
               <MagnifyingGlass
                 weight="duotone"
@@ -544,7 +544,7 @@ function DropdownItem({
       role={role}
       className={cn(
         'flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm transition-colors',
-        active ? 'bg-brand-soft text-brand' : 'text-fg hover:bg-recessed',
+        active ? 'bg-brand-soft text-fg-brand-strong' : 'text-fg hover:bg-recessed',
       )}
     >
       {icon}

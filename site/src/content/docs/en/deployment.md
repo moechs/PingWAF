@@ -97,3 +97,24 @@ The shipped `pingwaf.service` runs as the `pingwaf` user with `Restart=always`, 
 ## TLS on the control plane
 
 The dashboard is HTTPS from the first boot with a generated self-signed certificate. Set `PINGWAF_TLS_SANS` to the hostname you actually use (comma separated) before generating it, or upload a real certificate under **Settings → Control plane HTTPS**. When the console sits behind a TLS-terminating proxy, set `PINGWAF_TLS_ENABLED=false`.
+
+## Security
+
+Before exposing the console beyond localhost, work through the hardening
+checklist in
+[SECURITY.md](https://github.com/shuaiZend/PingWAF/blob/main/SECURITY.md#hardening-checklist).
+The essentials: change the seeded administrator password, set
+`PINGWAF_JWT_SECRET` and `PINGWAF_SECRET_KEY` to 32 random bytes each, keep
+self-service registration off (`PINGWAF_ALLOW_REGISTRATION=false`), bind
+`9080`/`9090` to trusted networks, keep gRPC TLS on, and enable HTTPS + HSTS on
+every site.
+
+Access logs keep request/response headers verbatim — including
+`Authorization`, `Cookie` and `Set-Cookie` — plus up to 8 KiB of each body, for
+180 days by default, so treat PostgreSQL and Elasticsearch as credential
+stores. MCP `write` keys are fleet-wide administrator credentials, and the
+built-in AI assistant sends tool results (sites, logs, WAF events, audit
+entries) to the provider you configure: enable it only where that data may
+leave the deployment. Report vulnerabilities privately through
+[GitHub Security Advisories](https://github.com/shuaiZend/PingWAF/security/advisories/new)
+or `security@pingwaf.com`.

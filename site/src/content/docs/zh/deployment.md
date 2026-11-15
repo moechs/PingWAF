@@ -97,3 +97,19 @@ pingwaf agent
 ## 控制面 TLS
 
 控制台从首次启动起就使用生成的自签证书提供 HTTPS。请在生成前用 `PINGWAF_TLS_SANS`（逗号分隔）指定实际访问的主机名，或在 **设置 → 控制面 HTTPS** 上传真实证书。若控制台位于 TLS 终止代理之后，设置 `PINGWAF_TLS_ENABLED=false`。
+
+## 安全
+
+把控制台暴露到 localhost 之外前，请逐项完成
+[SECURITY.md 加固清单](https://github.com/shuaiZend/PingWAF/blob/main/SECURITY.md#hardening-checklist)。
+要点：修改默认管理员口令；把 `PINGWAF_JWT_SECRET` 与 `PINGWAF_SECRET_KEY` 都设为
+32 字节随机值；保持自助注册关闭（`PINGWAF_ALLOW_REGISTRATION=false`）；
+`9080`/`9090` 只对可信网络开放；保持 gRPC TLS 开启；为每个站点启用 HTTPS 与 HSTS。
+
+访问日志会原样保存请求/响应头（含 `Authorization`、`Cookie`、`Set-Cookie`）与最多
+8 KiB 的 body，默认保留 180 天，因此请把 PostgreSQL 与 Elasticsearch 当作凭据存储。
+MCP 的 `write` key 等同于 fleet-wide 管理员凭据；内置 AI 助手会把工具结果（站点、
+日志、WAF 事件、审计条目）发送给所配置的第三方 provider——仅在该数据允许离开部署时
+启用。漏洞请通过
+[GitHub Security Advisories](https://github.com/shuaiZend/PingWAF/security/advisories/new)
+或 `security@pingwaf.com` 私密报告。

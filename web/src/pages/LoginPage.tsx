@@ -23,7 +23,8 @@ import { useToast } from '@/components/ui/Toast'
 import { supportedLanguages } from '@/i18n'
 import { authApi } from '@/api/auth'
 import { passkeysApi } from '@/api/passkeys'
-import { handleApiError, errorMessage } from '@/api/errors'
+import { handleApiError } from '@/api/errors'
+import { localizedErrorMessage } from '@/lib/errorMessages'
 import { isPasskeyCancellation, passkeysSupported } from '@/lib/webauthn'
 import type { LoginResponse } from '@/api/types'
 
@@ -36,6 +37,18 @@ interface LocationState {
   from?: string
 }
 
+/**
+ * Resume path from `?next=` (UX-06): only an absolute path on this origin is
+ * accepted. `//host` and full URLs would turn the login page into an open
+ * redirect, and `/login` itself would loop.
+ */
+function safeNextPath(raw: string | null): string | null {
+  const value = raw?.trim()
+  if (!value || !value.startsWith('/') || value.startsWith('//')) return null
+  if (value.startsWith('/login')) return null
+  return value
+}
+
 export function LoginPage() {
   const { t, i18n } = useTranslation()
   const navigate = useNavigate()
@@ -45,7 +58,14 @@ export function LoginPage() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
   const toast = useToast()
 
-  const redirectTo = (location.state as LocationState | null)?.from ?? '/dashboard'
+  const nextPath = safeNextPath(
+    new URLSearchParams(location.search).get('next'),
+  )
+  const redirectTo =
+    nextPath ?? (location.state as LocationState | null)?.from ?? '/dashboard'
+  // Reaching the form with `?next=` means the session expired mid-flow, not
+  // that the operator opened the page directly.
+  const sessionExpired = nextPath !== null
 
   const [modeState, setModeState] = useState<'login' | 'register'>('login')
   const [email, setEmail] = useState('')
@@ -87,7 +107,7 @@ export function LoginPage() {
     onSuccess,
     meta: { silentToast: true },
     onError: (err) => {
-      setFormError(errorMessage(err) || t('auth.invalidCredentials'))
+      setFormError(localizedErrorMessage(err) || t('auth.invalidCredentials'))
       handleApiError(err, { silent: true })
     },
   })
@@ -97,7 +117,7 @@ export function LoginPage() {
     onSuccess,
     meta: { silentToast: true },
     onError: (err) => {
-      setFormError(errorMessage(err))
+      setFormError(localizedErrorMessage(err))
       handleApiError(err, { silent: true })
     },
   })
@@ -109,7 +129,7 @@ export function LoginPage() {
     onError: (err) => {
       // Dismissing the browser's prompt is a normal outcome, not an error.
       if (isPasskeyCancellation(err)) return
-      setFormError(errorMessage(err) || t('auth.passkeyFailed'))
+      setFormError(localizedErrorMessage(err) || t('auth.passkeyFailed'))
       handleApiError(err, { silent: true })
     },
   })
@@ -210,6 +230,16 @@ export function LoginPage() {
             <div className="mt-5 flex items-start gap-2.5 rounded-lg border border-brand/30 bg-brand-soft px-3 py-2.5 text-[13px] leading-relaxed text-fg">
               <WarningCircle weight="fill" className="mt-0.5 h-4 w-4 shrink-0 text-brand" />
               <span>{t('auth.setupNotice')}</span>
+            </div>
+          )}
+
+          {sessionExpired && (
+            <div
+              role="status"
+              className="mt-5 flex items-start gap-2.5 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2.5 text-[13px] leading-relaxed text-fg"
+            >
+              <WarningCircle weight="fill" className="mt-0.5 h-4 w-4 shrink-0 text-fg-warning" />
+              <span>{t('errors.sessionExpiredHint')}</span>
             </div>
           )}
 

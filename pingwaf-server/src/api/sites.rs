@@ -43,6 +43,36 @@ use crate::models::{
     ResponseReplaceRule,
 };
 
+/// Specific machine-readable code for a hostname another site already serves.
+///
+/// The console keys its localised hint on it; the HTTP status (`400`) and the
+/// human-readable message are unchanged. Only the hostname-conflict paths carry
+/// it — every other validation failure keeps the default `bad_request` code.
+const DOMAIN_CONFLICT_CODE: &str = "site.domain_conflict";
+
+/// Tags a hostname conflict with [`DOMAIN_CONFLICT_CODE`].
+///
+/// `ensure_domains_available` reports hostname conflicts (an exact duplicate, a
+/// wildcard overlap, or a hostname under another site's wildcard) as its *only*
+/// `BadRequest`; every other error it can return comes from the database and is
+/// mapped by `From<DbErr>` to `NotFound`/`Conflict`/`Internal`. Matching the
+/// variant therefore tags exactly the conflicts, without string-sniffing.
+fn site_domain_conflict(err: ApiError) -> ApiError {
+    match err {
+        ApiError::BadRequest(_) => err.with_code(DOMAIN_CONFLICT_CODE),
+        other => other,
+    }
+}
+
+/// [`map_domain_conflict`] for the database-side hostname backstops
+/// (`uq_sites_domain` and the conflict trigger), with the specific code.
+///
+/// A non-conflict database error keeps its default code: `map_domain_conflict`
+/// passes it through `From<DbErr>`, which never produces a `BadRequest`.
+fn map_site_domain_conflict(err: DbErr) -> ApiError {
+    site_domain_conflict(map_domain_conflict(err))
+}
+
 /// Longest accepted route `rewrite_path`, in **bytes**, mirroring
 /// `pingap_config::MAX_REWRITE_PATH_LEN` — the data plane drops anything longer,
 /// so storing it would only lose the route's rewrite later, on the agent side.
@@ -1218,7 +1248,9 @@ async fn create(
     )?;
     let mut all_domains = vec![domain.clone()];
     all_domains.extend(alternate_domains.iter().cloned());
-    ensure_domains_available(&state.db, &all_domains, None).await?;
+    ensure_domains_available(&state.db, &all_domains, None)
+        .await
+        .map_err(site_domain_conflict)?;
 
     let upstream_address = normalize_origin_address(&payload.upstream_address)?;
     validate_upstream(&upstream_address, default_weight())?;
@@ -1274,7 +1306,7 @@ async fn create(
     // The pre-check above is not atomic: a racing create can slip through it.
     // The unique index and the conflicts trigger on `sites` are the backstop.
     .await
-    .map_err(map_domain_conflict)?;
+    .map_err(map_site_domain_conflict)?;
 
     // Every site starts with a default origin pool; the first origin node
     // goes into it.
@@ -1632,7 +1664,9 @@ async fn clone_site(
     )?;
     let mut all_domains = vec![domain.clone()];
     all_domains.extend(alternate_domains.iter().cloned());
-    ensure_domains_available(&state.db, &all_domains, None).await?;
+    ensure_domains_available(&state.db, &all_domains, None)
+        .await
+        .map_err(site_domain_conflict)?;
 
     let user_name = payload
         .name
@@ -1660,7 +1694,10 @@ async fn clone_site(
         alternate_domains,
         timestamp,
     );
-    let model = active.insert(&txn).await.map_err(map_domain_conflict)?;
+    let model = active
+        .insert(&txn)
+        .await
+        .map_err(map_site_domain_conflict)?;
 
     // Upstream pools first: nodes and routes reference them by id, so the
     // clone needs its own pool ids and a mapping from the source's.
@@ -2081,7 +2118,9 @@ async fn update(
 
         let mut all_domains = vec![primary.clone()];
         all_domains.extend(alternates.iter().cloned());
-        ensure_domains_available(&state.db, &all_domains, Some(id)).await?;
+        ensure_domains_available(&state.db, &all_domains, Some(id))
+            .await
+            .map_err(site_domain_conflict)?;
 
         active.domain = Set(primary);
         active.alternate_domains = Set(alternates);
@@ -2185,7 +2224,7 @@ async fn update(
         .await
         // Same backstop as create: the uniqueness check above is a pre-check,
         // the DB constraint decides under concurrency.
-        .map_err(map_domain_conflict)?;
+        .map_err(map_site_domain_conflict)?;
     tracing::info!(%id, "site updated");
     notify_config_changed(&state, id, Some(&current.email)).await;
 
@@ -5277,5 +5316,53 @@ mod tests {
         );
         assert_eq!(clone.trusted_header.unwrap(), "x-real-ip");
         assert_eq!(clone.status.unwrap(), site_status::PAUSED);
+    }
+
+    /// The console renders its localised "this domain is taken" hint from
+    /// `site.domain_conflict`. The pre-check's only `BadRequest` is a hostname
+    /// conflict, so every `BadRequest` from it carries the code; everything
+    /// else keeps its default code and status.
+    #[test]
+    fn domain_conflicts_carry_their_specific_code() {
+        let conflict = ApiError::BadRequest(
+            "domain 'a.example.com' is already served by another site"
+                .to_string(),
+        );
+        let tagged = site_domain_conflict(conflict);
+        assert_eq!(tagged.code(), DOMAIN_CONFLICT_CODE);
+        assert_eq!(tagged.status(), StatusCode::BAD_REQUEST);
+        assert!(tagged.to_string().contains("already served"), "{tagged}");
+
+        for other in [
+            ApiError::NotFound("site 7 not found".to_string()),
+            ApiError::Internal("db is down".to_string()),
+        ] {
+            let expected = other.code();
+            assert_eq!(site_domain_conflict(other).code(), expected);
+        }
+    }
+
+    /// The database-side backstops (the `uq_sites_domain` unique index and the
+    /// conflict trigger) map to the same code; unrelated database failures do
+    /// not become domain conflicts.
+    #[test]
+    fn database_domain_conflicts_carry_the_specific_code() {
+        for message in [
+            "error returned by database: duplicate key value violates unique \
+             constraint \"uq_sites_domain\"",
+            "domain already in use by another site",
+            "domain \"x.example.com\" is already in use by this site",
+        ] {
+            let err =
+                map_site_domain_conflict(DbErr::Custom(message.to_string()));
+            assert_eq!(err.code(), DOMAIN_CONFLICT_CODE, "{message}");
+            assert_eq!(err.status(), StatusCode::BAD_REQUEST, "{message}");
+        }
+
+        let err = map_site_domain_conflict(DbErr::Custom(
+            "connection reset by peer".to_string(),
+        ));
+        assert_ne!(err.code(), DOMAIN_CONFLICT_CODE);
+        assert_eq!(err.code(), "internal_error");
     }
 }

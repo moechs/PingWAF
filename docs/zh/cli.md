@@ -43,7 +43,7 @@ Web 控制台是 `:9080` 控制面的 HTTP 客户端。当控制面本身出问�
 | `--public-host` | `PINGWAF_PUBLIC_HOST` | *（未设置）* | 控制台对外访问的主机名（可带端口）；写死到 HTTP→HTTPS 跳转目标中，取代客户端的 `Host` 头 |
 | `--config` | `PINGWAF_CONFIG` | — | TOML 配置文件；其 `[server]` 与 `[agent]` 表持有相同设置 |
 
-仅 server 侧参数（`server` / `all-in-one`）：`--jwt-secret`（`PINGWAF_JWT_SECRET`，默认 `change-me-in-production`，须 ≥ 16 字符）、`--admin-email`（`PINGWAF_ADMIN_EMAIL`，默认 `admin@pingwaf.local`）、`--admin-password`（`PINGWAF_ADMIN_PASSWORD`，默认 `pingwaf123`）与 `--serve-frontend`（`PINGWAF_SERVE_FRONTEND`，默认 `true`）。
+仅 server 侧参数（`server` / `all-in-one`）：`--jwt-secret`（`PINGWAF_JWT_SECRET`，默认 `change-me-in-production`，须 ≥ 16 字符）、`--admin-email`（`PINGWAF_ADMIN_EMAIL`，默认 `admin@pingwaf.local`）、`--admin-password`（`PINGWAF_ADMIN_PASSWORD`，二进制默认 `pingwaf123`；compose 无默认、安装器会生成随机口令并只打印一次）与 `--serve-frontend`（`PINGWAF_SERVE_FRONTEND`，默认 `true`）。
 
 仅 agent 侧参数（`agent` / `all-in-one` 的 agent 半边）：`--server-url`（`PINGWAF_SERVER_URL`，默认 `http://localhost:9090`）、`--server-ca-cert`（`PINGWAF_SERVER_CA_CERT`）、`--api-key`（`PINGWAF_API_KEY`）、`--cache-dir`（`PINGWAF_CACHE_DIR`，默认 `./data/cache`）、`--fail-open`（`PINGWAF_FAIL_OPEN`，默认 `true`）、`--heartbeat-interval-secs`（`PINGWAF_HEARTBEAT_INTERVAL`，默认 `30`）、`--metrics-ship-interval`（`PINGWAF_METRICS_SHIP_INTERVAL`，默认 `30`），以及 `--log-batch-size`、`--log-flush-interval-secs`、`--max-body-log-size`（仅命令行）。
 

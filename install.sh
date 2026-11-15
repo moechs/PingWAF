@@ -14,8 +14,9 @@
 #   --server-url      Control plane gRPC URL (agent mode)
 #   --api-key         Agent enrollment token (agent mode)
 #   --admin-email     Seed administrator e-mail (server / all-in-one)
-#   --admin-password  Seed administrator password (server / all-in-one)
+#   --admin-password  Seed administrator password (omit to generate a random one)
 #   --tls-sans        Comma separated names of the dashboard certificate
+#   --listen-public   Bind the admin API and gRPC on 0.0.0.0 instead of 127.0.0.1
 #   --no-systemd      Skip systemd service creation
 #   --interactive     Prompt even when the flags would normally skip the questions
 #   --non-interactive Run with the given values and defaults, never prompt
@@ -40,6 +41,112 @@ error()   { printf '%s\n' "${RED}✗ $*${NO_COLOR}" >&2; }
 fatal()   { error "$@"; exit 1; }
 
 has() { command -v "$1" >/dev/null 2>&1; }
+
+# Cryptographically random lowercase hex string (default 32 bytes / 64 chars).
+random_hex() {
+    local bytes="${1:-32}"
+    if has openssl; then
+        openssl rand -hex "$bytes"
+    else
+        od -An -tx1 -N "$bytes" /dev/urandom | tr -d ' \n'
+    fi
+}
+
+# Cryptographically random alphanumeric password (32 characters by default).
+random_password() {
+    local length="${1:-32}" raw=""
+    if has openssl; then
+        raw="$(openssl rand -base64 48 2>/dev/null | tr -dc 'A-Za-z0-9' || true)"
+    else
+        raw="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' || true)"
+    fi
+    if (( ${#raw} < length )); then
+        raw="${raw}$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' || true)"
+    fi
+    printf '%s' "${raw:0:length}"
+}
+
+# Percent-decodes one URL component. Only used for the PostgreSQL connectivity
+# probe below, where the value is handed to libpq through the environment.
+url_decode() {
+    local value="$1" out="" char hex i=0
+    if [[ "$value" != *%* ]]; then
+        printf '%s' "$value"
+        return 0
+    fi
+    while (( i < ${#value} )); do
+        char="${value:i:1}"
+        if [[ "$char" == "%" ]] && (( i + 2 < ${#value} )); then
+            hex="${value:i+1:2}"
+            if [[ "$hex" =~ ^[0-9A-Fa-f]{2}$ ]]; then
+                out="${out}$(printf "\\x${hex}")"
+                i=$((i + 3))
+                continue
+            fi
+        fi
+        out="${out}${char}"
+        i=$((i + 1))
+    done
+    printf '%s' "$out"
+}
+
+# PostgreSQL connectivity probe that never puts the password on the command
+# line: the URL is split into the standard libpq environment variables and
+# `psql` is invoked without `-d`. Returns non-zero when the URL cannot be
+# parsed or the connection fails.
+postgres_reachable() {
+    local url="$1" rest userinfo user pass host port hostport path dbname
+    rest="${url#*://}"
+    [[ "$rest" == "$url" ]] && return 2
+    if [[ "$rest" == *@* ]]; then
+        userinfo="${rest%@*}"
+        rest="${rest##*@}"
+    else
+        userinfo=""
+    fi
+    user="${userinfo%%:*}"
+    if [[ "$userinfo" == *:* ]]; then
+        pass="${userinfo#*:}"
+    else
+        pass=""
+    fi
+    hostport="${rest%%/*}"
+    hostport="${hostport%%\?*}"
+    path=""
+    if [[ "$rest" == */* ]]; then
+        path="${rest#*/}"
+    fi
+    host=""
+    port=""
+    if [[ "$hostport" == \[*\]* ]]; then
+        host="${hostport#[}"
+        host="${host%%]*}"
+        if [[ "$hostport" == *"]:"* ]]; then
+            port="${hostport##*]:}"
+        fi
+    elif [[ "$hostport" == *:* ]]; then
+        host="${hostport%%:*}"
+        port="${hostport##*:}"
+    else
+        host="$hostport"
+    fi
+    dbname="${path%%\?*}"
+    [[ -z "$host" ]] && return 2
+    PGPASSWORD="$(url_decode "$pass")" \
+    PGHOST="$host" \
+    PGPORT="${port:-5432}" \
+    PGUSER="$(url_decode "${user:-postgres}")" \
+    PGDATABASE="$(url_decode "${dbname:-postgres}")" \
+        psql -w -c "SELECT 1" >/dev/null 2>&1
+}
+
+# True when the value is one of the usual truthy spellings.
+is_truthy() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 # Host part of a URL, without scheme, credentials, port or path. Handles both
 # `host:port` and `[IPv6]:port`, so the warning below can print a usable
@@ -88,6 +195,16 @@ API_KEY=""
 ADMIN_EMAIL=""
 ADMIN_PASSWORD=""
 TLS_SANS=""
+# Bind the admin API / gRPC on all interfaces. Off by default: a fresh install
+# with the seeded administrator account must not be reachable from the network
+# until the operator has changed its password (or put it behind a proxy).
+LISTEN_PUBLIC=false
+# Instance key for the at-rest sealing of notification/AI/backup credentials.
+# Taken from the environment when set; otherwise generated once and persisted
+# in ${CONFIG_DIR}/pingwaf.env (0600). Never rotate it silently: previously
+# sealed credentials cannot be opened with a new key.
+PINGWAF_SECRET_KEY="${PINGWAF_SECRET_KEY:-}"
+ADMIN_PASSWORD_GENERATED=false
 DRY_RUN=false
 # "" decides from the command line, "true"/"false" are explicit opt-ins.
 INTERACTIVE=""
@@ -118,8 +235,14 @@ Options:
   --api-key KEY            Agent enrollment token (agent mode)
   --db-url URL             PostgreSQL connection string
   --admin-email EMAIL      Seed administrator e-mail (server / all-in-one)
-  --admin-password PASS    Seed administrator password (server / all-in-one)
+  --admin-password PASS    Seed administrator password. When omitted (and no
+                           PINGWAF_ADMIN_PASSWORD) a random password is
+                           generated and printed exactly once at the end.
   --tls-sans NAMES         Comma separated dashboard certificate names
+  --listen-public          Bind the dashboard/REST API (9080) and the agent
+                           gRPC endpoint (9090) on 0.0.0.0. The default is
+                           127.0.0.1: expose them only through a reverse proxy
+                           or after changing the administrator password.
   --no-systemd             Skip systemd service file creation
   --interactive            Ask the questions even when options were given
   --non-interactive, --yes Never prompt; use the given values and defaults
@@ -137,6 +260,9 @@ Environment Variables:
   PINGWAF_ADMIN_EMAIL   Same as --admin-email
   PINGWAF_ADMIN_PASSWORD Same as --admin-password
   PINGWAF_TLS_SANS      Same as --tls-sans
+  PINGWAF_LISTEN_PUBLIC Same as --listen-public (1/true/yes/on)
+  PINGWAF_SECRET_KEY    Instance key that seals stored credentials; generated
+                        when unset and kept in /etc/pingwaf/pingwaf.env (0600)
 
 Examples:
   # Interactive: answer the questions, defaults in brackets
@@ -183,6 +309,7 @@ while [[ $# -gt 0 ]]; do
         --admin-email)    require_value "$1" "${2:-}"; ADMIN_EMAIL="$2"; PARAMS_GIVEN=true; shift 2 ;;
         --admin-password) require_value "$1" "${2:-}"; ADMIN_PASSWORD="$2"; PARAMS_GIVEN=true; shift 2 ;;
         --tls-sans)       require_value "$1" "${2:-}"; TLS_SANS="$2"; PARAMS_GIVEN=true; shift 2 ;;
+        --listen-public)  LISTEN_PUBLIC=true; PARAMS_GIVEN=true; shift ;;
         --no-systemd)     SKIP_SYSTEMD=true; shift ;;
         --interactive)    INTERACTIVE=true; shift ;;
         --non-interactive|--yes) INTERACTIVE=false; PARAMS_GIVEN=true; shift ;;
@@ -206,12 +333,16 @@ API_KEY="${API_KEY:-${PINGWAF_API_KEY:-}}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-${PINGWAF_ADMIN_EMAIL:-}}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-${PINGWAF_ADMIN_PASSWORD:-}}"
 TLS_SANS="${TLS_SANS:-${PINGWAF_TLS_SANS:-}}"
+if [[ "$LISTEN_PUBLIC" != "true" ]] && is_truthy "${PINGWAF_LISTEN_PUBLIC:-}"; then
+    LISTEN_PUBLIC=true
+fi
 
 # `--version latest` is the documented spelling for "no pin"; the interactive
 # prompt already normalises it, the flag path has to do the same or the download
 # URL becomes .../download/vlatest/...
 if [[ "$VERSION" == "latest" ]]; then VERSION=""; fi
 
+if [[ "$LISTEN_PUBLIC" == "true" ]]; then PARAMS_GIVEN=true; fi
 if [[ -n "$VERSION$MODE$DB_URL$SERVER_URL$SERVER_CA_CERT$SERVER_TLS_NAME$API_KEY$ADMIN_EMAIL$ADMIN_PASSWORD$TLS_SANS" ]]; then
     PARAMS_GIVEN=true
 fi
@@ -341,11 +472,12 @@ validate_install_values() {
 prompt_admin_password() {
     local first second
     for _ in 1 2 3; do
-        prompt_line "Administrator password (empty keeps the default, changed at first sign-in)" "" true
+        prompt_line "Administrator password (empty generates a random one, printed once)" "" true
         first="$REPLY"
         if [[ -z "$first" ]]; then
-            ADMIN_PASSWORD="pingwaf123"
-            warn "Keeping the documented default password; the console forces a change at first sign-in."
+            ADMIN_PASSWORD="$(random_password)"
+            ADMIN_PASSWORD_GENERATED=true
+            warn "A random administrator password will be generated and printed once at the end."
             return 0
         fi
         prompt_line "Repeat administrator password" "" true
@@ -372,13 +504,13 @@ mask_db_url() {
 
 print_plan_summary() {
     local systemd_state="no"
-    local password_state="default (pingwaf123)"
+    local password_state="random (generated at install, printed once)"
     local api_key_state="unset"
 
     if [[ "$SKIP_SYSTEMD" != "true" && "${OS:-}" == "linux" ]]; then
         systemd_state="yes (User=pingwaf, CAP_NET_BIND_SERVICE for 80/443)"
     fi
-    if [[ -n "$ADMIN_PASSWORD" && "$ADMIN_PASSWORD" != "pingwaf123" ]]; then
+    if [[ -n "$ADMIN_PASSWORD" && "$ADMIN_PASSWORD_GENERATED" != "true" ]]; then
         password_state="custom"
     fi
     if [[ -n "$API_KEY" ]]; then
@@ -406,6 +538,11 @@ print_plan_summary() {
     else
         echo "  database:    $(mask_db_url "${DB_URL:-postgres://pingwaf:pingwaf@localhost:5432/pingwaf}")"
         echo "  admin:       ${ADMIN_EMAIL:-admin@pingwaf.local} (password: ${password_state})"
+        if [[ "$LISTEN_PUBLIC" == "true" ]]; then
+            echo "  listen:      0.0.0.0:9080 (admin) / 0.0.0.0:9090 (gRPC) — change the admin password before exposing"
+        else
+            echo "  listen:      127.0.0.1:9080 (admin) / 127.0.0.1:9090 (gRPC) — loopback only"
+        fi
         echo "  tls sans:    ${TLS_SANS:-none (the generated certificate covers the hostname used to reach it)}"
     fi
     if [[ "$CONFIG_PRESENT" == "true" ]]; then
@@ -482,7 +619,10 @@ fi
 MODE="${MODE:-all-in-one}"
 DB_URL="${DB_URL:-postgres://pingwaf:pingwaf@localhost:5432/pingwaf}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@pingwaf.local}"
-ADMIN_PASSWORD="${ADMIN_PASSWORD:-pingwaf123}"
+# No built-in default: an empty value is replaced by a generated password after
+# the dry-run check below, so a non-interactive install never seeds the public
+# `pingwaf123` account.
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 TLS_SANS="${TLS_SANS// /}"
 
 # Validate mode
@@ -559,6 +699,17 @@ if [[ "$DRY_RUN" == "true" ]]; then
     exit 0
 fi
 
+# Secrets used by the generated configuration. The administrator password is
+# printed exactly once at the end of a successful install; the instance key is
+# written to a 0600 environment file the unit reads (never printed).
+if [[ -z "$ADMIN_PASSWORD" ]]; then
+    ADMIN_PASSWORD="$(random_password)"
+    ADMIN_PASSWORD_GENERATED=true
+fi
+if [[ -z "$PINGWAF_SECRET_KEY" ]]; then
+    PINGWAF_SECRET_KEY="$(random_hex 32)"
+fi
+
 if [[ "$OS" == "darwin" ]]; then
     fatal "Prebuilt binaries are published for Linux only. On macOS, build from source (see README.md)."
 fi
@@ -595,8 +746,44 @@ info "Installing PingWAF v${VERSION}"
 # Releases ship both .tar.xz (primary, smaller) and .tar.gz (compatibility
 # fallback). Prefer xz; skip straight to .tar.gz when xz(1) is not installed,
 # and fall back on a failed download (e.g. releases that predate .tar.xz).
+
+# Verifies one downloaded asset against the published sidecar with
+# `sha256sum -c` (or `shasum -a 256 -c` where coreutils is absent).
+verify_checksum() {
+    local file="$1" sidecar="$2" dir base
+    dir="$(dirname "$file")"
+    base="$(basename "$sidecar")"
+    if has sha256sum; then
+        ( cd "$dir" && sha256sum -c "$base" ) >/dev/null 2>&1
+    elif has shasum; then
+        ( cd "$dir" && shasum -a 256 -c "$base" ) >/dev/null 2>&1
+    else
+        fatal "Neither sha256sum nor shasum is available; cannot verify the release asset."
+    fi
+}
+
+# Rejects an archive that would write outside the temp directory (absolute
+# paths, `..` components) or that is not the expected single release directory.
+verify_archive_members() {
+    local archive="$1" list="${TMPDIR}/members.txt" prefix="pingwaf-${OS}-${ARCH}/"
+    case "$archive" in
+        *.tar.xz) tar -tJf "$archive" > "$list" ;;
+        *.tar.gz) tar -tzf "$archive" > "$list" ;;
+        *) fatal "Unexpected archive type: ${archive}" ;;
+    esac
+    if [[ ! -s "$list" ]]; then
+        fatal "The archive is empty: $(basename "$archive")"
+    fi
+    if grep -Eq '(^/|(^|/)\.\.(/|$))' "$list"; then
+        fatal "The archive contains an unsafe path (absolute or '..'); refusing to extract it."
+    fi
+    if grep -v "^${prefix}" "$list" | grep -q .; then
+        fatal "The archive contains entries outside '${prefix}'; refusing to extract it."
+    fi
+}
+
 fetch_asset() {
-    local ext url
+    local ext url checksum_url expected downloaded
     for ext in tar.xz tar.gz; do
         if [[ "$ext" == "tar.xz" ]] && ! has xz; then
             info "xz(1) not found — falling back to the .tar.gz asset."
@@ -604,20 +791,39 @@ fetch_asset() {
         fi
         ASSET_NAME="pingwaf-${OS}-${ARCH}.${ext}"
         url="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}"
+        checksum_url="${url}.sha256"
         info "Downloading ${ASSET_NAME}..."
         info "URL: ${url}"
+        downloaded=false
         if has curl; then
-            if curl -fsSL "$url" -o "${TMPDIR}/${ASSET_NAME}"; then
-                return 0
+            if curl -fsSL --proto '=https' "$url" -o "${TMPDIR}/${ASSET_NAME}" \
+                && curl -fsSL --proto '=https' "$checksum_url" -o "${TMPDIR}/${ASSET_NAME}.sha256"; then
+                downloaded=true
             fi
         elif has wget; then
-            if wget -q "$url" -O "${TMPDIR}/${ASSET_NAME}"; then
-                return 0
+            if wget -q "$url" -O "${TMPDIR}/${ASSET_NAME}" \
+                && wget -q "$checksum_url" -O "${TMPDIR}/${ASSET_NAME}.sha256"; then
+                downloaded=true
             fi
         else
             fatal "Neither curl nor wget found. Please install one of them."
         fi
-        warn "Download failed for ${ASSET_NAME} — trying the next format."
+        if [[ "$downloaded" != "true" ]]; then
+            warn "Download failed for ${ASSET_NAME} (asset or its .sha256) — trying the next format."
+            continue
+        fi
+        # Every release ships a .sha256 sidecar; a missing, malformed or
+        # mismatching one is fatal. Nothing is extracted or executed before
+        # this check passes.
+        expected="$(awk 'NR == 1 { print $1 }' "${TMPDIR}/${ASSET_NAME}.sha256")"
+        if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            fatal "The .sha256 sidecar for ${ASSET_NAME} is missing or malformed; refusing to install."
+        fi
+        if ! verify_checksum "${TMPDIR}/${ASSET_NAME}" "${TMPDIR}/${ASSET_NAME}.sha256"; then
+            fatal "Checksum mismatch for ${ASSET_NAME} (published: ${expected}). Refusing to install."
+        fi
+        success "Verified the sha256 of ${ASSET_NAME}."
+        return 0
     done
     fatal "Download failed. Check that version v${VERSION} exists and has a pingwaf-${OS}-${ARCH} asset."
 }
@@ -629,6 +835,10 @@ ASSET_NAME=""
 fetch_asset
 
 # ─── Extract & Install Binary ─────────────────────────────────────────────────
+# The checksum has already been verified; still refuse archives whose member
+# paths could escape the temp directory before tar touches the filesystem.
+verify_archive_members "${TMPDIR}/${ASSET_NAME}"
+
 info "Extracting..."
 case "$ASSET_NAME" in
     *.tar.xz) tar -xJf "${TMPDIR}/${ASSET_NAME}" -C "$TMPDIR" ;;
@@ -636,14 +846,12 @@ case "$ASSET_NAME" in
     *)        fatal "Unexpected asset name: ${ASSET_NAME}" ;;
 esac
 
-# Find the binary
-BINARY_PATH="$(find "$TMPDIR" -name "$BINARY_NAME" -type f | head -n1)"
+# The release archive contains exactly one binary with this name. There is no
+# "first executable" fallback: an unexpected archive layout is an error, not an
+# invitation to install an arbitrary file.
+BINARY_PATH="$(find "${TMPDIR}/pingwaf-${OS}-${ARCH}" -name "$BINARY_NAME" -type f | head -n1)"
 if [[ -z "$BINARY_PATH" ]]; then
-    # Fallback: first executable file
-    BINARY_PATH="$(find "$TMPDIR" -type f -perm +111 | head -n1)"
-fi
-if [[ -z "$BINARY_PATH" ]]; then
-    fatal "Binary not found in archive."
+    fatal "Binary '${BINARY_NAME}' not found in the verified archive."
 fi
 
 chmod +x "$BINARY_PATH"
@@ -661,10 +869,21 @@ if ! "$BINARY_PATH" --version >/dev/null 2>&1; then
 fi
 
 info "Installing binary to ${INSTALL_DIR}/${BINARY_NAME}..."
+# The binary must be root-owned: it is executed by the systemd unit (as the
+# unprivileged pingwaf user) and may be run by an operator. `mv` preserves the
+# installing user's ownership, so the owner/mode are normalised afterwards.
 if [[ -w "$INSTALL_DIR" ]]; then
     mv "$BINARY_PATH" "${INSTALL_DIR}/${BINARY_NAME}"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        chown root:root "${INSTALL_DIR}/${BINARY_NAME}" 2>/dev/null || true
+    else
+        warn "Installed as the current user; run: sudo chown root:root ${INSTALL_DIR}/${BINARY_NAME} && sudo chmod 0755 ${INSTALL_DIR}/${BINARY_NAME}"
+    fi
+    chmod 0755 "${INSTALL_DIR}/${BINARY_NAME}"
 elif has sudo; then
     sudo mv "$BINARY_PATH" "${INSTALL_DIR}/${BINARY_NAME}"
+    sudo chown root:root "${INSTALL_DIR}/${BINARY_NAME}"
+    sudo chmod 0755 "${INSTALL_DIR}/${BINARY_NAME}"
 else
     fatal "No write permission to ${INSTALL_DIR} and sudo not available."
 fi
@@ -706,6 +925,10 @@ write_config() {
     local config_file="${CONFIG_DIR}/pingwaf.toml"
     if [[ -f "$config_file" ]]; then
         warn "Config file already exists at ${config_file}, leaving it untouched."
+        if grep -q '^admin_password = "pingwaf123"' "$config_file" 2>/dev/null; then
+            warn "WARNING: ${config_file} still uses the public default administrator password."
+            warn "Change it now: pingwaf user reset-password --email ${ADMIN_EMAIL} (or via the dashboard)."
+        fi
         warn "Values from this run (control-plane URL, API key, admin account, TLS names,"
         warn "database) were not applied. In agent mode this file is authoritative:"
         warn "edit ${config_file} and run: sudo systemctl restart ${SERVICE_NAME}"
@@ -745,6 +968,16 @@ write_config() {
         fi
     fi
 
+    # Loopback by default: a fresh install still has the seeded administrator
+    # account, so the API/gRPC must not be reachable from the network until the
+    # password has been changed (or the operator opts into --listen-public /
+    # puts the console behind a reverse proxy).
+    local admin_addr="127.0.0.1:9080" grpc_addr="127.0.0.1:9090"
+    if [[ "$LISTEN_PUBLIC" == "true" ]]; then
+        admin_addr="0.0.0.0:9080"
+        grpc_addr="0.0.0.0:9090"
+    fi
+
     local tls_sans_line="# tls_sans = [\"waf.example.com\"]"
     if [[ -n "$TLS_SANS" ]]; then
         local sans_entry sans_joined=""
@@ -773,8 +1006,10 @@ write_config() {
 
 [server]
 db_url = "$(toml_string "$DB_URL")"
-admin_addr = "0.0.0.0:9080"
-grpc_addr = "0.0.0.0:9090"
+# Admin API + gRPC listen on loopback unless --listen-public was given; agents
+# on other hosts and remote dashboards need an explicit choice (or a proxy).
+admin_addr = "${admin_addr}"
+grpc_addr = "${grpc_addr}"
 # gRPC control plane TLS: "tls" (default) serves agents over TLS, reusing the
 # dashboard certificate — self-signed on first boot unless grpc_tls_cert/key
 # are configured. "off" serves plaintext and is logged as degraded.
@@ -826,8 +1061,41 @@ EOF
     success "Configuration written to ${config_file}"
 }
 
+# Writes the instance secret key (env-only setting) to a 0600 environment file
+# that the systemd unit reads. An existing key is kept: rotating it silently
+# would make every previously sealed notification/AI/backup credential
+# unreadable, and there is no automatic re-encryption.
+write_secret_env_file() {
+    local env_file="${CONFIG_DIR}/pingwaf.env" cmd=""
+    [[ -w "$CONFIG_DIR" ]] || cmd="sudo"
+
+    if [[ -f "$env_file" ]] && grep -q '^PINGWAF_SECRET_KEY=' "$env_file" 2>/dev/null; then
+        info "Keeping the existing ${env_file} (rotating it would break sealed credentials)."
+        return 0
+    fi
+
+    (umask 077; $cmd tee "$env_file" >/dev/null <<EOF
+# PingWAF environment secrets — mode 0600, read by the systemd unit.
+#
+# PINGWAF_SECRET_KEY seals notification channel / AI provider / backup target
+# credentials at rest. Treat this file like the database itself: rotating the
+# key makes previously sealed credentials unreadable (there is no automatic
+# re-encryption), so back it up and do not regenerate it on upgrade.
+PINGWAF_SECRET_KEY=${PINGWAF_SECRET_KEY}
+EOF
+    )
+    if ! $cmd chown pingwaf:pingwaf "$env_file" 2>/dev/null; then
+        warn "Could not hand ${env_file} to pingwaf:pingwaf — does the user exist?"
+    fi
+    if ! $cmd chmod 600 "$env_file" 2>/dev/null; then
+        warn "Could not chmod 600 ${env_file}; it may stay readable by other local users."
+    fi
+    success "Instance secret key written to ${env_file} (0600)"
+}
+
 if [[ "$OS" == "linux" ]]; then
     write_config
+    write_secret_env_file
 fi
 
 # ─── Systemd Service ──────────────────────────────────────────────────────────
@@ -841,8 +1109,21 @@ check_unit_capabilities() {
     local dropin_dir="/etc/systemd/system/${SERVICE_NAME}.service.d"
     local granted=false conf
 
-    if [[ -r "$unit_file" ]] && grep -q '^AmbientCapabilities=.*CAP_NET_BIND_SERVICE' "$unit_file"; then
-        granted=true
+    if [[ -f "$unit_file" ]]; then
+        if [[ -r "$unit_file" ]]; then
+            if grep -q '^AmbientCapabilities=.*CAP_NET_BIND_SERVICE' "$unit_file"; then
+                granted=true
+            fi
+        elif has sudo; then
+            # The unit is written 0600 (it can carry the agent API key), so a
+            # non-root upgrade run has to inspect it through sudo.
+            if sudo grep -q '^AmbientCapabilities=.*CAP_NET_BIND_SERVICE' "$unit_file" 2>/dev/null; then
+                granted=true
+            fi
+        else
+            # Cannot read the unit: do not claim the capability is missing.
+            return 0
+        fi
     fi
     # `systemctl edit` writes a drop-in, which the main unit file never shows.
     if [[ -d "$dropin_dir" ]]; then
@@ -930,7 +1211,9 @@ $(systemd_env PINGWAF_TLS_ENABLED "true")"
     local cmd=""
     [[ -w "/etc/systemd/system" ]] || cmd="sudo"
 
-    $cmd tee "$service_file" >/dev/null <<EOF
+    # The unit can carry the agent enrollment key (upgrade path), so it is
+    # written private (0600) and only readable by root.
+    (umask 077; $cmd tee "$service_file" >/dev/null <<EOF
 [Unit]
 Description=PingWAF - High Performance Web Application Firewall
 Documentation=https://github.com/${REPO}
@@ -948,6 +1231,9 @@ LimitNOFILE=65536
 ${agent_env}
 # Log level; the default keeps sqlx's per-statement log out of the way:
 Environment=RUST_LOG=info,sqlx=warn
+# Instance secrets (PINGWAF_SECRET_KEY) live in a 0600 file; the leading dash
+# keeps the unit working when the file does not exist (e.g. an agent node).
+EnvironmentFile=-${CONFIG_DIR}/pingwaf.env
 
 # The data plane binds 80/443 while running as the unprivileged pingwaf user.
 # Ambient capabilities are the only form that survives NoNewPrivileges=true;
@@ -961,10 +1247,20 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=${DATA_DIR} ${CONFIG_DIR}
 PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
 EOF
+    )
+    if ! $cmd chmod 600 "$service_file" 2>/dev/null; then
+        warn "Could not chmod 600 ${service_file}; it may be readable by other local users."
+    fi
 
     $cmd systemctl daemon-reload
     success "Systemd service installed: ${SERVICE_NAME}.service"
@@ -996,10 +1292,11 @@ check_postgres() {
     info "Checking PostgreSQL availability..."
 
     if has psql; then
-        if psql "$DB_URL" -c "SELECT 1" >/dev/null 2>&1; then
+        if postgres_reachable "$DB_URL"; then
             success "PostgreSQL connection successful."
         else
-            warn "psql found but cannot connect to: ${DB_URL}"
+            # Never echo the connection string: it carries the DB password.
+            warn "psql found but cannot connect to: $(mask_db_url "$DB_URL")"
             echo ""
             echo "  To set up PostgreSQL:"
             echo "    1. Install: sudo apt install postgresql-16"
@@ -1062,18 +1359,23 @@ print_firewall_hints() {
         return
     fi
 
-    info "Firewall ports to open:"
+    info "Firewall ports:"
     echo "    80/tcp   — HTTP traffic (proxied sites)"
     echo "    443/tcp  — HTTPS traffic (proxied sites)"
-    echo "    9080/tcp — Admin dashboard & REST API (HTTPS)"
-    echo "    9090/tcp — gRPC control plane (agent connections)"
+    echo "    9080/tcp — Admin dashboard & REST API (HTTPS) — management network only"
+    echo "    9090/tcp — gRPC control plane (agent connections) — only if agents are remote"
+    echo ""
+    echo "  Do NOT expose 9080/9090 before the administrator password has been"
+    echo "  changed. The generated config binds both to 127.0.0.1 by default;"
+    echo "  reinstall with --listen-public only when a proxy/remote agents need it."
     echo ""
     if has ufw; then
-        echo "  With UFW:"
+        echo "  With UFW (business ports):"
         echo "    sudo ufw allow 80/tcp"
         echo "    sudo ufw allow 443/tcp"
-        echo "    sudo ufw allow 9080/tcp"
-        echo "    sudo ufw allow 9090/tcp"
+        echo "  For the management ports, restrict the source instead of opening them:"
+        echo "    sudo ufw allow from <admin-cidr> to any port 9080 proto tcp"
+        echo "    sudo ufw allow from <agent-cidr> to any port 9090 proto tcp"
     fi
 }
 
@@ -1088,6 +1390,7 @@ echo ""
 echo "  Binary:    ${INSTALL_DIR}/${BINARY_NAME}"
 if [[ "$OS" == "linux" ]]; then
     echo "  Config:    ${CONFIG_DIR}/pingwaf.toml"
+    echo "  Secrets:   ${CONFIG_DIR}/pingwaf.env (0600, holds PINGWAF_SECRET_KEY)"
     echo "  Data:      ${DATA_DIR}/"
     echo "  Service:   systemctl {start|stop|restart|status} ${SERVICE_NAME}"
 fi
@@ -1109,13 +1412,19 @@ else
     echo "    ${BINARY_NAME} ${MODE} --db-url \"${DB_URL}\""
     echo ""
     echo "  Dashboard: https://localhost:9080  (self-signed certificate)"
+    if [[ "$LISTEN_PUBLIC" == "true" ]]; then
+        echo "  ${YELLOW}⚠ Admin/gRPC listen on 0.0.0.0 — change the password and restrict 9080/9090 to an admin network before exposing them.${NO_COLOR}"
+    else
+        echo "  Listen:    127.0.0.1 only (admin 9080 / gRPC 9090); use --listen-public for remote agents or a dashboard proxy"
+    fi
     if [[ "$CONFIG_PRESENT" == "true" ]]; then
         echo "  Administrator: unchanged — ${CONFIG_DIR}/pingwaf.toml was left as it was."
     else
         echo "  Administrator:"
         echo "    Email:    ${ADMIN_EMAIL}"
-        if [[ "$ADMIN_PASSWORD" == "pingwaf123" ]]; then
-            echo "    Password: pingwaf123 (the default — the console forces a change at first sign-in)"
+        if [[ "$ADMIN_PASSWORD_GENERATED" == "true" ]]; then
+            echo "    Password: ${ADMIN_PASSWORD}"
+            echo "              (generated — shown once; store it now and change it after sign-in)"
         else
             echo "    Password: (the value you supplied, stored in ${CONFIG_DIR}/pingwaf.toml)"
         fi
@@ -1127,7 +1436,11 @@ else
         echo "    systemctl show ${SERVICE_NAME} -p AmbientCapabilities"
         echo ""
     fi
-    echo "  ${YELLOW}⚠ Change the default admin password and JWT secret in production!${NO_COLOR}"
+    if [[ "$ADMIN_PASSWORD_GENERATED" == "true" ]]; then
+        echo "  ${YELLOW}⚠ Save the generated administrator password now: it is not shown again.${NO_COLOR}"
+    fi
+    echo "  ${YELLOW}⚠ Keep ${CONFIG_DIR}/pingwaf.toml and ${CONFIG_DIR}/pingwaf.env private:${NO_COLOR}"
+    echo "  ${YELLOW}   they hold the admin password, the JWT secret and the instance key.${NO_COLOR}"
     echo ""
     echo "  Next steps:"
     echo "    1. Ensure PostgreSQL is running and accessible"

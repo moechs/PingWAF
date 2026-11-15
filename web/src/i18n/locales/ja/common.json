@@ -1,4 +1,15 @@
 {
+  "a11y": {
+    "breadcrumb": "パンくずリスト",
+    "openNavigation": "ナビゲーションを開く",
+    "dismissNotification": "通知を閉じる",
+    "filterByAction": "アクションで絞り込む",
+    "filterByScope": "スコープで絞り込む",
+    "filterByEventType": "イベント種別で絞り込む",
+    "filterBySite": "サイトで絞り込む",
+    "retentionWindow": "保持期間",
+    "toggleSubscription": "{{name}} の購読を切り替える"
+  },
   "system": {
     "title": "システム監視",
     "subtitle": "コントロールプレーンの経過時間（ウォールクロック）帰属 — 占有率は CPU ではなく経過時間の割合です。",
@@ -303,7 +314,10 @@
     "networkTitle": "接続が失われました",
     "networkHint": "サーバーに到達できません。ネットワーク接続を確認してください。",
     "unknownTitle": "不明なエラー",
-    "unknownHint": "予期しないエラーが発生しました。もう一度お試しください。"
+    "unknownHint": "予期しないエラーが発生しました。もう一度お試しください。",
+    "invalidCredentials": "メールアドレスまたはパスワードが正しくありません。確認してもう一度お試しください。",
+    "domainConflict": "このドメインは別のサイトで既に使用されています。別のドメインを指定するか、既存のサイトを編集してください。",
+    "expressionInvalid": "式が正しくありません。構文とフィールド名を確認して再試行してください。"
   },
   "auth": {
     "loginTitle": "PingWAF にサインイン",
@@ -822,6 +836,9 @@
       "general": "一般",
       "enable": "CC 防御を有効化",
       "enableHint": "レートしきい値を超えるクライアントにチャレンジします。",
+      "disableConfirmTitle": "チャレンジ保護を無効にしますか？",
+      "disableConfirmDescription": "無効にすると訪問者へのチャレンジが行われず、このサイトの CC 自動緩和も停止します。正規のトラフィックに影響が出る場合のみ無効にしてください。",
+      "disableAck": "チャレンジによる保護が停止することを理解しました",
       "challengeLevel": "チャレンジレベル",
       "clearanceDuration": "クリアランス期間",
       "minutes": "解決済みチャレンジが有効な分単位。",
@@ -857,6 +874,15 @@
       "engineHint": "このサイトの WAF エンジンのマスタースイッチ。",
       "engineCardHint": "オフにすると、このサイトはすべての WAF 評価をスキップします：マネージドルール・カスタムルール・監視ダウングレードはすべて無効になります。",
       "engineOffWarn": "WAF エンジンがオフのため、リクエストは検知・遮断されません。",
+      "engineOffConfirmCta": "WAF エンジンを無効化",
+      "engineOffBannerTitle": "WAF エンジンはオフです",
+      "engineOffConfirmTitle": "WAF エンジンを無効にしますか？",
+      "engineOffConfirmDescription": "無効にすると、{{domain}} へのすべてのリクエストが検査・ルール照合・遮断されなくなります（再度有効にするまで）。誤検知の調査時のみ無効にしてください。",
+      "engineOffAck": "このサイトが WAF 保護なしで稼働することを理解しました",
+      "engineOffBannerAction": "保護を再度有効にする",
+      "modeDowngradeTitle": "保護モードを{{mode}}に切り替えますか？",
+      "modeDowngradeDescription": "サイトレベルのモードが WAF の遮断を決めます。切り替えるとこのサイトでは攻撃が遮断されなくなります（ルールは保持され、遮断モードに戻すと再び有効になります）。",
+      "modeDowngradeAck": "攻撃が遮断されなくなることを理解しました",
       "detectionTitle": "検知",
       "detectionHint": "より厳格な検知モード。必要に応じて有効化します。",
       "enforcementTitle": "強制",

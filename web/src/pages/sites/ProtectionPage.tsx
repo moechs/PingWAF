@@ -7,6 +7,7 @@ import { PageHeader } from '@/components/PageHeader'
 import { Tabs } from '@/components/ui/Tabs'
 import { Switch } from '@/components/ui/Switch'
 import { Card, CardBody } from '@/components/ui/Card'
+import { Button } from '@/components/ui/Button'
 import { SkeletonCard } from '@/components/ui/Skeleton'
 import { Input } from '@/components/ui/Input'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
@@ -15,7 +16,7 @@ import { challengeApi, challengeKeys } from '@/api/challenge'
 import { wafSettingsApi, wafSettingsKeys } from '@/api/wafSettings'
 import { ruleKeys, rulesApi } from '@/api/rules'
 import { RULE_MODES, type RuleMode, type WafSettings } from '@/api/types'
-import { useCanWrite, useWafSettingsMutation } from '@/hooks'
+import { useCanWrite, useSiteDetail, useWafSettingsMutation } from '@/hooks'
 import { cn } from '@/lib/utils'
 import { PostureOverview, type PostureTarget } from './PostureOverview'
 import { ManagedRulesPanel } from './ManagedRulesPanel'
@@ -54,6 +55,8 @@ export function ProtectionPage() {
   const canWrite = useCanWrite()
   const navigate = useNavigate()
   const { siteId = '' } = useParams<{ siteId: string }>()
+  const siteDetail = useSiteDetail(siteId)
+  const siteDomain = siteDetail.data?.site.domain ?? siteId
   const [searchParams, setSearchParams] = useSearchParams()
   const tab = parseTab(searchParams.get('tab'))
 
@@ -123,6 +126,10 @@ export function ProtectionPage() {
   })
 
   const [confirmUnderAttack, setConfirmUnderAttack] = useState(false)
+  // UX-04: turning the engine off is the one switch that disables every other
+  // protection control, so it takes an explicit acknowledgement first.
+  const [confirmEngineOff, setConfirmEngineOff] = useState(false)
+  const [engineOffAck, setEngineOffAck] = useState(false)
 
   return (
     <div className="animate-slide-up">
@@ -130,6 +137,37 @@ export function ProtectionPage() {
         title={t('pages.protection.title')}
         description={t('pages.protection.description')}
       />
+
+      {/* UX-04: a disabled engine is a persistent, page-level state — keep it
+          visible instead of hiding it inside the switch card. */}
+      {!settingsQuery.isPending && !engineOn && (
+        <div
+          role="status"
+          className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-warning/45 bg-warning/10 px-4 py-3"
+        >
+          <span className="flex items-start gap-2.5 text-[13px] leading-relaxed text-fg">
+            <Warning weight="fill" className="mt-0.5 h-4 w-4 shrink-0 text-fg-warning" />
+            <span>
+              <span className="block font-semibold">
+                {t('pages.protection.engineOffBannerTitle')}
+              </span>
+              <span className="mt-0.5 block">
+                {t('pages.protection.engineOffWarn')}
+              </span>
+            </span>
+          </span>
+          {canWrite && (
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={updateSettings.isPending}
+              onClick={() => updateSettings.mutate({ waf_enabled: true })}
+            >
+              {t('pages.protection.engineOffBannerAction')}
+            </Button>
+          )}
+        </div>
+      )}
 
       {/* ── Current effective posture ─────────────────────────────────── */}
       <div className="mb-5">
@@ -177,7 +215,14 @@ export function ProtectionPage() {
               checked={engineOn}
               disabled={!canWrite || updateSettings.isPending}
               aria-label={t('pages.protection.engineTitle')}
-              onCheckedChange={(waf_enabled) => updateSettings.mutate({ waf_enabled })}
+              onCheckedChange={(waf_enabled) => {
+                if (waf_enabled) {
+                  updateSettings.mutate({ waf_enabled: true })
+                  return
+                }
+                setEngineOffAck(false)
+                setConfirmEngineOff(true)
+              }}
             />
           </div>
         )}
@@ -396,6 +441,37 @@ export function ProtectionPage() {
         confirmLabel={t('pages.protection.underAttackCta')}
         loading={setUnderAttack.isPending}
       />
+
+      <ConfirmDialog
+        open={confirmEngineOff}
+        onClose={() => {
+          setConfirmEngineOff(false)
+          setEngineOffAck(false)
+        }}
+        onConfirm={() => {
+          setConfirmEngineOff(false)
+          setEngineOffAck(false)
+          updateSettings.mutate({ waf_enabled: false })
+        }}
+        tone="danger"
+        title={t('pages.protection.engineOffConfirmTitle')}
+        description={t('pages.protection.engineOffConfirmDescription', {
+          domain: siteDomain,
+        })}
+        confirmLabel={t('pages.protection.engineOffConfirmCta')}
+        loading={updateSettings.isPending}
+        disabled={!engineOffAck}
+      >
+        <label className="flex items-start gap-2.5 text-[13px]">
+          <input
+            type="checkbox"
+            className="mt-0.5 rounded border-border accent-brand"
+            checked={engineOffAck}
+            onChange={(e) => setEngineOffAck(e.target.checked)}
+          />
+          <span>{t('pages.protection.engineOffAck')}</span>
+        </label>
+      </ConfirmDialog>
     </div>
   )
 }
@@ -435,6 +511,11 @@ function EnforcementModeCard() {
   // The stored value is authoritative; legacy rows without it read as off.
   const mode = settingsQuery.data?.mode ?? 'off'
   const [confirmBlockWithAllow, setConfirmBlockWithAllow] = useState(false)
+  // UX-04: leaving Block mode is a downgrade of enforcement (monitor only logs,
+  // off disables the engine), so it needs the same explicit acknowledgement as
+  // switching the engine off.
+  const [confirmDowngrade, setConfirmDowngrade] = useState<RuleMode | null>(null)
+  const [downgradeAck, setDowngradeAck] = useState(false)
 
   const applyMode = useMutation({
     mutationFn: async (next: RuleMode) => {
@@ -466,6 +547,13 @@ function EnforcementModeCard() {
     ) {
       // Advisory only: the operator may proceed.
       setConfirmBlockWithAllow(true)
+      return
+    }
+    // block > monitor > off: moving down that ladder lowers enforcement.
+    const rank: Record<string, number> = { block: 2, monitor: 1, off: 0 }
+    if ((rank[next] ?? 0) < (rank[mode] ?? 0)) {
+      setDowngradeAck(false)
+      setConfirmDowngrade(next)
       return
     }
     applyMode.mutate(next)
@@ -541,6 +629,40 @@ function EnforcementModeCard() {
         confirmLabel={t('pages.waf.mode_block')}
         loading={applyMode.isPending}
       />
+
+      <ConfirmDialog
+        open={confirmDowngrade !== null}
+        onClose={() => {
+          setConfirmDowngrade(null)
+          setDowngradeAck(false)
+        }}
+        onConfirm={() => {
+          const next = confirmDowngrade
+          setConfirmDowngrade(null)
+          setDowngradeAck(false)
+          if (next) applyMode.mutate(next)
+        }}
+        tone="danger"
+        title={t('pages.protection.modeDowngradeTitle', {
+          mode: t(`pages.waf.mode_${confirmDowngrade ?? 'monitor'}`),
+        })}
+        description={t('pages.protection.modeDowngradeDescription', {
+          mode: t(`pages.waf.mode_${confirmDowngrade ?? 'monitor'}`),
+        })}
+        confirmLabel={t(`pages.waf.mode_${confirmDowngrade ?? 'monitor'}`)}
+        loading={applyMode.isPending}
+        disabled={!downgradeAck}
+      >
+        <label className="flex items-start gap-2.5 text-[13px]">
+          <input
+            type="checkbox"
+            className="mt-0.5 rounded border-border accent-brand"
+            checked={downgradeAck}
+            onChange={(e) => setDowngradeAck(e.target.checked)}
+          />
+          <span>{t('pages.protection.modeDowngradeAck')}</span>
+        </label>
+      </ConfirmDialog>
     </Card>
   )
 }

@@ -8,13 +8,18 @@
 #   # Dashboard: https://localhost:9080 (self-signed certificate — upload a real
 #   # one under Settings → Control plane HTTPS; set PINGWAF_TLS_ENABLED=false to
 #   # serve plain HTTP instead)
-#   # Default credentials: admin@pingwaf.local / pingwaf123
+#   # Credentials: there is no built-in default password. Set ADMIN_PASSWORD (and
+#   # PINGWAF_SECRET_KEY) in .env — the official `deploy/compose/install.sh`
+#   # generates both and prints the administrator password once.
 
 services:
   # ─── PingWAF All-in-One (control plane + data plane) ───────────────────────
   pingwaf:
-    # Pin a released version for production (e.g. :0.23.0) — :latest tracks
+    # Pin a released version for production (e.g. :0.32.26) — :latest tracks
     # the newest release; :main is the unstable amd64 snapshot of main.
+    # For a reproducible/auditable deployment, pin the image *digest* instead
+    # of the tag (`docker inspect --format '{{index .RepoDigests 0}}'` after a
+    # pull) — a tag can be moved, a digest cannot.
     image: ghcr.io/shuaizend/pingwaf:${PINGWAF_TAG:-latest}
     # To build from source instead of pulling the pre-built image, uncomment:
     # build:
@@ -56,8 +61,14 @@ services:
       # without touching the compose file; container-side ports stay fixed.
       - "${PINGWAF_HTTP_PORT:-80}:80"       # HTTP traffic (proxied)
       - "${PINGWAF_HTTPS_PORT:-443}:443"    # HTTPS traffic (proxied)
-      - "${PINGWAF_ADMIN_PORT:-9080}:9080"  # Admin dashboard + REST API
-      - "${PINGWAF_GRPC_PORT:-9090}:9090"   # gRPC control plane (agents connect here)
+      # The admin API and the agent gRPC endpoint publish on loopback only: a
+      # fresh install still has the seeded administrator account, so exposing
+      # 9080/9090 to the network before the password is changed would hand the
+      # control plane to whoever connects first. Publish them on 0.0.0.0 (or a
+      # private interface) explicitly when a reverse proxy / remote agents
+      # need it — and restrict them with a firewall.
+      - "${PINGWAF_ADMIN_BIND:-127.0.0.1}:${PINGWAF_ADMIN_PORT:-9080}:9080"  # Admin dashboard + REST API
+      - "${PINGWAF_GRPC_BIND:-127.0.0.1}:${PINGWAF_GRPC_PORT:-9090}:9090"    # gRPC control plane (agents connect here)
     environment:
       - PINGWAF_DB_URL=postgres://pingwaf:${POSTGRES_PASSWORD:-pingwaf}@postgres:5432/pingwaf
       - PINGWAF_MODE=all-in-one
@@ -68,7 +79,15 @@ services:
       - PINGWAF_ADMIN_ADDR=0.0.0.0:9080
       - PINGWAF_GRPC_ADDR=0.0.0.0:9090
       - PINGWAF_ADMIN_EMAIL=${ADMIN_EMAIL:-admin@pingwaf.local}
-      - PINGWAF_ADMIN_PASSWORD=${ADMIN_PASSWORD:-pingwaf123}
+      # REQUIRED on a fresh database: set ADMIN_PASSWORD in .env (the official
+      # `deploy/compose/install.sh` generates a random one and prints it once).
+      # There is deliberately no built-in default password; an empty value
+      # makes the first boot fail instead of seeding a known account.
+      - PINGWAF_ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      # REQUIRED: instance key that seals notification/AI/backup credentials at
+      # rest (openssl rand -hex 32). Generate it once and never rotate it
+      # silently — previously sealed credentials become unreadable.
+      - PINGWAF_SECRET_KEY=${PINGWAF_SECRET_KEY:-}
       - PINGWAF_ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-false}
       # HTTPS for the dashboard (self-signed until a certificate is uploaded).
       # Add the hostname you reach the dashboard on so the generated pair covers
@@ -107,6 +126,20 @@ services:
       # capabilities: no-new-privileges, rootless Docker, some PodSecurity
       # defaults. Both paths are complementary, not alternatives.
       - NET_BIND_SERVICE
+    # Drop every capability except the one needed to bind 80/443, and block
+    # setuid/file-capability regains: the proxy is internet-facing, so a
+    # process compromise must not come with the default Docker capability set.
+    #
+    # no-new-privileges makes the kernel ignore the file capability baked into
+    # the binary, so 80/443 bind as the unprivileged user only because modern
+    # container runtimes set net.ipv4.ip_unprivileged_port_start=0 (Docker
+    # >= 20.10, Podman). On an older runtime where bind() fails with
+    # "Permission denied", remove this line (or add the sysctl) — do not run
+    # the container as root just to bind the ports.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl --connect-timeout 2 --max-time 3 -sf http://localhost:9080/healthz || exit 1"]
