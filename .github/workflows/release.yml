@@ -264,17 +264,18 @@ jobs:
           ls -lh "$ASSET.tar.xz" "$ASSET.tar.gz" \
                  "$ASSET.tar.xz.sha256" "$ASSET.tar.gz.sha256"
 
-      # SBOM for the exact archive install.sh downloads. `upload-*` is off so
-      # the file is attached to the release once, by the upload step below.
+      # SBOM for the source tree that produced the archive. `dir:` (not the
+      # tarball) is deliberate: syft's `dir:` source cannot scan a single file,
+      # and scanning the repository's Cargo.lock gives a dependency inventory
+      # that is actually useful. `target/` is excluded because it contains the
+      # build output, not dependencies.
       - name: Generate SPDX SBOM
-        uses: anchore/sbom-action@v0
-        with:
-          path: pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.tar.gz
-          format: spdx-json
-          output-file: pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
-          dependency-snapshot: false
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b "$RUNNER_TEMP/bin" v1.42.3
+          "$RUNNER_TEMP/bin/syft" scan dir:. \
+            --exclude './target/**' \
+            -o "spdx-json=pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.spdx.json"
 
       # Signed SLSA provenance for both archives: consumers can verify with
       # `gh attestation verify pingwaf-linux-amd64.tar.gz --repo <repo>`.
