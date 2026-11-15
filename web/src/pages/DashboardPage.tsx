@@ -1081,7 +1081,7 @@ function SystemCpuCard() {
             <span className="mx-2 text-fg-subtle/40">·</span>
             {t('pages.dashboard.cpuCard.cores')}: {snap.cpu.cores}
           </p>
-          <p className="mt-0.5 text-xs text-fg-subtle/70 tabular-nums">
+          <p className="mt-0.5 text-xs text-fg-subtle tabular-nums">
             {t('pages.dashboard.cpuCard.rss')}: {snap.memory.rss}
           </p>
         </>

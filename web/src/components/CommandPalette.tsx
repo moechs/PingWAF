@@ -328,7 +328,7 @@ export function CommandPalette({ onClose }: { onClose: () => void }) {
               setActive(0)
             }}
             placeholder={t('search.placeholder')}
-            className="h-11 w-full bg-transparent text-sm text-fg placeholder:text-fg-subtle/70 focus:outline-none"
+            className="h-11 w-full bg-transparent text-sm text-fg placeholder:text-fg-subtle focus:outline-none"
           />
           <kbd className="rounded border border-line bg-recessed px-1.5 py-0.5 font-mono text-[10px] text-fg-subtle">
             esc

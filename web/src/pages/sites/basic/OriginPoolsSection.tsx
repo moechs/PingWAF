@@ -249,7 +249,7 @@ export function OriginPoolsSection({
                         <span className="flex items-center gap-1">
                           <Lock weight="duotone" className="h-3.5 w-3.5" />
                           <span className="pw-mono">{pool.sni}</span>
-                          <span className="text-fg-subtle/70">
+                          <span className="text-fg-subtle">
                             {(pool.verify_cert ?? siteOriginVerifyCert) ===
                             null
                               ? t('pages.basic.certFollowGlobal')
