@@ -1402,6 +1402,13 @@
         "colBlocked": "ブロック",
         "colBlockRate": "ブロック率",
         "colLastSeen": "最終検知",
+        "colActions": "操作",
+        "block": "ブロック",
+        "alreadyBlocked": "ブロック済み",
+        "blockConfirmTitle": "{{name}} をブロックしますか？",
+        "blockConfirmDescription": "この AI クローラー系のサイトポリシーを「ブロック」に設定します。「ボット保護 → AI クローラー制御」から元に戻せます。",
+        "blockedToast": "{{name}} をブロックしました",
+        "blockFailed": "ブロックできませんでした",
         "empty": "この期間内に AI クローラーの traffic はありません"
       },
       "title": "トラフィック",

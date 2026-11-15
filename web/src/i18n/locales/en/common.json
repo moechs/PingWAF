@@ -1402,6 +1402,13 @@
         "colBlocked": "Blocked",
         "colBlockRate": "Block rate",
         "colLastSeen": "Last seen",
+        "colActions": "Actions",
+        "block": "Block",
+        "alreadyBlocked": "Blocked",
+        "blockConfirmTitle": "Block {{name}}?",
+        "blockConfirmDescription": "Sets this AI crawler family's site policy to Block. You can revert it under Bot protection → AI crawler control.",
+        "blockedToast": "Blocked {{name}}",
+        "blockFailed": "Could not block the bot",
         "empty": "No AI crawler traffic in this window"
       },
       "title": "Traffic",

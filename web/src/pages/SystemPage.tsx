@@ -113,11 +113,11 @@ export function SystemPage() {
         }
       />
 
-      {/* Build identity: this control plane, and how many agents are not on
-          it. A node that fails to auto-upgrade shows up here first. */}
-      <div className="mb-4">
-        <Card>
-          <CardHeader title={t('system.versionTitle')} />
+      {/* Build identity and memory detail share one row: both are short
+          reference cards, and a full-width row wasted most of the page. */}
+      <div className="mb-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <Card className="h-full">
+          <CardHeader title={t('system.systemVersionTitle')} />
           <CardBody>
             <dl className="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-3">
               <div>
@@ -181,6 +181,7 @@ export function SystemPage() {
             )}
           </CardBody>
         </Card>
+        {!metrics.isError && <MemoryDetail memory={metrics.data?.memory} />}
       </div>
 
       {metrics.isError ? (
@@ -200,9 +201,6 @@ export function SystemPage() {
           <MetricCards metrics={metrics.data} loading={metrics.isFetching} />
           <div className="mt-3">
             <MetricPills metrics={metrics.data} />
-          </div>
-          <div className="mt-3">
-            <MemoryDetail memory={metrics.data?.memory} />
           </div>
         </>
       )}

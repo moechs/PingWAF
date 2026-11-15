@@ -1402,6 +1402,13 @@
         "colBlocked": "拦截",
         "colBlockRate": "拦截率",
         "colLastSeen": "最近活跃",
+        "colActions": "操作",
+        "block": "拉黑",
+        "alreadyBlocked": "已拉黑",
+        "blockConfirmTitle": "拉黑 {{name}}？",
+        "blockConfirmDescription": "将把该 AI 爬虫家族的站点策略设为“拦截”，可在「机器人防护 → AI 爬虫控制」中恢复。",
+        "blockedToast": "已拉黑 {{name}}",
+        "blockFailed": "拉黑失败",
         "empty": "该时间范围内暂无 AI 爬虫流量"
       },
       "title": "流量",
