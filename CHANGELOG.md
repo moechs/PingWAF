@@ -115,6 +115,13 @@ verbatim for reference and attribution, and is not maintained here.
   stacks off. The toast after changing the site mode reads "Site protection
   mode updated" rather than "Mode applied to all rules", which it never did.
 
+### Security
+
+- **`libz-sys` 1.1.31 -> 1.1.33** for RUSTSEC-2026-0544 (heap buffer
+  overflow). It is a transitive build dependency (vergen-git2 -> git2 ->
+  libgit2-sys) that reads the git metadata at compile time and is not linked
+  into the shipped binary; the lockfile update clears `cargo audit`.
+
 ## [PingWAF 0.32.31] — 2026-11-16
 
 ### Performance
