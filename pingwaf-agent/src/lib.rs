@@ -1,3 +1,4 @@
+pub mod body_budget;
 pub mod cache;
 pub mod cert_events;
 pub mod cert_status;

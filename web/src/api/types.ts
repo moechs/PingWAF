@@ -1131,6 +1131,17 @@ export interface Agent {
   used_memory_bytes: number | null
   memory_bytes: number | null
   status: AgentStatus | string
+  /**
+   * Why the node is degraded: the reload its data plane could not apply.
+   * null when the configuration is in effect or the node is not connected.
+   */
+  status_reason?: string | null
+  /**
+   * Log entries the agent discarded since its process started, before the
+   * control plane stored them. 0 when nothing was lost or the node is unknown
+   * to this control plane instance.
+   */
+  logs_dropped?: number
   api_key_id: string | null
   config_hash: string | null
   last_heartbeat: string | null

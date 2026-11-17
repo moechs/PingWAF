@@ -311,7 +311,10 @@ export function AgentsPage() {
       accessor: (a) => a.status,
       width: '1%',
       cell: (a) => (
-        <span className="inline-flex items-center gap-2">
+        <span
+          className="inline-flex items-center gap-2"
+          title={a.status_reason ?? undefined}
+        >
           <span
             className={cn(
               'h-2 w-2 shrink-0 rounded-full',
@@ -669,6 +672,27 @@ export function AgentsPage() {
                 </Badge>
               )}
             </div>
+
+            {detail.status_reason && (
+              <div className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-[13px] text-fg">
+                <Warning weight="duotone" className="mt-0.5 h-4 w-4 shrink-0" />
+                <p className="min-w-0">
+                  {t('pages.agents.configNotApplied')}{' '}
+                  <span className="pw-mono break-words text-xs">{detail.status_reason}</span>
+                </p>
+              </div>
+            )}
+
+            {(detail.logs_dropped ?? 0) > 0 && (
+              <div className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-[13px] text-fg">
+                <Warning weight="duotone" className="mt-0.5 h-4 w-4 shrink-0" />
+                <p className="min-w-0">
+                  {t('pages.agents.logsDropped', {
+                    dropped: formatNumber(detail.logs_dropped ?? 0),
+                  })}
+                </p>
+              </div>
+            )}
 
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <MetricTile

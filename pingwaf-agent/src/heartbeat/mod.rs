@@ -83,6 +83,8 @@ pub struct MetricsCollector {
     rps_state: std::sync::Mutex<RpsState>,
     /// Last calculated RPS value
     cached_rps: AtomicU64,
+    /// Log entries discarded before the control plane stored them
+    logs_dropped_total: AtomicU64,
 }
 
 impl MetricsCollector {
@@ -94,7 +96,20 @@ impl MetricsCollector {
             active_connections: AtomicI64::new(0),
             rps_state: std::sync::Mutex::new(RpsState::default()),
             cached_rps: AtomicU64::new(0),
+            logs_dropped_total: AtomicU64::new(0),
         }
+    }
+
+    /// Count log entries that will never reach the control plane, wherever
+    /// they were discarded. Returns the running total.
+    pub fn record_logs_dropped(&self, count: u64) -> u64 {
+        self.logs_dropped_total.fetch_add(count, Ordering::Relaxed) + count
+    }
+
+    /// Log entries discarded since the process started; shipped with every
+    /// heartbeat so the loss is visible on the control plane.
+    pub fn logs_dropped_total(&self) -> u64 {
+        self.logs_dropped_total.load(Ordering::Relaxed)
     }
 
     /// Record a request (called on every proxied request).

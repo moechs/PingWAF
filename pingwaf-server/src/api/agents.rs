@@ -110,6 +110,15 @@ pub struct AgentResponse {
     /// `None` until the first heartbeat after migration 000064.
     pub used_memory_bytes: Option<i64>,
     pub status: String,
+    /// Why the node is `degraded`: the reload its data plane could not apply,
+    /// as of the last heartbeat. `null` when the configuration is in effect
+    /// or the node is not connected.
+    pub status_reason: Option<String>,
+    /// Access-log and security-event entries the node discarded since its
+    /// agent process started, as of its last heartbeat: its queue overflowed
+    /// while the control plane was unreachable, or the control plane refused
+    /// to store them. `0` also for agents too old to report it.
+    pub logs_dropped: u64,
     pub api_key_id: Option<Uuid>,
     pub config_hash: Option<String>,
     pub last_heartbeat: Option<DateTime<Utc>>,
@@ -764,6 +773,8 @@ async fn enrich(
             total_memory_bytes: row.total_memory_bytes,
             used_memory_bytes: row.used_memory_bytes,
             status: row.status,
+            status_reason: state.agents.apply_error(&row.id).await,
+            logs_dropped: state.agents.log_drops(&row.id).await,
             api_key_id: row.api_key_id,
             config_hash: row.config_hash,
             last_heartbeat: row.last_heartbeat,

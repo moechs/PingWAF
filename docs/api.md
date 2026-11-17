@@ -1830,6 +1830,8 @@ List registered agents.
       "cpu_cores": 4,
       "memory_bytes": 8589934592,
       "status": "online",
+      "status_reason": null,
+      "logs_dropped": 0,
       "last_heartbeat": "2024-01-01T12:00:00Z",
       "last_seen": "2024-01-01T12:00:00Z",
       "registered_at": "2024-01-01T00:00:00Z",
@@ -1842,6 +1844,22 @@ List registered agents.
   "total": 1
 }
 ```
+
+`status` is `online`, `degraded` or `offline`. A node is `degraded` while its
+data plane could not apply the configuration it last received: it keeps
+serving the previous one and retries on its own (5 s, doubling up to 5 min),
+and `status_reason` carries the failing reload step(s). `status_reason` is
+`null` once the configuration is in effect and for nodes without a live
+stream.
+
+`logs_dropped` counts the access-log and security-event entries the agent
+discarded since its process started, before the control plane stored them:
+its 2048-entry queue was full while the control plane was unreachable, or the
+control plane refused to store an entry. The agent reports the running total
+with every heartbeat, so it resets when the agent restarts; the control plane
+also writes a warning to its own log each time the total grows. `0` means
+nothing was lost, or that this control plane instance has not heard from the
+node since it started.
 
 `name` is the operator-facing label: it is `display_name` when one is set,
 otherwise it falls back to `hostname`. `hostname` is the identity the agent
@@ -2043,10 +2061,15 @@ Semantics worth knowing before you reach for it:
   logs are stored yet: the agent flushes its current batch (and up to one
   more batch drained while the RPC was in flight) asynchronously.
 - The agent's in-memory log channel holds at most 2048 entries; anything
-  dropped while the control plane was unreachable is gone for good.
-- A batch whose transport failed is kept by the agent and retried, capped at
-  one `log_batch_size` batch — the flush never turns into an unbounded send
-  loop.
+  that overflows it while the control plane was unreachable is gone for good.
+  Each lost entry is counted and reported as `logs_dropped` on
+  `GET /api/v1/agents`.
+- A batch that was not stored is kept by the agent — across reconnects too —
+  and retried on the next batch interval, whether the transport failed or the
+  control plane answered with an error. It stays capped at one
+  `log_batch_size` batch, so the flush never turns into an unbounded send
+  loop. An entry is given up only when the control plane refuses it on its
+  own while storing others from the same batch.
 
 ---
 
@@ -2825,7 +2848,10 @@ Request and response bodies are prefixes: the agent stores at most
 `max_body_log_size` bytes per direction (8 KiB by default, 64 KiB ceiling,
 `capture_response_body` can switch response capture off). Both directions report
 the real size and a `*_truncated` flag, so a short body is never mistaken for a
-complete one.
+complete one. A node holds at most 32 MiB of these prefixes for its in-flight
+requests and another 32 MiB in its log queue; the default limit fits exactly,
+while a raised one can leave a busy node's entries without a body — truncated
+flag set, real size kept.
 
 Repeated header names are folded into the single value the stored map accepts:
 most headers join with `, ` (the way HTTP prescribes), while `Set-Cookie`

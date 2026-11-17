@@ -161,6 +161,20 @@ message AgentHeartbeat {
   // than the full set. The control plane must then keep the rows it did not
   // see instead of treating them as revoked.
   bool blocked_ips_truncated = 21;
+
+  // Why the data plane is not running the configuration named by
+  // `config_hash`: the hash is what the agent last received, and a reload
+  // that failed part-way leaves the proxy on a mix of old and new state.
+  // Empty when the last reload applied in full. Sent together with
+  // `health = AGENT_HEALTH_DEGRADED`; the agent retries on its own.
+  string config_apply_error = 22;
+
+  // Access-log and security-event entries this agent discarded since its
+  // process started: its queue was full while the control plane was
+  // unreachable, or the control plane refused to store them. Cumulative, so
+  // a value lower than the previous heartbeat's means the agent restarted.
+  // Always 0 from agents that predate the field.
+  uint64 logs_dropped_total = 23;
 }
 
 // Backend health of one upstream, reported per heartbeat.

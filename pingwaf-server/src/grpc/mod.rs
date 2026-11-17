@@ -16,7 +16,9 @@ pub mod visitor_auth;
 
 pub use cache_status::{CacheStatusRegistry, SiteCacheStatus};
 pub use control_plane::ControlPlaneService;
-pub use registry::{AgentRegistry, ConnectedAgent, COMMAND_CHANNEL_CAPACITY};
+pub use registry::{
+    AgentRegistry, ConfigDrift, ConnectedAgent, COMMAND_CHANNEL_CAPACITY,
+};
 
 use pingwaf_proto::control_plane::{
     server_command::Payload, ServerCommand, SiteConfig, UpdateSiteCommand,
@@ -82,11 +84,47 @@ async fn update_payload_for_agent(
     Ok(Some(config))
 }
 
+/// The command that replaces an agent's configuration with `site_config`.
+fn update_site_command(site_config: SiteConfig) -> ServerCommand {
+    ServerCommand {
+        command_id: Uuid::new_v4().to_string(),
+        r#type: command_type::UPDATE_SITE,
+        issued_at: now_timestamp(),
+        payload: Some(Payload::UpdateSite(UpdateSiteCommand {
+            site_config: Some(site_config),
+        })),
+    }
+}
+
+/// Pushes one agent the configuration it should be running, built fresh.
+///
+/// This is the repair for a push that never arrived: the heartbeat handler
+/// calls it when an agent keeps reporting a `config_hash` other than the one
+/// last issued to it (see [`AgentRegistry::observe_config_hash`]). Returns
+/// whether the command entered a live stream; `Ok(false)` also covers an agent
+/// whose row is gone.
+pub(crate) async fn repush_agent_config(
+    db: &DatabaseConnection,
+    registry: &AgentRegistry,
+    agent_id: Uuid,
+) -> Result<bool, DbErr> {
+    let Some(row) = agent::Entity::find_by_id(agent_id).one(db).await? else {
+        return Ok(false);
+    };
+    let visible = agent_visible_site_ids(db, &row).await?;
+    let config = build_site_config(db, Some(&visible)).await?;
+    Ok(registry
+        .send_command(&agent_id, update_site_command(config))
+        .await)
+}
+
 /// Notifies every connected agent that the configuration for `site_id` changed.
 ///
 /// This is a best-effort operation: it logs failures but never propagates them
 /// to the caller. The REST API handler has already committed the change; a push
-/// failure merely means the agent will pick it up on the next `sync_rules`.
+/// that does not arrive is repaired from the heartbeat, which reports the hash
+/// the agent runs — one that stays behind the hash issued here gets the
+/// configuration pushed again (see [`repush_agent_config`]). Agents never pull.
 ///
 /// A successful build also records a configuration version (unless the latest
 /// version already carries this fingerprint), which is what makes the console
@@ -164,14 +202,7 @@ pub async fn notify_config_changed(
         let Some(site_config_for_agent) = payload else {
             continue;
         };
-        let command = ServerCommand {
-            command_id: Uuid::new_v4().to_string(),
-            r#type: command_type::UPDATE_SITE,
-            issued_at: now_timestamp(),
-            payload: Some(Payload::UpdateSite(UpdateSiteCommand {
-                site_config: Some(site_config_for_agent),
-            })),
-        };
+        let command = update_site_command(site_config_for_agent);
         if state.agents.send_command(&row.id, command).await {
             delivered += 1;
         }
@@ -324,15 +355,10 @@ async fn push_visible_bundle(
             config
         },
     };
-    let command = ServerCommand {
-        command_id: Uuid::new_v4().to_string(),
-        r#type: command_type::UPDATE_SITE,
-        issued_at: now_timestamp(),
-        payload: Some(Payload::UpdateSite(UpdateSiteCommand {
-            site_config: Some(payload),
-        })),
-    };
-    state.agents.send_command(&row.id, command).await
+    state
+        .agents
+        .send_command(&row.id, update_site_command(payload))
+        .await
 }
 
 /// Ids of the agents that currently serve `site_id`.

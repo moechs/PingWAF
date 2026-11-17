@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use pingwaf_proto::control_plane::{
@@ -51,7 +52,7 @@ use crate::grpc::config::{
     build_rule_bundle, build_site_config, from_timestamp,
 };
 use crate::grpc::registry::{
-    AgentRegistry, HeartbeatMetrics, COMMAND_CHANNEL_CAPACITY,
+    AgentRegistry, ConfigDrift, HeartbeatMetrics, COMMAND_CHANNEL_CAPACITY,
 };
 use crate::models::{
     access_log, action, agent, agent_blocked_ip, agent_metric, agent_status,
@@ -536,7 +537,13 @@ impl ControlPlaneTrait for ControlPlaneService {
         )
         .map_err(|err| Status::internal(err.to_string()))?;
 
+        // Order matters: a change committed while the configuration is being
+        // built queues its own push, which must survive to be replayed.
+        self.agents.begin_registration(row.id).await;
         let initial_config = self.site_config_for(&row).await?;
+        self.agents
+            .note_initial_config(row.id, &initial_config.config_hash)
+            .await;
         // DR-04: the config above is pushed regardless — this only makes a
         // version/capability mismatch visible to the operator.
         self.warn_scope_capability_gaps(&row).await;
@@ -619,6 +626,7 @@ impl ControlPlaneTrait for ControlPlaneService {
                 persist_peer_ip(&db, agent_id, &peer).await;
             }
             persist_heartbeat(&db, agent_id, &first, &registry).await;
+            reconcile_agent_config(&db, &registry, agent_id, &first).await;
             persist_host_samples(&db, agent_id, &first.host_samples).await;
             persist_blocked_ips(
                 &db,
@@ -647,6 +655,8 @@ impl ControlPlaneTrait for ControlPlaneService {
                     .record_heartbeat(agent_id, heartbeat_metrics(&message))
                     .await;
                 persist_heartbeat(&db, agent_id, &message, &registry).await;
+                reconcile_agent_config(&db, &registry, agent_id, &message)
+                    .await;
                 persist_host_samples(&db, agent_id, &message.host_samples)
                     .await;
                 persist_blocked_ips(
@@ -1378,6 +1388,57 @@ async fn persist_peer_ip(db: &DatabaseConnection, agent_id: Uuid, peer: &str) {
     }
 }
 
+/// Acts on what a heartbeat says about the agent's configuration: records
+/// (and logs, on change) a reload the data plane could not apply, and pushes
+/// the configuration again when the agent stays on a hash other than the one
+/// last issued to it.
+async fn reconcile_agent_config(
+    db: &DatabaseConnection,
+    registry: &AgentRegistry,
+    agent_id: Uuid,
+    message: &AgentHeartbeat,
+) {
+    let apply_error = message.config_apply_error.trim();
+    if registry.record_apply_error(agent_id, apply_error).await {
+        if apply_error.is_empty() {
+            tracing::info!(
+                %agent_id,
+                config_hash = %message.config_hash,
+                "agent data plane applied its configuration again"
+            );
+        } else {
+            tracing::warn!(
+                %agent_id,
+                config_hash = %message.config_hash,
+                error = %apply_error,
+                "agent data plane could not apply its configuration; it keeps serving the previous one and retries"
+            );
+        }
+    }
+
+    let ConfigDrift::Repush { expected } = registry
+        .observe_config_hash(
+            agent_id,
+            message.config_hash.trim(),
+            Instant::now(),
+        )
+        .await
+    else {
+        return;
+    };
+    tracing::warn!(
+        %agent_id,
+        reported = %message.config_hash,
+        expected = expected.as_deref().unwrap_or(""),
+        "agent is not on the configuration last issued to it; pushing it again"
+    );
+    if let Err(err) =
+        crate::grpc::repush_agent_config(db, registry, agent_id).await
+    {
+        tracing::warn!(%agent_id, error = %err, "failed to rebuild the configuration for a re-push");
+    }
+}
+
 async fn persist_heartbeat(
     db: &DatabaseConnection,
     agent_id: Uuid,
@@ -1393,6 +1454,20 @@ async fn persist_heartbeat(
     // `last_heartbeat` against Utc::now(), so trusting the reported timestamp
     // would let a skewed client clock mark healthy agents offline.
     let health = agent_status::from_proto_health(message.health);
+
+    // Lost access logs and security events are a gap in the audit trail the
+    // agent alone used to know about: say so here each time the count grows.
+    let newly_dropped = registry
+        .record_log_drops(agent_id, message.logs_dropped_total)
+        .await;
+    if newly_dropped > 0 {
+        tracing::warn!(
+            %agent_id,
+            dropped = newly_dropped,
+            total = message.logs_dropped_total,
+            "agent discarded log entries before they could be stored"
+        );
+    }
 
     // Rule-cache disk health: absent on older agents (treat as healthy).
     // A false means the edge could not load any usable snapshot and runs on

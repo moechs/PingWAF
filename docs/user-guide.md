@@ -873,8 +873,10 @@ of waiting out the batch interval.
   fleet for you. `delivered` means the command reached the agent — it does not
   guarantee the entries are stored yet.
 - Logs dropped while an agent was offline are unrecoverable: the agent's log
-  buffer holds at most 2048 entries and older entries are discarded under
-  pressure. Flush does not resurrect them.
+  buffer holds at most 2048 entries and new entries are discarded once it is
+  full. Flush does not resurrect them. The node's detail panel on the
+  **Agents** page shows how many entries it has discarded since its agent
+  process started.
 
 ### Elasticsearch Integration
 
@@ -1011,7 +1013,11 @@ key. An explicitly configured secret always wins.
 
 The Agents page shows:
 - Display name (an optional operator label — left empty, the hostname is shown; rename via `PATCH /api/v1/agents/{id}`, search matches the label, hostname and IP)
-- Connection status (online/offline/degraded)
+- Connection status (online/offline/degraded). A node is **degraded** while its
+  data plane could not apply the latest configuration; the detail panel names
+  the failing reload step, and the node retries on its own
+- Log entries the node discarded before the control plane stored them (detail
+  panel, shown only when non-zero)
 - Last heartbeat time
 - System info (hostname, OS, CPU, memory)
 - Agent version

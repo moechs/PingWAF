@@ -395,7 +395,7 @@ server-side log batch size (`500`) are compiled-in constants with no override.
 | `heartbeat_interval_secs` | int | `30` | Fallback heartbeat frequency, used only when the control plane hands no interval down at registration |
 | `log_batch_size` | int | `100` | Log entries before flush |
 | `log_flush_interval_secs` | int | `5` | Max time between flushes |
-| `max_body_log_size` | int | `8192` | Max request body bytes to log |
+| `max_body_log_size` | int | `8192` | Max body bytes to log per direction (request and response), 64 KiB ceiling, `0` disables body capture. Bodies held for logging are capped at 32 MiB for the in-flight requests and 32 MiB for the log queue: above the default, a busy node logs some entries without their body, marked truncated |
 | `metrics_ship_interval_secs` | int | `30` | Edge-metrics ship interval; `0` disables shipping |
 | `auto_upgrade` | bool | `false` | Install the control plane's build automatically when the versions differ. Replaces the binary and restarts the process — see [Agent Self-Upgrade](#agent-self-upgrade) |
 | `upgrade_url` | string | — | Control plane REST base (`https://cp.example.com:9080`) used only by the upgrade endpoints. Auto-upgrade stays disabled while this is unset |

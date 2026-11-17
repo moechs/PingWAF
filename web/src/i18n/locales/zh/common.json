@@ -1688,6 +1688,8 @@
       "unassigned": "未分配",
       "connected": "已连接",
       "pendingCommands": "待执行命令",
+      "configNotApplied": "新配置未在数据面生效，节点仍按上一份配置运行并会自动重试：",
+      "logsDropped": "该节点自代理进程启动以来已丢弃 {{dropped}} 条日志：控制面不可达导致队列写满，或控制面拒绝存储。这些访问日志与安全事件不会出现在日志页。",
       "neverSeen": "从未",
       "registeredAt": "注册时间",
       "agentId": "节点 ID",

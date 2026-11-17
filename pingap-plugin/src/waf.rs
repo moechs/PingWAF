@@ -51,6 +51,7 @@ use pingap_core::{
 use pingap_util::{IpRules, base64_decode};
 use pingora::http::{ResponseHeader, Version};
 use pingora::proxy::Session;
+use pingwaf_agent::body_budget::{BodyBudget, LOG_BODY_BUDGET_BYTES};
 use pingwaf_agent::cache::{
     AiCrawlConfig as CacheAiCrawlConfig,
     BasicAuthConfig as CacheBasicAuthConfig,
@@ -1568,32 +1569,49 @@ impl CompiledRateRule {
         })
     }
 
-    /// Counter key for this rule and request: the rule id (a UUID, unique
-    /// across sites) plus the value of every tracked characteristic. Requests
-    /// missing a parameterized value (absent header/cookie/query) share the
-    /// `-` bucket instead of bypassing the counter.
+    /// Counter key for this rule and request: a digest of the rule id (a
+    /// UUID, unique across sites) and the value of every tracked
+    /// characteristic.
+    ///
+    /// The values are attacker-chosen and unbounded (a path, a header, a
+    /// query value), so they are not stored: the table keeps 16 bytes per
+    /// counter whatever the request looked like.
     fn counter_key(
         &self,
         request_data: &RequestData,
         host: &str,
         asn: Option<u32>,
-    ) -> String {
-        let mut key = String::with_capacity(64);
-        key.push_str(&self.id);
+    ) -> RateKey {
+        let mut digest = RateKeyDigest::new();
+        digest.push(&self.id);
+        self.key_parts(request_data, host, asn, |part| digest.push(part));
+        digest.finish()
+    }
+
+    /// Feeds `sink` the value of every tracked characteristic, in rule
+    /// order. Requests missing a parameterized value (absent
+    /// header/cookie/query) share the `-` bucket instead of bypassing the
+    /// counter.
+    fn key_parts(
+        &self,
+        request_data: &RequestData,
+        host: &str,
+        asn: Option<u32>,
+        mut sink: impl FnMut(&str),
+    ) {
         for c in &self.chars {
-            key.push('\u{1f}');
             match c {
-                RateChar::Ip => key.push_str(&request_data.client_ip),
-                RateChar::Host => key.push_str(host),
-                RateChar::Path => key.push_str(&request_data.path),
-                RateChar::Country => key.push_str(
-                    request_data.country_code.as_deref().unwrap_or("-"),
-                ),
-                RateChar::Asn => match asn {
-                    Some(n) => key.push_str(&n.to_string()),
-                    None => key.push('-'),
+                RateChar::Ip => sink(&request_data.client_ip),
+                RateChar::Host => sink(host),
+                RateChar::Path => sink(&request_data.path),
+                RateChar::Country => {
+                    sink(request_data.country_code.as_deref().unwrap_or("-"))
                 },
-                RateChar::Header(name) => key.push_str(
+                RateChar::Asn => match asn {
+                    Some(n) => sink(&n.to_string()),
+                    None => sink("-"),
+                },
+                RateChar::Header(name) => sink(
                     request_data
                         .headers
                         .iter()
@@ -1601,7 +1619,7 @@ impl CompiledRateRule {
                         .map(|(_, v)| v.trim())
                         .unwrap_or("-"),
                 ),
-                RateChar::Cookie(name) => key.push_str(
+                RateChar::Cookie(name) => sink(
                     request_data
                         .headers
                         .iter()
@@ -1613,7 +1631,7 @@ impl CompiledRateRule {
                         })
                         .unwrap_or("-"),
                 ),
-                RateChar::Query(name) => key.push_str(
+                RateChar::Query(name) => sink(
                     request_data
                         .query
                         .split('&')
@@ -1625,7 +1643,51 @@ impl CompiledRateRule {
                 ),
             }
         }
-        key
+    }
+}
+
+/// Fixed-size key of one rate limit counter (see
+/// [`CompiledRateRule::counter_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RateKey(u128);
+
+/// Two independently keyed 64-bit hashes make up a [`RateKey`]. The keys are
+/// drawn once per process, so a client cannot compute two requests that land
+/// on the same counter, and 128 bits put an accidental collision (one client
+/// inheriting another's count or ban) out of reach at any table size.
+static RATE_KEY_HASHERS: LazyLock<
+    [std::collections::hash_map::RandomState; 2],
+> = LazyLock::new(Default::default);
+
+struct RateKeyDigest {
+    high: std::collections::hash_map::DefaultHasher,
+    low: std::collections::hash_map::DefaultHasher,
+}
+
+impl RateKeyDigest {
+    fn new() -> Self {
+        use std::hash::BuildHasher;
+        let [high, low] = &*RATE_KEY_HASHERS;
+        Self {
+            high: high.build_hasher(),
+            low: low.build_hasher(),
+        }
+    }
+
+    /// `str` hashes as its bytes plus a terminator, so the parts stay
+    /// delimited: ("ab", "c") and ("a", "bc") give different keys.
+    fn push(&mut self, part: &str) {
+        use std::hash::Hash;
+        part.hash(&mut self.high);
+        part.hash(&mut self.low);
+    }
+
+    fn finish(self) -> RateKey {
+        use std::hash::Hasher;
+        RateKey(
+            (u128::from(self.high.finish()) << 64)
+                | u128::from(self.low.finish()),
+        )
     }
 }
 
@@ -1684,10 +1746,17 @@ const RATE_COUNTERS_GC_THRESHOLD: usize = 65_536;
 /// the CPU cost on the hot path.
 const RATE_COUNTERS_GC_INTERVAL_SECS: u64 = 30;
 
-/// Past this many counters the sweep cadence tightens to every second: the
-/// map is growing faster than the relaxed interval can trim it, and memory
-/// pressure matters more than the (still once-per-second) O(N) sweep.
-const RATE_COUNTERS_GC_PANIC_THRESHOLD: usize = 262_144;
+/// Hard cap on live counters, all sites together. Sweeping only removes
+/// *expired* entries, so a flood of unique keys inside one window (a rule
+/// keyed on the path or a query value needs no botnet for that) used to grow
+/// the table for as long as the window lasted. At the cap a new key is only
+/// admitted after [`RateCounters::shed`] made room for it; with 16-byte keys
+/// the whole table then stays within a few tens of MiB.
+const RATE_COUNTERS_MAX_ENTRIES: usize = 262_144;
+
+/// Room one shed pass tries to free, so a table hovering at the cap is not
+/// walked again a second later.
+const RATE_COUNTERS_SHED_ROOM: usize = RATE_COUNTERS_MAX_ENTRIES / 8;
 
 /// Below `RATE_COUNTERS_GC_THRESHOLD` the map still needs occasional pruning:
 /// keys that stop receiving traffic (one-off scanner IP/path combinations)
@@ -1696,6 +1765,105 @@ const RATE_COUNTERS_GC_PANIC_THRESHOLD: usize = 262_144;
 /// at this size the map is cheap to keep, and the goal is bounded staleness,
 /// not per-request freshness.
 const RATE_COUNTERS_IDLE_GC_INTERVAL_SECS: u64 = 600;
+
+/// Rate limit counters of every site, capped at
+/// [`RATE_COUNTERS_MAX_ENTRIES`].
+#[derive(Default)]
+struct RateCounters {
+    map: DashMap<RateKey, RateCounter>,
+    /// Unix second of the last shed pass: at the cap the table is walked at
+    /// most once a second, whatever the request rate.
+    last_shed: AtomicU64,
+    /// Requests a rule did not count because the table was full.
+    uncounted: AtomicU64,
+}
+
+impl RateCounters {
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn sweep_expired(&self, now: u64) {
+        self.map.retain(|_, counter| now < counter.expires_at);
+    }
+
+    /// Whether a counter for a key not yet in the table may be created.
+    ///
+    /// `false` means the request goes uncounted for this rule: the table is
+    /// full of counters that carry more state than a first hit would, and
+    /// keeping those (the running bans above all) is worth more than
+    /// starting one more.
+    fn admit(&self, now: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.map.len() < RATE_COUNTERS_MAX_ENTRIES {
+            return true;
+        }
+        let last = self.last_shed.load(Relaxed);
+        if now != last
+            && self
+                .last_shed
+                .compare_exchange(last, now, Relaxed, Relaxed)
+                .is_ok()
+        {
+            self.shed(now);
+            if self.map.len() < RATE_COUNTERS_MAX_ENTRIES {
+                return true;
+            }
+        }
+        let uncounted = self.uncounted.fetch_add(1, Relaxed) + 1;
+        // 1, 2, 4, 8, ... : enough to notice, never one line per request.
+        if uncounted.is_power_of_two() {
+            warn!(
+                counters = self.map.len(),
+                uncounted,
+                "rate limit counter table is full; requests with new keys are not counted"
+            );
+        }
+        false
+    }
+
+    /// Frees [`RATE_COUNTERS_SHED_ROOM`] entries: expired counters first,
+    /// then the lowest counts. Keys under a running ban are never dropped —
+    /// a flood of fresh keys must not be a way to lift one — and a counter
+    /// that is close to its threshold outlives the single hits a unique-key
+    /// flood consists of.
+    fn shed(&self, now: u64) {
+        // Live, unbanned counters by magnitude of their count.
+        let mut magnitudes = [0usize; 33];
+        self.map.retain(|_, counter| {
+            if now >= counter.expires_at {
+                return false;
+            }
+            if now >= counter.blocked_until {
+                magnitudes[count_magnitude(counter.count)] += 1;
+            }
+            true
+        });
+        let keep = RATE_COUNTERS_MAX_ENTRIES - RATE_COUNTERS_SHED_ROOM;
+        let excess = self.map.len().saturating_sub(keep);
+        if excess == 0 {
+            return;
+        }
+        let mut freed = 0;
+        let mut cutoff = 0;
+        for (magnitude, counters) in magnitudes.iter().enumerate() {
+            if freed >= excess {
+                break;
+            }
+            freed += counters;
+            cutoff = magnitude + 1;
+        }
+        self.map.retain(|_, counter| {
+            now < counter.blocked_until
+                || count_magnitude(counter.count) >= cutoff
+        });
+    }
+}
+
+/// 0 for a count of 0, then one step per doubling: 1, 2-3, 4-7, ...
+fn count_magnitude(count: u32) -> usize {
+    (u32::BITS - count.leading_zeros()) as usize
+}
 
 fn unix_now() -> u64 {
     crate::host_cache::unix_now()
@@ -1727,7 +1895,7 @@ impl RateLimitPolicy {
     /// the request continue.
     fn evaluate(
         &self,
-        counters: &DashMap<String, RateCounter>,
+        counters: &RateCounters,
         request_data: &RequestData,
         host: &str,
         cleared: bool,
@@ -1742,8 +1910,7 @@ impl RateLimitPolicy {
             // size so a policy-less site does not pay an O(N) scan per
             // request.
             if counters.len() > 1024 {
-                let now = unix_now();
-                counters.retain(|_, counter| counter.expires_at > now);
+                counters.sweep_expired(unix_now());
             }
             return RateOutcome { deny: None, logged };
         }
@@ -1790,17 +1957,13 @@ impl RateLimitPolicy {
                 continue;
             }
             let key = rule.counter_key(request_data, host, asn);
-            // Throttled sweep at every water level: above the threshold, at
-            // most one retain per interval (one per second once the panic
-            // threshold is passed) instead of a full O(N) walk on every
-            // request once an attacker has pushed the map past the threshold;
-            // below it, a slow idle interval still purges expired entries.
-            // The compare-exchange picks a single racer to run it; the
-            // others proceed without the walk.
-            let interval = if counters.len() >= RATE_COUNTERS_GC_PANIC_THRESHOLD
-            {
-                1
-            } else if counters.len() > RATE_COUNTERS_GC_THRESHOLD {
+            // Throttled sweep of expired counters at every water level: at
+            // most one retain per interval instead of a full O(N) walk on
+            // every request once an attacker has pushed the map past the
+            // threshold; below it, a slow idle interval still purges expired
+            // entries. The compare-exchange picks a single racer to run it;
+            // the others proceed without the walk.
+            let interval = if counters.len() > RATE_COUNTERS_GC_THRESHOLD {
                 RATE_COUNTERS_GC_INTERVAL_SECS
             } else {
                 RATE_COUNTERS_IDLE_GC_INTERVAL_SECS
@@ -1819,15 +1982,26 @@ impl RateLimitPolicy {
                     )
                     .is_ok()
             {
-                counters.retain(|_, entry| now < entry.expires_at);
+                counters.sweep_expired(now);
             }
             let window = now / rule.period_secs;
-            let mut entry = counters.entry(key).or_insert(RateCounter {
-                window,
-                count: 0,
-                blocked_until: 0,
-                expires_at: 0,
-            });
+            // A key already in the table is always counted; only a new one
+            // has to be admitted, and that happens with no shard lock held
+            // (shedding walks the whole map).
+            let mut entry = match counters.map.get_mut(&key) {
+                Some(entry) => entry,
+                None => {
+                    if !counters.admit(now) {
+                        continue;
+                    }
+                    counters.map.entry(key).or_insert(RateCounter {
+                        window,
+                        count: 0,
+                        blocked_until: 0,
+                        expires_at: 0,
+                    })
+                },
+            };
             if entry.window != window {
                 entry.window = window;
                 entry.count = 0;
@@ -2060,6 +2234,9 @@ struct PendingAccess {
     /// Body bytes the log keeps per direction, resolved from the agent
     /// config when the request arrived. 0 disables body capture.
     body_limit: usize,
+    /// What the body prefixes held here are charged against while the entry
+    /// sits in the pool.
+    body_charge: BodyCharge,
     /// Response facts, present once `handle_response` held the entry back
     /// for body capture.
     response: Option<ResponseFacts>,
@@ -2155,6 +2332,32 @@ impl ResponseFacts {
             let room = limit - buf.len();
             buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
         }
+    }
+
+    /// Absorbs one streamed chunk for an entry still held in the pending
+    /// pool, charging the bytes it keeps against the pool's body budget.
+    ///
+    /// When the budget cannot take them, capture stops for the rest of the
+    /// response: what was kept so far stays, and the log marks the body as
+    /// truncated. Byte counting carries on regardless.
+    fn absorb_held(
+        &mut self,
+        chunk: &[u8],
+        limit: usize,
+        charge: &mut BodyCharge,
+    ) {
+        let limit = if self.capture_body { limit } else { 0 };
+        let kept = self.body.as_ref().map_or(0, Vec::len);
+        let wanted = chunk.len().min(limit.saturating_sub(kept));
+        if wanted > 0 && !charge.try_add(wanted) {
+            self.capture_body = false;
+            // An empty prefix (rather than none) is what makes `truncated`
+            // report a body that was there but not kept.
+            self.body.get_or_insert_with(Vec::new);
+            self.body_size += chunk.len() as u64;
+            return;
+        }
+        self.absorb(chunk, limit);
     }
 
     /// Whether the kept prefix is shorter than the body it came from.
@@ -2371,6 +2574,49 @@ const PENDING_ACCESS_MAX_ENTRIES: usize = 2048;
 static PENDING_ACCESS: LazyLock<DashMap<String, PendingAccess>> =
     LazyLock::new(DashMap::new);
 
+/// Body prefixes held by the entries of [`PENDING_ACCESS`]. The entry cap
+/// bounds the pool at 2048 exchanges; this bounds the bytes their request and
+/// response prefixes pin (see [`LOG_BODY_BUDGET_BYTES`]). An entry whose
+/// prefix does not fit keeps its facts and logs the body as truncated.
+static PENDING_BODIES: BodyBudget = BodyBudget::new(LOG_BODY_BUDGET_BYTES);
+
+/// One pending entry's share of a [`BodyBudget`]. Returned on drop, so the
+/// bytes come back whichever path takes the entry out of the pool: shipped,
+/// answered by the plugin, swept, or evicted.
+struct BodyCharge {
+    budget: &'static BodyBudget,
+    held: usize,
+}
+
+impl BodyCharge {
+    fn new(budget: &'static BodyBudget) -> Self {
+        Self { budget, held: 0 }
+    }
+
+    /// Charges `bytes` more. Returns false, charging nothing, when the pool's
+    /// budget cannot take them.
+    fn try_add(&mut self, bytes: usize) -> bool {
+        let fits = self.budget.try_reserve(bytes);
+        if fits {
+            self.held += bytes;
+        }
+        fits
+    }
+
+    /// Gives back `bytes` of what this entry was charged.
+    fn release(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.held);
+        self.held -= bytes;
+        self.budget.release(bytes);
+    }
+}
+
+impl Drop for BodyCharge {
+    fn drop(&mut self) {
+        self.budget.release(self.held);
+    }
+}
+
 fn register_pending_access(request_id: &str, pending: PendingAccess) {
     if PENDING_ACCESS.len() >= PENDING_ACCESS_MAX_ENTRIES {
         PENDING_ACCESS.retain(|_, v| v.start.elapsed() < PENDING_ACCESS_TTL);
@@ -2415,6 +2661,9 @@ pub fn pending_path_bypasses_rate_limit(request_id: &str) -> bool {
 /// Backfills the request-body facts of a pending access entry once the
 /// request-body filter has seen the body. A no-op when the entry is gone
 /// (the request was already answered or swept).
+///
+/// The prefix is charged against the pool's body budget. When it does not
+/// fit, the entry records the size and logs the body as truncated instead.
 fn amend_pending_access_body(
     request_id: &str,
     body: Option<Vec<u8>>,
@@ -2422,9 +2671,15 @@ fn amend_pending_access_body(
     truncated: bool,
 ) {
     if let Some(mut entry) = PENDING_ACCESS.get_mut(request_id) {
-        entry.request_body = body;
+        let entry = &mut *entry;
+        if let Some(replaced) = entry.request_body.take() {
+            entry.body_charge.release(replaced.len());
+        }
+        let offered = body.as_ref().is_some_and(|bytes| !bytes.is_empty());
+        let kept = body.filter(|bytes| entry.body_charge.try_add(bytes.len()));
+        entry.request_body_truncated = truncated || (offered && kept.is_none());
+        entry.request_body = kept;
         entry.request_body_size = size;
-        entry.request_body_truncated = truncated;
     }
 }
 
@@ -2964,6 +3219,7 @@ pub(crate) fn emit_challenge_access(
         request_body_size: 0,
         request_body_truncated: false,
         body_limit: log_body_limit(),
+        body_charge: BodyCharge::new(&PENDING_BODIES),
         response: None,
         waf_triggered: false,
         // This entry is built for a response the plugin generated itself —
@@ -3139,9 +3395,9 @@ pub struct WafPlugin {
     /// Separate sweep gate for the by-site id table, so a deleted site's
     /// compiled automaton cannot stay resident forever.
     site_context_sweep: HostCacheSweep,
-    /// Rate limit counters, keyed by rule id and characteristic values. Kept
-    /// on the plugin so they survive per-site context rebuilds.
-    rate_counters: DashMap<String, RateCounter>,
+    /// Rate limit counters of every site. Kept on the plugin so they survive
+    /// per-site context rebuilds.
+    rate_counters: RateCounters,
 }
 
 /// How a body whose staging budget ran out is handled.
@@ -4318,7 +4574,7 @@ impl TryFrom<&PluginConf> for WafPlugin {
             site_contexts_by_id: DashMap::new(),
             context_sweep: HostCacheSweep::default(),
             site_context_sweep: HostCacheSweep::default(),
-            rate_counters: DashMap::new(),
+            rate_counters: RateCounters::default(),
         })
     }
 }
@@ -4582,6 +4838,7 @@ impl Plugin for WafPlugin {
                     request_body_size: 0,
                     request_body_truncated: false,
                     body_limit,
+                    body_charge: BodyCharge::new(&PENDING_BODIES),
                     response: None,
                     waf_triggered: false,
                     // Set when a path exception skips the challenge layer
@@ -5913,13 +6170,12 @@ impl Plugin for WafPlugin {
         let Some(mut entry) = PENDING_ACCESS.get_mut(&request_id) else {
             return Ok(ResponseBodyPluginResult::Unchanged);
         };
-        let entry_limit = entry.body_limit;
+        let entry = &mut *entry;
         let Some(facts) = entry.response.as_mut() else {
             return Ok(ResponseBodyPluginResult::Unchanged);
         };
-        let limit = if facts.capture_body { entry_limit } else { 0 };
         if let Some(chunk) = body.as_ref() {
-            facts.absorb(chunk, limit);
+            facts.absorb_held(chunk, entry.body_limit, &mut entry.body_charge);
         }
         Ok(ResponseBodyPluginResult::Unchanged)
     }
@@ -7477,6 +7733,7 @@ inspect_body = true"###,
                 request_body_size: 0,
                 request_body_truncated: false,
                 body_limit: 0,
+                body_charge: BodyCharge::new(&PENDING_BODIES),
                 response: None,
                 waf_triggered: false,
                 path_bypasses_challenge: false,
@@ -9767,13 +10024,13 @@ inspect_body = true"###,
             }],
             last_gc_sweep: AtomicU64::new(0),
         };
-        let counters: DashMap<String, RateCounter> = DashMap::new();
+        let counters = RateCounters::default();
 
         // Fill the map past the GC threshold with already-expired entries.
         let now = unix_now();
         for i in 0..=RATE_COUNTERS_GC_THRESHOLD {
-            counters.insert(
-                format!("stale-{i}"),
+            counters.map.insert(
+                RateKey(i as u128),
                 RateCounter {
                     window: 0,
                     count: 1,
@@ -9784,7 +10041,7 @@ inspect_body = true"###,
         }
 
         let request = RequestData::new("GET", "/");
-        let evaluate = |counters: &DashMap<String, RateCounter>| {
+        let evaluate = |counters: &RateCounters| {
             policy.evaluate(counters, &request, "example.com", false, None)
         };
 
@@ -9797,8 +10054,8 @@ inspect_body = true"###,
         // "now": the interval has not elapsed, so repeated evaluations must
         // not sweep — the map stays at threshold+1 entries.
         for i in 0..=RATE_COUNTERS_GC_THRESHOLD {
-            counters.insert(
-                format!("stale2-{i}"),
+            counters.map.insert(
+                RateKey(i as u128),
                 RateCounter {
                     window: 0,
                     count: 1,
@@ -9843,15 +10100,15 @@ inspect_body = true"###,
             }],
             last_gc_sweep: AtomicU64::new(0),
         };
-        let counters: DashMap<String, RateCounter> = DashMap::new();
+        let counters = RateCounters::default();
 
         let request = RequestData::new("GET", "/");
-        let evaluate = |counters: &DashMap<String, RateCounter>| {
+        let evaluate = |counters: &RateCounters| {
             policy.evaluate(counters, &request, "example.com", false, None)
         };
         let stale = |i: usize| {
             (
-                format!("stale-{i}"),
+                RateKey(i as u128),
                 RateCounter {
                     window: 0,
                     count: 1,
@@ -9866,7 +10123,7 @@ inspect_body = true"###,
         // creates survives.
         for i in 0..3 {
             let (k, v) = stale(i);
-            counters.insert(k, v);
+            counters.map.insert(k, v);
         }
         evaluate(&counters);
         assert_eq!(counters.len(), 1);
@@ -9875,7 +10132,7 @@ inspect_body = true"###,
         // evaluations must not sweep the small map.
         for i in 0..3 {
             let (k, v) = stale(i);
-            counters.insert(k, v);
+            counters.map.insert(k, v);
         }
         policy
             .last_gc_sweep
@@ -10084,7 +10341,7 @@ inspect_body = true"###,
             rules: vec![rule],
             last_gc_sweep: AtomicU64::new(0),
         };
-        let counters: DashMap<String, RateCounter> = DashMap::new();
+        let counters = RateCounters::default();
         let request = RequestData::new("GET", "/api/x");
         let outcome = policy.evaluate(
             &counters,
@@ -10095,7 +10352,7 @@ inspect_body = true"###,
         );
         assert!(outcome.deny.is_none());
         assert!(
-            counters.is_empty(),
+            counters.map.is_empty(),
             "an excepted request must not be counted"
         );
     }
@@ -10180,32 +10437,174 @@ inspect_body = true"###,
             scheme: "http".to_string(),
             protocol: "HTTP/1.1".to_string(),
         };
-        let sep = '\u{1f}';
+        let parts = |request: &RequestData| {
+            let mut parts = Vec::new();
+            rule.key_parts(request, "s.test", None, |part| {
+                parts.push(part.to_string())
+            });
+            parts
+        };
+        let key =
+            |request: &RequestData| rule.counter_key(request, "s.test", None);
 
         let full = request(
             vec![("x-api-key", "v1"), ("Cookie", "a=1; Session=abc; b=2")],
             "lang=en&page=2",
         );
-        assert_eq!(
-            format!("rl-h{sep}v1{sep}abc{sep}en"),
-            rule.counter_key(&full, "s.test", None)
-        );
+        assert_eq!(parts(&full), ["v1", "abc", "en"]);
 
         // Header matching is case-insensitive; a present-but-empty query
         // value keys as "" rather than the missing bucket.
         let mixed = request(vec![("X-API-KEY", "v1")], "lang=");
-        assert_eq!(
-            format!("rl-h{sep}v1{sep}-{sep}"),
-            rule.counter_key(&mixed, "s.test", None)
-        );
+        assert_eq!(parts(&mixed), ["v1", "-", ""]);
 
         // Requests missing every parameterized value share the '-' bucket
         // instead of bypassing the counter.
         let empty = request(Vec::new(), "page=2");
-        assert_eq!(
-            format!("rl-h{sep}-{sep}-{sep}-"),
-            rule.counter_key(&empty, "s.test", None)
+        assert_eq!(parts(&empty), ["-", "-", "-"]);
+
+        // Same values, same counter — however the request spelled them.
+        let respelled = request(
+            vec![("X-API-KEY", " v1 "), ("cookie", "Session=abc")],
+            "page=2&lang=en",
         );
+        assert_eq!(key(&full), key(&respelled));
+        assert_ne!(key(&full), key(&mixed));
+        assert_ne!(key(&mixed), key(&empty));
+    }
+
+    /// The key is a digest, so what it must not lose is the boundary between
+    /// the parts and the rule they belong to.
+    #[test]
+    fn rate_key_keeps_parts_and_rules_apart() {
+        let rule = |id: &str| CompiledRateRule {
+            id: id.to_string(),
+            name: "k".to_string(),
+            expression: None,
+            exception: None,
+            chars: vec![RateChar::Host, RateChar::Path],
+            period_secs: 60,
+            threshold: 1,
+            mitigation_secs: 0,
+            action: RateAction::Block,
+        };
+        let a = rule("rule-a");
+        let key = |rule: &CompiledRateRule, host: &str, path: &str| {
+            rule.counter_key(&RequestData::new("GET", path), host, None)
+        };
+        assert_eq!(key(&a, "a.test", "/x"), key(&a, "a.test", "/x"));
+        assert_ne!(key(&a, "a.test", "/x"), key(&a, "a.tes", "t/x"));
+        assert_ne!(
+            key(&a, "a.test", "/x"),
+            key(&rule("rule-b"), "a.test", "/x")
+        );
+        assert_eq!(std::mem::size_of::<RateKey>(), 16);
+    }
+
+    fn counter(count: u32, blocked_until: u64, expires_at: u64) -> RateCounter {
+        RateCounter {
+            window: 0,
+            count,
+            blocked_until,
+            expires_at,
+        }
+    }
+
+    /// A flood of unique keys inside one window cannot grow the table past
+    /// the cap: the single hits it consists of are the first to go, and the
+    /// counters that matter — bans, and clients on their way to one — stay.
+    #[test]
+    fn rate_counters_are_capped_and_shed_the_cheapest_first() {
+        let counters = RateCounters::default();
+        let now = unix_now();
+        let live = now + 600;
+
+        counters
+            .map
+            .insert(RateKey(u128::MAX), counter(1, live, live));
+        counters
+            .map
+            .insert(RateKey(u128::MAX - 1), counter(40, 0, live));
+        let mut next = 0u128;
+        while counters.len() < RATE_COUNTERS_MAX_ENTRIES {
+            counters.map.insert(RateKey(next), counter(1, 0, live));
+            next += 1;
+        }
+
+        assert!(counters.admit(now), "shedding makes room for a new key");
+        assert!(
+            counters.len()
+                <= RATE_COUNTERS_MAX_ENTRIES - RATE_COUNTERS_SHED_ROOM
+        );
+        assert!(
+            counters.map.contains_key(&RateKey(u128::MAX)),
+            "a running ban survives the shed"
+        );
+        assert!(
+            counters.map.contains_key(&RateKey(u128::MAX - 1)),
+            "a counter with real state outlives single hits"
+        );
+    }
+
+    /// A table full of running bans has nothing cheaper than a new key: the
+    /// request goes uncounted, and the table is not walked again within the
+    /// same second.
+    #[test]
+    fn rate_counters_full_of_bans_refuse_new_keys() {
+        let policy = RateLimitPolicy {
+            rules: vec![CompiledRateRule {
+                id: "rl-cap".to_string(),
+                name: "cap".to_string(),
+                expression: None,
+                exception: None,
+                chars: vec![RateChar::Ip],
+                period_secs: 60,
+                threshold: 1,
+                mitigation_secs: 600,
+                action: RateAction::Block,
+            }],
+            // The expired-counter sweep is not what this test is about.
+            last_gc_sweep: AtomicU64::new(unix_now()),
+        };
+        let counters = RateCounters::default();
+        let live = unix_now() + 600;
+        for i in 0..RATE_COUNTERS_MAX_ENTRIES {
+            counters
+                .map
+                .insert(RateKey(i as u128), counter(2, live, live));
+        }
+
+        let mut request = RequestData::new("GET", "/");
+        request.client_ip = "198.51.100.7".to_string();
+        for _ in 0..3 {
+            let outcome =
+                policy.evaluate(&counters, &request, "s.test", false, None);
+            assert!(outcome.deny.is_none(), "an uncounted request passes");
+        }
+        assert_eq!(counters.len(), RATE_COUNTERS_MAX_ENTRIES);
+        assert_eq!(
+            counters
+                .uncounted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+
+        // A key that already has a counter is still enforced at the cap.
+        let known = policy.rules[0].counter_key(&request, "s.test", None);
+        counters.map.remove(&RateKey(0));
+        counters.map.insert(known, counter(2, live, live));
+        let outcome =
+            policy.evaluate(&counters, &request, "s.test", false, None);
+        assert!(outcome.deny.is_some(), "the ban of a known key holds");
+    }
+
+    #[test]
+    fn count_magnitude_steps_once_per_doubling() {
+        let magnitudes: Vec<usize> = [0, 1, 2, 3, 4, 7, 8, u32::MAX]
+            .into_iter()
+            .map(count_magnitude)
+            .collect();
+        assert_eq!(magnitudes, [0, 1, 2, 2, 3, 3, 4, 32]);
     }
 
     #[test]
@@ -10224,7 +10623,7 @@ inspect_body = true"###,
             }],
             last_gc_sweep: AtomicU64::new(0),
         };
-        let counters: DashMap<String, RateCounter> = DashMap::new();
+        let counters = RateCounters::default();
         let request = |ip: &str, path: &str| RequestData {
             method: "GET".to_string(),
             path: path.to_string(),
@@ -10509,12 +10908,132 @@ inspect_body = true"###,
             request_body_size: 0,
             request_body_truncated: false,
             body_limit: 0,
+            body_charge: BodyCharge::new(&PENDING_BODIES),
             response: None,
             waf_triggered,
             path_bypasses_challenge: false,
             path_bypasses_rate_limit: false,
             start: Instant::now(),
         }
+    }
+
+    /// A pending entry charged against `budget` instead of the shared pool,
+    /// so a test owns the numbers it asserts on.
+    fn budgeted_pending(budget: &'static BodyBudget) -> PendingAccess {
+        PendingAccess {
+            body_limit: 4096,
+            body_charge: BodyCharge::new(budget),
+            ..skip_pending("/upload", false)
+        }
+    }
+
+    /// The pool's body budget decides whether a request-body prefix is kept:
+    /// one that does not fit leaves the entry in place, logged as truncated,
+    /// and the bytes come back when an entry leaves the pool.
+    #[test]
+    fn request_body_prefix_is_charged_against_the_pool_budget() {
+        static BUDGET: BodyBudget = BodyBudget::new(1000);
+        PENDING_ACCESS
+            .insert("body-budget-a".to_string(), budgeted_pending(&BUDGET));
+        PENDING_ACCESS
+            .insert("body-budget-b".to_string(), budgeted_pending(&BUDGET));
+
+        amend_pending_access_body(
+            "body-budget-a",
+            Some(vec![b'a'; 700]),
+            700,
+            false,
+        );
+        amend_pending_access_body(
+            "body-budget-b",
+            Some(vec![b'b'; 700]),
+            700,
+            false,
+        );
+        assert_eq!(700, BUDGET.held());
+        {
+            let kept = PENDING_ACCESS.get("body-budget-a").unwrap();
+            assert_eq!(Some(700), kept.request_body.as_ref().map(Vec::len));
+            assert!(!kept.request_body_truncated);
+        }
+        {
+            let shed = PENDING_ACCESS.get("body-budget-b").unwrap();
+            assert!(shed.request_body.is_none());
+            assert!(shed.request_body_truncated);
+            assert_eq!(700, shed.request_body_size);
+        }
+
+        PENDING_ACCESS.remove("body-budget-a");
+        assert_eq!(0, BUDGET.held(), "a removed entry returns its bytes");
+
+        amend_pending_access_body(
+            "body-budget-b",
+            Some(vec![b'b'; 700]),
+            700,
+            false,
+        );
+        assert_eq!(700, BUDGET.held());
+        // A second amendment replaces the prefix; it is not charged twice.
+        amend_pending_access_body(
+            "body-budget-b",
+            Some(vec![b'b'; 300]),
+            300,
+            false,
+        );
+        assert_eq!(300, BUDGET.held());
+        {
+            let entry = PENDING_ACCESS.get("body-budget-b").unwrap();
+            assert_eq!(Some(300), entry.request_body.as_ref().map(Vec::len));
+            assert!(!entry.request_body_truncated);
+        }
+        PENDING_ACCESS.remove("body-budget-b");
+        assert_eq!(0, BUDGET.held());
+    }
+
+    /// A held response charges only the bytes it keeps, and stops capturing —
+    /// keeping what it has, marked truncated — once the pool is full.
+    #[test]
+    fn response_body_prefix_is_charged_against_the_pool_budget() {
+        static BUDGET: BodyBudget = BodyBudget::new(1000);
+        let capturing = || {
+            let mut facts = ResponseFacts::generated(200);
+            facts.capture_body = true;
+            facts
+        };
+
+        let mut charge = BodyCharge::new(&BUDGET);
+        let mut facts = capturing();
+        facts.absorb_held(&[b'x'; 600], 4096, &mut charge);
+        facts.absorb_held(&[b'x'; 600], 4096, &mut charge);
+        facts.absorb_held(&[b'x'; 100], 4096, &mut charge);
+        assert_eq!(Some(600), facts.body.as_ref().map(Vec::len));
+        assert_eq!(1300, facts.body_size);
+        assert!(facts.truncated());
+        assert_eq!(600, BUDGET.held());
+
+        // Nothing was kept for this one, yet its log still says a body was
+        // there.
+        let mut late_charge = BodyCharge::new(&BUDGET);
+        let mut late = capturing();
+        late.absorb_held(&[b'x'; 500], 4096, &mut late_charge);
+        assert_eq!(Some(0), late.body.as_ref().map(Vec::len));
+        assert!(late.truncated());
+        assert_eq!(600, BUDGET.held());
+
+        drop(charge);
+        assert_eq!(0, BUDGET.held());
+
+        // Only the kept prefix is charged, never the whole chunk; a response
+        // whose body is not captured is charged nothing.
+        let mut charge = BodyCharge::new(&BUDGET);
+        let mut facts = capturing();
+        facts.absorb_held(&[b'x'; 5000], 256, &mut charge);
+        facts.absorb_held(&[b'x'; 5000], 256, &mut charge);
+        assert_eq!(256, BUDGET.held());
+        let mut uncaptured = ResponseFacts::generated(200);
+        uncaptured.absorb_held(&[b'x'; 500], 4096, &mut charge);
+        assert!(uncaptured.body.is_none());
+        assert_eq!(256, BUDGET.held());
     }
 
     #[tokio::test]

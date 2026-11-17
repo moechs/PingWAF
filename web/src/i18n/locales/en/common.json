@@ -1688,6 +1688,8 @@
       "unassigned": "Unassigned",
       "connected": "Connected",
       "pendingCommands": "Pending commands",
+      "configNotApplied": "The latest configuration is not in effect on this node. It keeps serving the previous one and retries automatically:",
+      "logsDropped": "This node has discarded {{dropped}} log entries since its agent process started: its queue filled up while the control plane was unreachable, or the control plane refused to store them. These access logs and security events will not appear on the Logs page.",
       "neverSeen": "Never",
       "registeredAt": "Registered",
       "agentId": "Agent ID",

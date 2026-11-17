@@ -22,6 +22,18 @@ use persist::{
     CacheHealth, LoadSource, CACHE_FORMAT_VERSION,
 };
 
+/// Caps a status detail shipped in the heartbeat, so one long error cannot
+/// bloat every frame and every control-plane log line.
+fn bounded_reason(reason: String) -> String {
+    const MAX_CHARS: usize = 300;
+    if reason.chars().count() <= MAX_CHARS {
+        reason
+    } else {
+        let cut: String = reason.chars().take(MAX_CHARS).collect();
+        format!("{cut}…")
+    }
+}
+
 /// Creates the rule-cache directory owner-only (`0700`) on Unix.
 ///
 /// The snapshot under it carries site TLS private keys, OIDC client secrets,
@@ -1420,6 +1432,10 @@ pub struct RuleCache {
     /// Outcome of the latest disk load / persist cycle, reported by the
     /// heartbeat so a silently degraded cache is visible to the operator.
     health: CacheHealth,
+    /// Why the data plane's last reload of this cache did not apply in full;
+    /// `None` when it did. Written by the hot-reload watcher, read by the
+    /// heartbeat: `config_hash` alone only says what was received.
+    config_apply_error: Mutex<Option<String>>,
 }
 
 impl RuleCache {
@@ -1439,6 +1455,7 @@ impl RuleCache {
             last_policy_sync_at: AtomicI64::new(0),
             persist_lock: Mutex::new(()),
             health: CacheHealth::new(),
+            config_apply_error: Mutex::new(None),
             blocked_dirty: AtomicBool::new(false),
             rules_dirty: AtomicBool::new(false),
             last_rules_persist_ms: AtomicU64::new(0),
@@ -2444,14 +2461,28 @@ impl RuleCache {
     /// Degraded-state detail for the heartbeat; empty when all is well.
     /// Truncated to keep heartbeat frames and control-plane logs bounded.
     pub fn cache_status_reason(&self) -> String {
-        const MAX_CHARS: usize = 300;
-        let reason = self.health.status().reason.unwrap_or_default();
-        if reason.chars().count() <= MAX_CHARS {
-            reason
-        } else {
-            let cut: String = reason.chars().take(MAX_CHARS).collect();
-            format!("{cut}…")
-        }
+        bounded_reason(self.health.status().reason.unwrap_or_default())
+    }
+
+    /// Records the outcome of the data plane's latest reload: the failure
+    /// detail, or `None` once a reload applied in full.
+    pub fn set_config_apply_error(&self, error: Option<String>) {
+        *self
+            .config_apply_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = error;
+    }
+
+    /// Why the data plane is not running this cache's configuration; empty
+    /// when the last reload applied in full. Bounded like
+    /// [`Self::cache_status_reason`].
+    pub fn config_apply_error(&self) -> String {
+        let error = self
+            .config_apply_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        bounded_reason(error.unwrap_or_default())
     }
 
     /// Persist current rules to disk, feeding the outcome back into the
@@ -3625,6 +3656,26 @@ mod tests {
         assert_eq!(registry.get("example.com"), Some(&FailoverMode::Closed));
         assert_eq!(registry.get("m.example.com"), Some(&FailoverMode::Closed));
         assert_eq!(registry.get("other.example.com"), None);
+    }
+
+    /// The watcher records why a reload failed and clears it when one goes
+    /// through; the heartbeat ships the detail bounded.
+    #[test]
+    fn config_apply_error_is_recorded_bounded_and_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        assert_eq!(cache.config_apply_error(), "");
+
+        cache.set_config_apply_error(Some("upstreams: no such host".into()));
+        assert_eq!(cache.config_apply_error(), "upstreams: no such host");
+
+        cache.set_config_apply_error(Some("x".repeat(1000)));
+        assert_eq!(cache.config_apply_error().chars().count(), 301);
+
+        cache.set_config_apply_error(None);
+        assert_eq!(cache.config_apply_error(), "");
     }
 
     #[test]

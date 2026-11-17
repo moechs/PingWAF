@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pingap_cache::new_storage_clear_service;
 
@@ -2062,96 +2062,39 @@ pub async fn start_data_plane(
     // key) and set as current, so the ACME renewal task keeps working.
     let watcher_cache = Arc::clone(&rule_cache);
     let watcher_config_manager = Arc::clone(&config_manager);
-    let mut last_hash = watcher_cache.config_hash();
+    let mut tracker = ReloadTracker::new(watcher_cache.config_hash());
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(RELOAD_POLL_INTERVAL).await;
             let hash = watcher_cache.config_hash();
-            if hash == last_hash {
+            if !tracker.is_due(&hash, Instant::now()) {
                 continue;
             }
             info!(
-                old = %last_hash,
+                old = %tracker.applied,
                 new = %hash,
+                retry = tracker.failure.is_some(),
                 "data plane: rule change detected, reloading"
             );
             let converted = build_reload_config(&watcher_cache);
-            if converted.locations.is_empty()
-                && converted.certificates.is_empty()
-            {
-                warn!(
-                    "data plane: nothing left to serve, unloading every site"
-                );
-            }
-            let Ok(new_toml) = toml::to_string_pretty(&converted) else {
-                error!(
-                    "data plane: reload config serialization failed, keeping current"
-                );
-                last_hash = hash;
+            let errors = apply_reload(&watcher_config_manager, converted).await;
+            if errors.is_empty() {
+                tracker.succeeded(hash);
+                watcher_cache.set_config_apply_error(None);
                 continue;
-            };
-            // Fetch-merge-save must be atomic with respect to ACME's own
-            // read-modify-write: an issuance completing while the reload was
-            // reading a PEM-less snapshot used to be clobbered by the reload
-            // save, dropping the certificate from storage (and then from the
-            // SNI table on the next provider rebuild).
-            let config = match watcher_config_manager
-                .update_raw(|prev_toml| {
-                    merge_config_state(&new_toml, &prev_toml)
-                })
-                .await
-            {
-                Ok(config) => config,
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "data plane: merged reload config failed, using freshly converted config"
-                    );
-                    converted
-                },
-            };
-            watcher_config_manager.set_current_config(config.clone());
-            if let Err(e) = try_init_upstreams(
-                &config.upstreams,
-                config.basic.origin_verify_cert,
-                None,
-            ) {
-                error!(error = %e, "data plane: reload upstreams failed");
             }
-            if let Err(e) = try_init_locations(&config.locations) {
-                error!(error = %e, "data plane: reload locations failed");
-            }
-            if let Err(e) =
-                try_init_server_locations(&config.servers, &config.locations)
-            {
-                error!(error = %e, "data plane: reload server locations failed");
-            }
-            let (updated, errors) =
-                try_update_certificates(&config.certificates);
-            if !updated.is_empty() {
-                info!(
-                    certs = updated.join(","),
-                    "data plane: certificates reloaded"
-                );
-            }
-            if !errors.is_empty() {
-                error!(error = errors, "data plane: certificate reload errors");
-            }
-            let (updated_plugins, plugin_errors) =
-                try_init_plugins(&config.plugins);
-            if !updated_plugins.is_empty() {
-                info!(
-                    plugins = updated_plugins.join(","),
-                    "data plane: plugins reloaded"
-                );
-            }
-            if !plugin_errors.is_empty() {
-                error!(
-                    error = plugin_errors,
-                    "data plane: plugin reload errors"
-                );
-            }
-            last_hash = hash;
+            // The hash is not adopted: the proxy now runs a mix of old and
+            // new state, and adopting it would leave that in place until the
+            // next unrelated push. The heartbeat reports the node degraded
+            // with this detail until a retry goes through.
+            let retry_in = tracker.failed(hash, Instant::now());
+            let detail = errors.join("; ");
+            error!(
+                error = %detail,
+                retry_in_secs = retry_in.as_secs(),
+                "data plane: reload did not apply in full, will retry"
+            );
+            watcher_cache.set_config_apply_error(Some(detail));
         }
     });
 
@@ -2159,6 +2102,167 @@ pub async fn start_data_plane(
     // The caller (run()) aborts this task on shutdown signal.
     std::future::pending::<()>().await;
     Ok(())
+}
+
+/// How often the hot-reload watcher looks at the rule cache.
+const RELOAD_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Longest wait between two attempts at a reload that keeps failing. A
+/// failure that will not go away on its own (a certificate that does not
+/// parse) then costs one reload every five minutes, not one every poll.
+const RELOAD_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// Decides when the hot-reload watcher applies the rule cache to the proxy.
+///
+/// A configuration counts as applied only once every reload step accepted
+/// it. One that failed is attempted again with a growing delay, and a newer
+/// one from the control plane is attempted at once.
+struct ReloadTracker {
+    /// Hash of the last configuration every reload step accepted.
+    applied: Arc<str>,
+    failure: Option<ReloadFailure>,
+}
+
+struct ReloadFailure {
+    hash: Arc<str>,
+    attempts: u32,
+    retry_at: Instant,
+}
+
+impl ReloadTracker {
+    fn new(applied: Arc<str>) -> Self {
+        Self {
+            applied,
+            failure: None,
+        }
+    }
+
+    /// Whether the cache at `hash` should be applied now. After a failure
+    /// the proxy holds a partial reload, so even a cache that went back to
+    /// the last applied hash has to be applied again.
+    fn is_due(&self, hash: &str, now: Instant) -> bool {
+        match &self.failure {
+            None => *self.applied != *hash,
+            Some(failure) => *failure.hash != *hash || now >= failure.retry_at,
+        }
+    }
+
+    fn succeeded(&mut self, hash: Arc<str>) {
+        self.applied = hash;
+        self.failure = None;
+    }
+
+    /// Records a failed attempt and returns how long until the next one.
+    fn failed(&mut self, hash: Arc<str>, now: Instant) -> Duration {
+        let attempts = match &self.failure {
+            Some(failure) if failure.hash == hash => {
+                failure.attempts.saturating_add(1)
+            },
+            _ => 1,
+        };
+        let delay = reload_retry_delay(attempts);
+        self.failure = Some(ReloadFailure {
+            hash,
+            attempts,
+            retry_at: now + delay,
+        });
+        delay
+    }
+}
+
+/// Delay before attempt `attempts + 1`: one poll interval, doubling up to
+/// [`RELOAD_RETRY_MAX`].
+fn reload_retry_delay(attempts: u32) -> Duration {
+    let doublings = attempts.saturating_sub(1).min(16);
+    RELOAD_POLL_INTERVAL
+        .saturating_mul(1 << doublings)
+        .min(RELOAD_RETRY_MAX)
+}
+
+/// Applies a converted configuration to the running proxy and returns what
+/// went wrong, one entry per failed step; empty when all of it applied.
+///
+/// Every step is attempted even after an earlier one failed, as before: the
+/// providers are independent, and a certificate that does not parse must not
+/// keep a new upstream from loading.
+async fn apply_reload(
+    config_manager: &pingap_config::ConfigManager,
+    converted: PingapConfig,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if converted.locations.is_empty() && converted.certificates.is_empty() {
+        warn!("data plane: nothing left to serve, unloading every site");
+    }
+    let new_toml = match toml::to_string_pretty(&converted) {
+        Ok(new_toml) => new_toml,
+        Err(e) => {
+            error!(
+                error = %e,
+                "data plane: reload config serialization failed, keeping current"
+            );
+            return vec![format!("serialize config: {e}")];
+        },
+    };
+    // Fetch-merge-save must be atomic with respect to ACME's own
+    // read-modify-write: an issuance completing while the reload was
+    // reading a PEM-less snapshot used to be clobbered by the reload
+    // save, dropping the certificate from storage (and then from the
+    // SNI table on the next provider rebuild).
+    let config = match config_manager
+        .update_raw(|prev_toml| merge_config_state(&new_toml, &prev_toml))
+        .await
+    {
+        Ok(config) => config,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "data plane: merged reload config failed, using freshly converted config"
+            );
+            errors.push(format!("merge config: {e}"));
+            converted
+        },
+    };
+    config_manager.set_current_config(config.clone());
+    if let Err(e) = try_init_upstreams(
+        &config.upstreams,
+        config.basic.origin_verify_cert,
+        None,
+    ) {
+        error!(error = %e, "data plane: reload upstreams failed");
+        errors.push(format!("upstreams: {e}"));
+    }
+    if let Err(e) = try_init_locations(&config.locations) {
+        error!(error = %e, "data plane: reload locations failed");
+        errors.push(format!("locations: {e}"));
+    }
+    if let Err(e) =
+        try_init_server_locations(&config.servers, &config.locations)
+    {
+        error!(error = %e, "data plane: reload server locations failed");
+        errors.push(format!("server locations: {e}"));
+    }
+    let (updated, cert_errors) = try_update_certificates(&config.certificates);
+    if !updated.is_empty() {
+        info!(
+            certs = updated.join(","),
+            "data plane: certificates reloaded"
+        );
+    }
+    if !cert_errors.is_empty() {
+        error!(error = cert_errors, "data plane: certificate reload errors");
+        errors.push(format!("certificates: {cert_errors}"));
+    }
+    let (updated_plugins, plugin_errors) = try_init_plugins(&config.plugins);
+    if !updated_plugins.is_empty() {
+        info!(
+            plugins = updated_plugins.join(","),
+            "data plane: plugins reloaded"
+        );
+    }
+    if !plugin_errors.is_empty() {
+        error!(error = plugin_errors, "data plane: plugin reload errors");
+        errors.push(format!("plugins: {plugin_errors}"));
+    }
+    errors
 }
 
 /// Run PingWAF in the specified mode.
@@ -3764,6 +3868,84 @@ mod tests {
             .unwrap();
         assert!(parsed.locations.is_empty());
         assert_eq!(parsed.servers.len(), 2);
+    }
+
+    /// A reload that failed must not be taken for applied: the watcher used
+    /// to adopt the hash anyway, and the proxy kept its half-reloaded state
+    /// until some unrelated push changed the hash again.
+    #[test]
+    fn failed_reload_is_retried_until_it_applies() {
+        let start = Instant::now();
+        let mut tracker = ReloadTracker::new(Arc::from("v1"));
+        assert!(!tracker.is_due("v1", start));
+        assert!(tracker.is_due("v2", start));
+
+        let delay = tracker.failed(Arc::from("v2"), start);
+        assert_eq!(delay, RELOAD_POLL_INTERVAL);
+        assert_eq!(&*tracker.applied, "v1", "a failed hash is not adopted");
+        assert!(
+            !tracker.is_due("v2", start),
+            "the retry waits out its delay"
+        );
+        assert!(tracker.is_due("v2", start + delay));
+
+        tracker.succeeded(Arc::from("v2"));
+        assert_eq!(&*tracker.applied, "v2");
+        assert!(!tracker.is_due("v2", start + delay));
+    }
+
+    /// The reload itself reports the step that failed, and the same
+    /// configuration without the offending entry applies cleanly.
+    #[tokio::test]
+    async fn reload_reports_the_failing_step() {
+        let manager = pingap_config::new_memory_config_manager("", None);
+        let mut config = convert_cached_rules(
+            &CachedRules::default(),
+            Path::new("/tmp/pingwaf-test-cache"),
+        );
+        assert!(apply_reload(&manager, config.clone()).await.is_empty());
+
+        config.certificates.insert(
+            "broken".to_string(),
+            pingap_config::CertificateConf {
+                domains: Some("reload-broken.test".to_string()),
+                tls_cert: Some("not a certificate".to_string()),
+                tls_key: Some("not a key".to_string()),
+                ..Default::default()
+            },
+        );
+        let errors = apply_reload(&manager, config.clone()).await;
+        assert!(
+            errors.iter().any(|error| error.contains("broken")),
+            "{errors:?}"
+        );
+
+        config.certificates.clear();
+        assert!(apply_reload(&manager, config).await.is_empty());
+    }
+
+    #[test]
+    fn reload_retry_backs_off_and_a_new_config_skips_the_wait() {
+        let start = Instant::now();
+        let mut tracker = ReloadTracker::new(Arc::from("v1"));
+        let delays: Vec<u64> = (0..8)
+            .map(|_| tracker.failed(Arc::from("v2"), start).as_secs())
+            .collect();
+        assert_eq!(delays, [5, 10, 20, 40, 80, 160, 300, 300]);
+        assert!(!tracker.is_due("v2", start + Duration::from_secs(299)));
+
+        // A newer push is not held back by the delay earned by the old one,
+        // and starts its own backoff from the bottom.
+        assert!(tracker.is_due("v3", start));
+        assert_eq!(
+            tracker.failed(Arc::from("v3"), start),
+            RELOAD_POLL_INTERVAL
+        );
+
+        // The cache going back to the applied hash still needs a reload: the
+        // failed attempt left the proxy between the two.
+        assert!(tracker.is_due("v1", start));
+        assert_eq!(reload_retry_delay(u32::MAX), RELOAD_RETRY_MAX);
     }
 
     #[test]

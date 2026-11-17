@@ -13,6 +13,7 @@ use pingwaf_proto::control_plane::{
     self as proto, control_plane_client::ControlPlaneClient as ProtoClient,
 };
 
+use crate::body_budget::{BodyBudget, LOG_BODY_BUDGET_BYTES};
 use crate::cache::{BlockedIpEntry, RuleCache};
 use crate::cert_events::{
     attribute_events, cert_event_buffer, CertAttribution,
@@ -73,14 +74,45 @@ pub struct LogEntry {
     pub referer: String,
 }
 
+impl LogEntry {
+    /// Body-prefix bytes this entry carries, both directions.
+    fn body_bytes(&self) -> usize {
+        self.request_body.as_ref().map_or(0, Vec::len)
+            + self.response_body.as_ref().map_or(0, Vec::len)
+    }
+
+    /// Drops the body prefixes and flags each dropped one as truncated, so
+    /// the stored entry does not read as "this exchange had no body".
+    fn shed_bodies(&mut self) {
+        if self
+            .request_body
+            .take()
+            .is_some_and(|body| !body.is_empty())
+        {
+            self.request_body_truncated = true;
+        }
+        if self
+            .response_body
+            .take()
+            .is_some_and(|body| !body.is_empty())
+        {
+            self.response_body_truncated = true;
+        }
+    }
+}
+
 /// Host callback invoked when the server requests a cache purge:
 /// `(site_id, urls, tags)`.
 type PurgeCacheFn = Box<dyn Fn(&str, &[String], &[String]) + Send + Sync>;
 
-/// How often expired dynamic IP blocks are swept from the rule cache.
-/// Consecutive batch failures before the log shipper falls back to sending
-/// entries one at a time (see `flush_or_isolate`).
+/// Consecutive refusals of a whole batch before the log shipper sends its
+/// entries one at a time (see `LogBacklog::isolate`).
 const LOG_SHIP_ISOLATION_THRESHOLD: u32 = 3;
+/// Ceiling for that threshold. It doubles each time a one-by-one pass gets
+/// nothing through, so a control plane that refuses everything is probed
+/// with a full pass every few minutes instead of every few seconds.
+const LOG_SHIP_ISOLATION_THRESHOLD_MAX: u32 = 48;
+/// How often expired dynamic IP blocks are swept from the rule cache.
 const BLOCK_SWEEP_INTERVAL_SECS: u64 = 60;
 
 /// How often the debounced blocked-IP disk flush runs (see
@@ -126,8 +158,13 @@ pub struct ControlPlaneClient {
     metrics: Arc<MetricsCollector>,
     /// Channel for queuing log entries (bounded to prevent memory exhaustion)
     log_sender: mpsc::Sender<LogEntry>,
-    /// Log receiver (consumed by the log shipper task)
-    log_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<LogEntry>>>,
+    /// Body-prefix bytes of the entries waiting in the queue. The queue is
+    /// capped by entry count; this caps what those entries can pin.
+    queued_bodies: BodyBudget,
+    /// The queue's receiving end and the batch being shipped. Owned by the
+    /// client rather than the shipper task, so a reconnect resumes with the
+    /// entries the previous session had not delivered.
+    log_state: Arc<tokio::sync::Mutex<LogShipState>>,
     /// Optional command handlers
     command_handlers: Arc<tokio::sync::RwLock<CommandHandlers>>,
     /// Buffered host probe samples, shipped with each heartbeat
@@ -163,8 +200,9 @@ impl ControlPlaneClient {
         // Bounded on purpose: entries carry headers plus a body prefix
         // (8-64 KiB each), so 16384 entries could pin ~1 GB while the
         // control plane is unreachable (2026-10-17 audit). 2048 caps the
-        // backlog in the tens of MB; the rest are dropped and counted by
-        // the existing try_send warning path.
+        // entries, `queued_bodies` caps the body bytes they hold; entries
+        // beyond the first are dropped and counted in `send_log`, bodies
+        // beyond the second are shed there.
         let (log_tx, log_rx) = mpsc::channel(2048);
         let retry_delay_ms = AtomicU64::new(config.reconnect_initial_delay_ms);
 
@@ -203,7 +241,11 @@ impl ControlPlaneClient {
             rule_cache,
             metrics,
             log_sender: log_tx,
-            log_receiver: Arc::new(tokio::sync::Mutex::new(log_rx)),
+            queued_bodies: BodyBudget::new(LOG_BODY_BUDGET_BYTES),
+            log_state: Arc::new(tokio::sync::Mutex::new(LogShipState {
+                receiver: log_rx,
+                backlog: LogBacklog::default(),
+            })),
             command_handlers: Arc::new(tokio::sync::RwLock::new(handlers)),
             probe: Arc::new(ProbeBuffer::new()),
             flush_notify: Arc::new(tokio::sync::Notify::new()),
@@ -224,11 +266,33 @@ impl ControlPlaneClient {
 
     /// Queue a log entry for shipping to the server (non-blocking).
     ///
-    /// If the log buffer is full, the entry is dropped with a warning.
-    pub fn send_log(&self, entry: LogEntry) {
+    /// If the log buffer is full, the entry is dropped and counted; the
+    /// count reaches the control plane with the next heartbeat. If only the
+    /// queue's body budget is exhausted, the entry is queued without its body
+    /// prefixes, flagged as truncated.
+    pub fn send_log(&self, mut entry: LogEntry) {
         static DROPPED: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
+        static BODIES_SHED: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let mut body_bytes = entry.body_bytes();
+        if body_bytes > 0 && !self.queued_bodies.try_reserve(body_bytes) {
+            entry.shed_bodies();
+            body_bytes = 0;
+            let shed = BODIES_SHED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if shed == 1 || shed.is_multiple_of(1024) {
+                warn!(
+                    shed,
+                    "Log queue body budget exhausted, queueing entries \
+                     without their bodies"
+                );
+            }
+        }
         if let Err(e) = self.log_sender.try_send(entry) {
+            self.queued_bodies.release(body_bytes);
+            self.metrics.record_logs_dropped(1);
             match e {
                 mpsc::error::TrySendError::Full(_) => {
                     // One warning per drop made an unreachable control plane
@@ -252,7 +316,9 @@ impl ControlPlaneClient {
     /// Only compiled with the `test-util` feature.
     #[cfg(feature = "test-util")]
     pub async fn pop_log(&self) -> Option<LogEntry> {
-        self.log_receiver.lock().await.try_recv().ok()
+        let entry = self.log_state.lock().await.receiver.try_recv().ok()?;
+        self.queued_bodies.release(entry.body_bytes());
+        Some(entry)
     }
 
     /// Establish the gRPC channel to the control plane server.
@@ -687,6 +753,7 @@ impl ControlPlaneClient {
                 // keeps the rows it did not see.
                 let (blocked_ips, blocked_ips_truncated) =
                     heartbeat_blocked_ips(rule_cache.blocked_ips_snapshot());
+                let config_apply_error = rule_cache.config_apply_error();
                 let hb = proto::AgentHeartbeat {
                     agent_id: agent_id.clone(),
                     agent_token: agent_token.clone(),
@@ -700,8 +767,10 @@ impl ControlPlaneClient {
                     requests_per_second: system_metrics.requests_per_second,
                     blocked_requests_total: system_metrics
                         .blocked_requests_total,
-                    health: proto::AgentHealthStatus::AgentHealthHealthy as i32,
+                    health: heartbeat_health(&config_apply_error) as i32,
                     config_hash: rule_cache.config_hash().to_string(),
+                    config_apply_error,
+                    logs_dropped_total: metrics.logs_dropped_total(),
                     // Per-site edge cache disk usage, straight from the quota
                     // ledger; this is what the control plane's
                     // `/api/v1/cache/status` reports.
@@ -921,12 +990,16 @@ impl ControlPlaneClient {
         channel: Channel,
         agent_id: &str,
     ) -> anyhow::Result<()> {
-        let mut client = ProtoClient::new(channel);
-        let agent_token = self.agent_token.load_full();
-        let mut receiver = self.log_receiver.lock().await;
-        let mut batch: Vec<proto::LogEntry> =
-            Vec::with_capacity(self.config.log_batch_size);
-        let mut consecutive_failures: u32 = 0;
+        let mut sink = GrpcLogSink {
+            client: ProtoClient::new(channel),
+            agent_token: self.agent_token.load_full(),
+        };
+        let mut state = self.log_state.lock().await;
+        let LogShipState { receiver, backlog } = &mut *state;
+        // Entries carried over from the previous session were stamped with
+        // the identity it had registered under.
+        backlog.restamp(agent_id);
+        let batch_cap = self.config.log_batch_size.max(1);
 
         let flush_interval =
             Duration::from_secs(self.config.log_flush_interval_secs.max(1));
@@ -937,37 +1010,23 @@ impl ControlPlaneClient {
         loop {
             if self.shutdown_signal.load(Ordering::Relaxed) {
                 // Flush remaining logs before shutdown
-                if !batch.is_empty() {
-                    Self::flush_or_isolate(
-                        &mut client,
-                        &mut batch,
-                        &agent_token,
-                        self.config.log_batch_size,
-                        &mut consecutive_failures,
-                    )
-                    .await;
-                }
+                self.flush_backlog(backlog, &mut sink).await;
                 break;
             }
 
             tokio::select! {
-                entry = receiver.recv() => {
+                // A full batch the control plane has not taken stops the
+                // intake: the queue behind it then holds the backlog, and
+                // what overflows is dropped (and counted) in `send_log`.
+                entry = receiver.recv(), if backlog.len() < batch_cap => {
                     match entry {
                         Some(log_entry) => {
-                            let proto_entry =
-                                Self::convert_log_entry(agent_id, log_entry);
-                            batch.push(proto_entry);
-
-                            // Flush when batch is full
-                            if batch.len() >= self.config.log_batch_size {
-                                Self::flush_or_isolate(
-                                    &mut client,
-                                    &mut batch,
-                                    &agent_token,
-                                    self.config.log_batch_size,
-                                    &mut consecutive_failures,
-                                )
-                                .await;
+                            backlog.push(self.dequeue(agent_id, log_entry));
+                            // Flush when the batch is full - unless the last
+                            // attempt failed, which waits for the next tick
+                            // rather than retrying on every entry.
+                            if backlog.len() >= batch_cap && !backlog.stalled {
+                                self.flush_backlog(backlog, &mut sink).await;
                             }
                         }
                         None => {
@@ -979,41 +1038,18 @@ impl ControlPlaneClient {
                 }
                 _ = interval.tick() => {
                     // Periodic flush
-                    if !batch.is_empty() {
-                        Self::flush_or_isolate(
-                            &mut client,
-                            &mut batch,
-                            &agent_token,
-                            self.config.log_batch_size,
-                            &mut consecutive_failures,
-                        )
-                        .await;
-                    }
+                    self.flush_backlog(backlog, &mut sink).await;
                 }
                 _ = self.flush_notify.notified() => {
                     // A server-initiated flush: ship the current batch now,
                     // then drain whatever arrived while the RPC was in
                     // flight — up to one batch, so a flood cannot turn a
                     // single command into an unbounded send loop.
-                    if !batch.is_empty() {
-                        Self::flush_or_isolate(
-                            &mut client,
-                            &mut batch,
-                            &agent_token,
-                            self.config.log_batch_size,
-                            &mut consecutive_failures,
-                        )
-                        .await;
-                    }
-                    let mut drained = 0usize;
-                    while drained < self.config.log_batch_size {
+                    self.flush_backlog(backlog, &mut sink).await;
+                    while backlog.len() < batch_cap {
                         match receiver.try_recv() {
                             Ok(entry) => {
-                                batch.push(Self::convert_log_entry(
-                                    agent_id,
-                                    entry,
-                                ));
-                                drained += 1;
+                                backlog.push(self.dequeue(agent_id, entry))
                             },
                             Err(mpsc::error::TryRecvError::Empty) => break,
                             Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -1022,31 +1058,15 @@ impl ControlPlaneClient {
                             },
                         }
                     }
-                    if !batch.is_empty() {
-                        Self::flush_or_isolate(
-                            &mut client,
-                            &mut batch,
-                            &agent_token,
-                            self.config.log_batch_size,
-                            &mut consecutive_failures,
-                        )
-                        .await;
+                    if !backlog.stalled {
+                        self.flush_backlog(backlog, &mut sink).await;
                     }
                     // The next periodic flush measures from now, not from
                     // the tick that was interrupted mid-cycle.
                     interval.reset();
                 }
                 _ = self.wait_for_shutdown() => {
-                    if !batch.is_empty() {
-                        Self::flush_or_isolate(
-                            &mut client,
-                            &mut batch,
-                            &agent_token,
-                            self.config.log_batch_size,
-                            &mut consecutive_failures,
-                        )
-                        .await;
-                    }
+                    self.flush_backlog(backlog, &mut sink).await;
                     break;
                 }
             }
@@ -1055,124 +1075,28 @@ impl ControlPlaneClient {
         Ok(())
     }
 
-    /// Flush a batch of log entries to the server. `true` when the batch was
-    /// accepted (or was empty); `false` when it must be retried.
-    async fn flush_logs(
-        client: &mut ProtoClient<Channel>,
-        batch: &mut Vec<proto::LogEntry>,
-        agent_token: &Option<Arc<String>>,
-        batch_cap: usize,
-    ) -> bool {
-        if batch.is_empty() {
-            return true;
-        }
-
-        let entries = std::mem::take(batch);
-        let count = entries.len();
-
-        // Use client-streaming RPC for log shipping. The batch keeps a copy
-        // until the server has accepted it: a transport failure must not
-        // silently drop the whole batch, so the unsent entries go back to
-        // the (now empty) batch. Only the wire copy is cloned — the
-        // original moves into the stream.
-        let mut request =
-            tonic::Request::new(tokio_stream::iter(entries.clone()));
-        attach_agent_token(&mut request, agent_token);
-        match client.ship_logs(request).await {
-            Ok(response) => {
-                let ack = response.into_inner();
-                if ack.success {
-                    debug!(
-                        count,
-                        received = ack.received_count,
-                        "Flushed logs to server"
-                    );
-                    true
-                } else {
-                    warn!(
-                        error = %ack.error_message,
-                        "Server rejected log batch"
-                    );
-                    false
-                }
-            },
-            Err(e) => {
-                error!(error = %e, count, "Failed to ship logs");
-                restore_failed_batch(batch, entries, batch_cap);
-                false
-            },
-        }
+    /// Converts an entry taken off the queue for the batch, returning its
+    /// body bytes to the queue's budget. The batch is not charged: it is
+    /// bounded by `log_batch_size`.
+    fn dequeue(&self, agent_id: &str, entry: LogEntry) -> proto::LogEntry {
+        self.queued_bodies.release(entry.body_bytes());
+        Self::convert_log_entry(agent_id, entry)
     }
 
-    /// Ship one entry per RPC.
-    ///
-    /// Used after a batch keeps failing: a single entry the server cannot
-    /// persist (before the server-side NUL sanitiser shipped, a binary body
-    /// did exactly this) must not block every log line behind it. Entries the
-    /// server still rejects are dropped and counted, never retried forever.
-    async fn flush_logs_individually(
-        client: &mut ProtoClient<Channel>,
-        entries: Vec<proto::LogEntry>,
-        agent_token: &Option<Arc<String>>,
-    ) -> usize {
-        let mut dropped = 0usize;
-        for entry in entries {
-            let mut request =
-                tonic::Request::new(tokio_stream::iter(vec![entry]));
-            attach_agent_token(&mut request, agent_token);
-            match client.ship_logs(request).await {
-                Ok(response) => {
-                    let ack = response.into_inner();
-                    if !ack.success {
-                        dropped += 1;
-                        warn!(
-                            error = %ack.error_message,
-                            "dropping a log entry the server rejected"
-                        );
-                    }
-                },
-                Err(e) => {
-                    dropped += 1;
-                    warn!(error = %e, "dropping an unshippable log entry");
-                },
-            }
-        }
-        dropped
-    }
-
-    /// Flush the batch; after a few consecutive failures, isolate entries.
-    ///
-    /// The batch-retry path is intentionally unbounded for transport errors
-    /// (a control plane restart must not lose logs), but one entry that can
-    /// never be persisted would otherwise head-of-line block the shipper
-    /// forever. After [`LOG_SHIP_ISOLATION_THRESHOLD`] failures the batch is
-    /// sent one entry at a time, so only the poison entry is dropped.
-    async fn flush_or_isolate(
-        client: &mut ProtoClient<Channel>,
-        batch: &mut Vec<proto::LogEntry>,
-        agent_token: &Option<Arc<String>>,
-        batch_cap: usize,
-        consecutive_failures: &mut u32,
+    /// Ships the backlog and accounts for what the control plane refused.
+    async fn flush_backlog(
+        &self,
+        backlog: &mut LogBacklog,
+        sink: &mut impl LogSink,
     ) {
-        if batch.is_empty() {
-            return;
+        let dropped = backlog.flush(sink).await;
+        if dropped > 0 {
+            let total = self.metrics.record_logs_dropped(dropped as u64);
+            error!(
+                dropped,
+                total, "dropped log entries the control plane refused to store"
+            );
         }
-        if Self::flush_logs(client, batch, agent_token, batch_cap).await {
-            *consecutive_failures = 0;
-            return;
-        }
-        *consecutive_failures += 1;
-        if *consecutive_failures < LOG_SHIP_ISOLATION_THRESHOLD {
-            return;
-        }
-        let entries = std::mem::take(batch);
-        let dropped =
-            Self::flush_logs_individually(client, entries, agent_token).await;
-        error!(
-            dropped,
-            "log batch failed repeatedly; shipped entries individually"
-        );
-        *consecutive_failures = 0;
     }
 
     /// Run the certificate-event shipping loop.
@@ -1906,6 +1830,18 @@ fn effective_heartbeat_interval(server_secs: i64, local_secs: u64) -> Duration {
     Duration::from_secs(secs.max(5))
 }
 
+/// Health reported in the heartbeat. `config_hash` names the configuration
+/// the agent received; when the data plane could not apply it in full the
+/// node is serving something else, which the control plane must not read as
+/// healthy.
+fn heartbeat_health(config_apply_error: &str) -> proto::AgentHealthStatus {
+    if config_apply_error.is_empty() {
+        proto::AgentHealthStatus::AgentHealthHealthy
+    } else {
+        proto::AgentHealthStatus::AgentHealthDegraded
+    }
+}
+
 /// Convert a probe sample into its wire representation.
 fn to_proto_sample(sample: &HostSample) -> proto::HostSample {
     proto::HostSample {
@@ -2032,23 +1968,242 @@ fn get_total_memory() -> u64 {
     }
 }
 
-/// Puts the entries of a failed log shipment back into the shipper's batch.
+/// How one shipment of log entries ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShipOutcome {
+    /// The control plane stored the entries.
+    Accepted,
+    /// The link, or the control plane as a whole, failed. Nothing says the
+    /// entries are at fault: they are kept and sent again.
+    Unavailable,
+    /// The control plane received the entries and refused to store them.
+    Rejected,
+}
+
+/// Tells a refusal of the entries apart from a failure to reach, or to be
+/// served by, the control plane.
 ///
-/// The batch is empty at this point (`flush_logs` took it), so the failed
-/// entries become the batch again. A control plane that is unreachable
-/// never drains them, so the replay is capped at `batch_cap`: the oldest
-/// entries beyond the cap are dropped, keeping the newest — the backlog may
-/// not grow without bound while the server is down.
-fn restore_failed_batch(
-    batch: &mut Vec<proto::LogEntry>,
-    failed: Vec<proto::LogEntry>,
-    batch_cap: usize,
-) {
-    if failed.len() <= batch_cap {
-        *batch = failed;
-    } else {
-        let skipped = failed.len() - batch_cap;
-        *batch = failed.into_iter().skip(skipped).collect();
+/// Only the codes the control plane answers with after reading the stream
+/// count as a refusal: a storage error (`Internal`) and a message it could
+/// not accept (`InvalidArgument`, `OutOfRange`, `ResourceExhausted`,
+/// `FailedPrecondition`, `DataLoss`). Everything else - a dropped connection,
+/// a timeout, an expired token - would fail for any entry.
+fn classify_ship_error(status: &tonic::Status) -> ShipOutcome {
+    use tonic::Code;
+    match status.code() {
+        Code::Internal
+        | Code::InvalidArgument
+        | Code::OutOfRange
+        | Code::ResourceExhausted
+        | Code::FailedPrecondition
+        | Code::DataLoss => ShipOutcome::Rejected,
+        _ => ShipOutcome::Unavailable,
+    }
+}
+
+/// Where the log shipper sends entries; a seam so the retry and isolation
+/// rules can be exercised without a control plane.
+trait LogSink {
+    /// Ships `entries[range]` as one request.
+    async fn ship(
+        &mut self,
+        entries: Arc<Vec<proto::LogEntry>>,
+        range: std::ops::Range<usize>,
+    ) -> ShipOutcome;
+}
+
+struct GrpcLogSink {
+    client: ProtoClient<Channel>,
+    agent_token: Option<Arc<String>>,
+}
+
+impl LogSink for GrpcLogSink {
+    async fn ship(
+        &mut self,
+        entries: Arc<Vec<proto::LogEntry>>,
+        range: std::ops::Range<usize>,
+    ) -> ShipOutcome {
+        let count = range.len();
+        // The request stream reads from the shared batch and copies one
+        // entry at a time as it is encoded, instead of duplicating the whole
+        // batch (bodies included) before the call.
+        let mut request = tonic::Request::new(tokio_stream::iter(
+            range.map(move |index| entries[index].clone()),
+        ));
+        attach_agent_token(&mut request, &self.agent_token);
+        match self.client.ship_logs(request).await {
+            Ok(response) => {
+                let ack = response.into_inner();
+                if ack.success {
+                    debug!(
+                        count,
+                        received = ack.received_count,
+                        "Flushed logs to server"
+                    );
+                    ShipOutcome::Accepted
+                } else {
+                    // The server lost the stream part-way through reading
+                    // it: a broken link, not a verdict on the entries.
+                    warn!(
+                        error = %ack.error_message,
+                        count,
+                        "Control plane did not receive the whole log batch; keeping it"
+                    );
+                    ShipOutcome::Unavailable
+                }
+            },
+            Err(status) => {
+                let outcome = classify_ship_error(&status);
+                if outcome == ShipOutcome::Rejected {
+                    warn!(error = %status, count, "Control plane refused the log batch");
+                } else {
+                    warn!(error = %status, count, "Failed to ship logs; keeping the batch");
+                }
+                outcome
+            },
+        }
+    }
+}
+
+/// The log shipper's state that outlives a control-plane session.
+struct LogShipState {
+    receiver: mpsc::Receiver<LogEntry>,
+    backlog: LogBacklog,
+}
+
+/// Log entries converted for the wire and not yet stored by the control
+/// plane.
+///
+/// Entries leave only when the control plane has stored them or has singled
+/// them out as unstorable. A shipment that fails, or is cancelled because the
+/// session ended, leaves them in place for the next attempt.
+struct LogBacklog {
+    /// Shared with the request stream of the shipment in flight.
+    entries: Arc<Vec<proto::LogEntry>>,
+    /// Consecutive shipments of the whole batch the control plane refused.
+    rejections: u32,
+    /// Refusals needed before the next one-by-one pass.
+    isolate_after: u32,
+    /// The last shipment did not go through; the next one waits for the
+    /// flush interval.
+    stalled: bool,
+}
+
+impl Default for LogBacklog {
+    fn default() -> Self {
+        Self {
+            entries: Arc::default(),
+            rejections: 0,
+            isolate_after: LOG_SHIP_ISOLATION_THRESHOLD,
+            stalled: false,
+        }
+    }
+}
+
+impl LogBacklog {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn push(&mut self, entry: proto::LogEntry) {
+        Arc::make_mut(&mut self.entries).push(entry);
+    }
+
+    /// Re-stamps the entries with the identity of the current session.
+    fn restamp(&mut self, agent_id: &str) {
+        if self.entries.iter().all(|entry| entry.agent_id == agent_id) {
+            return;
+        }
+        for entry in Arc::make_mut(&mut self.entries) {
+            entry.agent_id = agent_id.to_string();
+        }
+    }
+
+    /// Removes the first `count` entries.
+    fn discard_front(&mut self, count: usize) {
+        match Arc::get_mut(&mut self.entries) {
+            Some(entries) => {
+                entries.drain(..count);
+            },
+            // A request stream that is still being torn down holds the
+            // other reference; leave it its copy.
+            None => self.entries = Arc::new(self.entries[count..].to_vec()),
+        }
+    }
+
+    /// Ships the batch. Returns how many entries were given up on.
+    ///
+    /// A batch that could not be delivered is kept whole. Only repeated
+    /// refusals by the control plane lead to [`Self::isolate`].
+    async fn flush(&mut self, sink: &mut impl LogSink) -> usize {
+        let count = self.len();
+        if count == 0 {
+            return 0;
+        }
+        match sink.ship(Arc::clone(&self.entries), 0..count).await {
+            ShipOutcome::Accepted => {
+                self.discard_front(count);
+                self.rejections = 0;
+                self.isolate_after = LOG_SHIP_ISOLATION_THRESHOLD;
+                self.stalled = false;
+                0
+            },
+            ShipOutcome::Unavailable => {
+                self.stalled = true;
+                0
+            },
+            ShipOutcome::Rejected => {
+                self.stalled = true;
+                self.rejections += 1;
+                if self.rejections < self.isolate_after {
+                    return 0;
+                }
+                self.rejections = 0;
+                self.isolate(sink).await
+            },
+        }
+    }
+
+    /// Ships the batch one entry per request, to find the entries the
+    /// control plane cannot store. Returns how many were dropped.
+    ///
+    /// One unstorable entry (before the server-side NUL sanitiser shipped, a
+    /// binary body did exactly this) must not hold back every log line
+    /// behind it. An entry is only dropped when another one of the same pass
+    /// was stored: that is what shows the control plane is working and the
+    /// entry is the problem. A pass that gets nothing through means the
+    /// control plane is refusing everything (its database is down, say), so
+    /// the batch is kept and the next pass is put off for longer.
+    async fn isolate(&mut self, sink: &mut impl LogSink) -> usize {
+        let mut refused = 0;
+        let mut tried = 0;
+        let mut interrupted = false;
+        while tried < self.len() {
+            let range = tried..tried + 1;
+            match sink.ship(Arc::clone(&self.entries), range).await {
+                ShipOutcome::Accepted => {},
+                ShipOutcome::Rejected => refused += 1,
+                // The link went away mid-pass: the rest waits.
+                ShipOutcome::Unavailable => {
+                    interrupted = true;
+                    break;
+                },
+            }
+            tried += 1;
+        }
+        if refused == tried {
+            if !interrupted {
+                self.isolate_after = self
+                    .isolate_after
+                    .saturating_mul(2)
+                    .min(LOG_SHIP_ISOLATION_THRESHOLD_MAX);
+            }
+            return 0;
+        }
+        self.discard_front(tried);
+        self.isolate_after = LOG_SHIP_ISOLATION_THRESHOLD;
+        self.stalled = self.len() > 0;
+        refused
     }
 }
 
@@ -2056,26 +2211,368 @@ fn restore_failed_batch(
 mod tests {
     use super::*;
 
+    /// The heartbeat used to say "healthy" unconditionally, so a node whose
+    /// reload failed looked exactly like one running the new configuration.
     #[test]
-    fn failed_log_batch_is_restored_and_capped() {
-        let entry = |i: usize| proto::LogEntry {
-            request_id: i.to_string(),
+    fn heartbeat_health_follows_the_reload_outcome() {
+        assert_eq!(
+            heartbeat_health(""),
+            proto::AgentHealthStatus::AgentHealthHealthy
+        );
+        assert_eq!(
+            heartbeat_health("certificates: bad pem(site-a)"),
+            proto::AgentHealthStatus::AgentHealthDegraded
+        );
+    }
+
+    /// A sink that answers from a script: the verdict of each request, then
+    /// `Accepted` once the script runs out. `poison` entries are refused
+    /// whenever they are part of a request, whatever the script says.
+    #[derive(Default)]
+    struct ScriptedSink {
+        script: std::collections::VecDeque<ShipOutcome>,
+        poison: Vec<String>,
+        /// The request ids of every request, in order.
+        requests: Vec<Vec<String>>,
+        stored: Vec<String>,
+    }
+
+    impl LogSink for ScriptedSink {
+        async fn ship(
+            &mut self,
+            entries: Arc<Vec<proto::LogEntry>>,
+            range: std::ops::Range<usize>,
+        ) -> ShipOutcome {
+            let ids: Vec<String> = entries[range]
+                .iter()
+                .map(|entry| entry.request_id.clone())
+                .collect();
+            self.requests.push(ids.clone());
+            let scripted =
+                self.script.pop_front().unwrap_or(ShipOutcome::Accepted);
+            let outcome = if scripted == ShipOutcome::Accepted
+                && ids.iter().any(|id| self.poison.contains(id))
+            {
+                ShipOutcome::Rejected
+            } else {
+                scripted
+            };
+            if outcome == ShipOutcome::Accepted {
+                self.stored.extend(ids);
+            }
+            outcome
+        }
+    }
+
+    fn backlog_of(ids: &[&str]) -> LogBacklog {
+        let mut backlog = LogBacklog::default();
+        for id in ids {
+            backlog.push(proto::LogEntry {
+                request_id: id.to_string(),
+                ..Default::default()
+            });
+        }
+        backlog
+    }
+
+    fn ids(backlog: &LogBacklog) -> Vec<&str> {
+        backlog
+            .entries
+            .iter()
+            .map(|entry| entry.request_id.as_str())
+            .collect()
+    }
+
+    /// An unreachable control plane used to cost the batch after three
+    /// attempts: the one-by-one fallback dropped every entry whose request
+    /// failed, whatever the reason.
+    #[tokio::test]
+    async fn unreachable_control_plane_never_costs_the_batch() {
+        let mut backlog = backlog_of(&["a", "b", "c"]);
+        let mut sink = ScriptedSink {
+            script: std::iter::repeat_n(ShipOutcome::Unavailable, 20).collect(),
             ..Default::default()
         };
-        // Under the cap: everything comes back, in order.
-        let failed: Vec<_> = (0..3).map(entry).collect();
-        let mut batch = Vec::new();
-        restore_failed_batch(&mut batch, failed, 8);
-        assert_eq!(batch.len(), 3);
-        assert_eq!(batch[0].request_id, "0");
-        // Over the cap: the oldest entries are dropped, the newest kept —
-        // the backlog cannot grow without bound while the server is down.
-        let failed: Vec<_> = (0..10).map(entry).collect();
-        let mut batch = Vec::new();
-        restore_failed_batch(&mut batch, failed, 4);
-        assert_eq!(batch.len(), 4);
-        assert_eq!(batch[0].request_id, "6");
-        assert_eq!(batch[3].request_id, "9");
+        for _ in 0..20 {
+            assert_eq!(backlog.flush(&mut sink).await, 0);
+            assert!(backlog.stalled);
+        }
+        assert_eq!(ids(&backlog), ["a", "b", "c"]);
+        // Always the whole batch: no entry was ever sent on its own.
+        assert!(sink.requests.iter().all(|request| request.len() == 3));
+
+        assert_eq!(backlog.flush(&mut sink).await, 0);
+        assert_eq!(sink.stored, ["a", "b", "c"]);
+        assert_eq!(backlog.len(), 0);
+        assert!(!backlog.stalled);
+    }
+
+    /// One entry the control plane cannot store is singled out and dropped;
+    /// the entries around it are delivered.
+    #[tokio::test]
+    async fn refused_entry_is_isolated_and_the_rest_delivered() {
+        let mut backlog = backlog_of(&["a", "bad", "c"]);
+        let mut sink = ScriptedSink {
+            poison: vec!["bad".to_string()],
+            ..Default::default()
+        };
+        for _ in 1..LOG_SHIP_ISOLATION_THRESHOLD {
+            assert_eq!(backlog.flush(&mut sink).await, 0);
+            assert_eq!(backlog.len(), 3, "kept while the batch is retried");
+        }
+        assert_eq!(backlog.flush(&mut sink).await, 1);
+        assert_eq!(sink.stored, ["a", "c"]);
+        assert_eq!(backlog.len(), 0);
+        assert!(!backlog.stalled);
+    }
+
+    /// A control plane that refuses everything (its database is down) is not
+    /// a reason to drop anything: nothing in the pass was stored, so nothing
+    /// shows the entries are at fault. The passes are spaced out instead.
+    #[tokio::test]
+    async fn control_plane_refusing_everything_keeps_the_batch() {
+        let mut backlog = backlog_of(&["a", "b"]);
+        let mut sink = ScriptedSink {
+            script: std::iter::repeat_n(ShipOutcome::Rejected, 500).collect(),
+            ..Default::default()
+        };
+        let mut passes = Vec::new();
+        for attempt in 1..=100 {
+            let before = sink.requests.len();
+            assert_eq!(backlog.flush(&mut sink).await, 0);
+            if sink.requests.len() - before > 1 {
+                passes.push(attempt);
+            }
+        }
+        assert_eq!(ids(&backlog), ["a", "b"]);
+        // After 3 refusals, then 6, 12, 24 and 48 more.
+        assert_eq!(passes, [3, 9, 21, 45, 93]);
+        assert_eq!(backlog.isolate_after, LOG_SHIP_ISOLATION_THRESHOLD_MAX);
+
+        // The control plane recovers: the batch goes through and the
+        // threshold starts over.
+        sink.script.clear();
+        assert_eq!(backlog.flush(&mut sink).await, 0);
+        assert_eq!(sink.stored, ["a", "b"]);
+        assert_eq!(backlog.isolate_after, LOG_SHIP_ISOLATION_THRESHOLD);
+    }
+
+    /// A pass cut short by the link keeps what it had not got to, and what
+    /// it had judged is settled: delivered entries are not sent twice.
+    #[tokio::test]
+    async fn interrupted_isolation_keeps_the_untried_entries() {
+        let mut backlog = backlog_of(&["a", "bad", "c", "d"]);
+        let mut sink = ScriptedSink {
+            poison: vec!["bad".to_string()],
+            script: [
+                ShipOutcome::Rejected,
+                ShipOutcome::Rejected,
+                ShipOutcome::Rejected,
+                // The pass: a stored, bad refused, then the link drops.
+                ShipOutcome::Accepted,
+                ShipOutcome::Accepted,
+                ShipOutcome::Unavailable,
+            ]
+            .into(),
+            ..Default::default()
+        };
+        for _ in 1..LOG_SHIP_ISOLATION_THRESHOLD {
+            assert_eq!(backlog.flush(&mut sink).await, 0);
+        }
+        assert_eq!(backlog.flush(&mut sink).await, 1);
+        assert_eq!(ids(&backlog), ["c", "d"]);
+        assert!(backlog.stalled);
+
+        assert_eq!(backlog.flush(&mut sink).await, 0);
+        assert_eq!(sink.stored, ["a", "c", "d"]);
+    }
+
+    /// The batch is shared with the request, not copied into it, and stays
+    /// in the backlog until the control plane answers - so a session that
+    /// ends mid-request (the future is dropped) loses nothing.
+    #[tokio::test]
+    async fn cancelled_shipment_leaves_the_batch_in_place() {
+        struct Hanging;
+        impl LogSink for Hanging {
+            async fn ship(
+                &mut self,
+                _entries: Arc<Vec<proto::LogEntry>>,
+                _range: std::ops::Range<usize>,
+            ) -> ShipOutcome {
+                std::future::pending().await
+            }
+        }
+
+        let mut backlog = backlog_of(&["a", "b"]);
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            backlog.flush(&mut Hanging),
+        )
+        .await;
+        assert!(cancelled.is_err());
+        assert_eq!(ids(&backlog), ["a", "b"]);
+
+        // The next session registers under another identity.
+        backlog.restamp("agent-2");
+        assert!(backlog
+            .entries
+            .iter()
+            .all(|entry| entry.agent_id == "agent-2"));
+        let mut sink = ScriptedSink::default();
+        assert_eq!(backlog.flush(&mut sink).await, 0);
+        assert_eq!(sink.stored, ["a", "b"]);
+    }
+
+    #[test]
+    fn only_a_verdict_on_the_entries_counts_as_a_refusal() {
+        use tonic::{Code, Status};
+        for code in [
+            Code::Internal,
+            Code::InvalidArgument,
+            Code::OutOfRange,
+            Code::ResourceExhausted,
+            Code::FailedPrecondition,
+            Code::DataLoss,
+        ] {
+            assert_eq!(
+                classify_ship_error(&Status::new(code, "")),
+                ShipOutcome::Rejected,
+                "{code:?}"
+            );
+        }
+        for code in [
+            Code::Unavailable,
+            Code::Cancelled,
+            Code::DeadlineExceeded,
+            Code::Unknown,
+            Code::Unauthenticated,
+            Code::PermissionDenied,
+            Code::Unimplemented,
+            Code::Aborted,
+        ] {
+            assert_eq!(
+                classify_ship_error(&Status::new(code, "")),
+                ShipOutcome::Unavailable,
+                "{code:?}"
+            );
+        }
+    }
+
+    /// A full queue used to be counted in a warning only the agent's own log
+    /// carried.
+    #[tokio::test]
+    async fn queue_overflow_is_counted_for_the_heartbeat() {
+        let client = test_client(100, 1000);
+        let capacity = client.log_sender.max_capacity();
+        for _ in 0..capacity + 3 {
+            client.send_log(blank_log_entry());
+        }
+        assert_eq!(client.metrics.logs_dropped_total(), 3);
+    }
+
+    fn log_entry_with_bodies(request: usize, response: usize) -> LogEntry {
+        LogEntry {
+            request_body: Some(vec![b'a'; request]),
+            request_body_size: request as u64,
+            response_body: Some(vec![b'b'; response]),
+            response_body_size: response as u64,
+            ..blank_log_entry()
+        }
+    }
+
+    /// With the queue's body budget spent, an entry is still queued — without
+    /// its bodies, flagged truncated — and the budget comes back as entries
+    /// leave the queue.
+    #[tokio::test]
+    async fn exhausted_body_budget_sheds_bodies_not_entries() {
+        let client = test_client(100, 1000);
+        // Room for exactly one 1000-byte entry.
+        let preloaded = LOG_BODY_BUDGET_BYTES - 1500;
+        assert!(client.queued_bodies.try_reserve(preloaded));
+
+        client.send_log(log_entry_with_bodies(600, 400));
+        client.send_log(log_entry_with_bodies(600, 400));
+        assert_eq!(0, client.metrics.logs_dropped_total());
+        assert_eq!(preloaded + 1000, client.queued_bodies.held());
+
+        let (first, second) = {
+            let mut state = client.log_state.lock().await;
+            (
+                state.receiver.try_recv().unwrap(),
+                state.receiver.try_recv().unwrap(),
+            )
+        };
+        let first = client.dequeue("agent", first);
+        assert_eq!(600, first.request_body.len());
+        assert_eq!(400, first.response_body.len());
+        assert!(!first.request_body_truncated);
+        assert!(!first.response_body_truncated);
+        assert_eq!(preloaded, client.queued_bodies.held());
+
+        let second = client.dequeue("agent", second);
+        assert!(second.request_body.is_empty());
+        assert!(second.response_body.is_empty());
+        assert!(second.request_body_truncated);
+        assert!(second.response_body_truncated);
+        assert_eq!(600, second.request_body_size);
+        assert_eq!(400, second.response_body_size);
+        assert_eq!(preloaded, client.queued_bodies.held());
+    }
+
+    /// An entry the full queue turned away gives its reservation back.
+    #[tokio::test]
+    async fn overflowing_entry_does_not_keep_its_body_reservation() {
+        let client = test_client(100, 1000);
+        let capacity = client.log_sender.max_capacity();
+        for _ in 0..capacity + 3 {
+            client.send_log(log_entry_with_bodies(6, 4));
+        }
+        assert_eq!(3, client.metrics.logs_dropped_total());
+        assert_eq!(capacity * 10, client.queued_bodies.held());
+    }
+
+    fn blank_log_entry() -> LogEntry {
+        LogEntry {
+            site_id: String::new(),
+            request_id: String::new(),
+            client_ip: String::new(),
+            method: String::new(),
+            scheme: String::new(),
+            host: String::new(),
+            path: String::new(),
+            query_string: String::new(),
+            protocol: String::new(),
+            request_headers: HashMap::new(),
+            request_body: None,
+            request_body_size: 0,
+            request_body_truncated: false,
+            response_status: 0,
+            response_headers: HashMap::new(),
+            response_body: None,
+            response_body_size: 0,
+            response_body_truncated: false,
+            upstream_addr: String::new(),
+            upstream_latency_ms: 0,
+            upstream_status: 0,
+            waf_score: 0,
+            waf_action: String::new(),
+            waf_rule_id: String::new(),
+            waf_enforced_rule_id: String::new(),
+            waf_rule_name: String::new(),
+            waf_event_type: String::new(),
+            waf_details: String::new(),
+            waf_matched_tags: Vec::new(),
+            user_identity: String::new(),
+            total_latency_ms: 0,
+            cache_status: String::new(),
+            tls_version: String::new(),
+            ja3_hash: String::new(),
+            country_code: String::new(),
+            city: String::new(),
+            asn: 0,
+            user_agent: String::new(),
+            referer: String::new(),
+        }
     }
 
     #[tokio::test]

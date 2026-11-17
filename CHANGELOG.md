@@ -52,7 +52,56 @@ verbatim for reference and attribution, and is not maintained here.
   notification-channel delete prompt and the system-token revoke label showed a
   literal `{count}` / `{name}` in zh, en and ja.
 
+- **A configuration push that did not arrive is pushed again.** The control
+  plane sent each change once and never looked at the `config_hash` the agent
+  reports in its heartbeat, so a node that missed a push stayed on the old
+  configuration until it reconnected. The hash last issued to each agent is
+  now compared with every heartbeat: a node that reports a different one twice
+  in a row gets its configuration again, then at most every 60 s, doubling to
+  10 min while it does not converge. Reconnecting no longer replays older
+  queued `UpdateSite` commands after the fresh configuration, which could roll
+  a node back to a superseded one.
+
+- **A configuration the data plane could not load is retried and reported.**
+  The agent marked a configuration as applied before the reload ran, so a
+  failed reload was never attempted again and the node kept reporting itself
+  healthy on the previous configuration. A failed reload now leaves the
+  configuration pending and is retried after 5 s, doubling to 5 min; meanwhile
+  the node is `degraded` — a status the API and console already listed but
+  nothing ever set — and `GET /api/v1/agents` carries the reason in
+  `status_reason`, shown in the node detail panel. A degraded node that stops
+  sending heartbeats is now marked offline like an online one; it used to stay
+  `degraded` forever.
+
+- **Logs survive a control-plane outage up to the queue limit, and what is
+  lost is counted.** A batch the control plane could not take was dropped
+  together with the stream, and entries discarded because the queue was full
+  left only a line in the agent's own log. A batch now stays with the agent
+  across reconnects and is sent again; an entry is given up only when the
+  control plane stored the rest of its batch and refused that one. Entries the
+  agent had to discard are reported with the heartbeat: the control plane logs
+  each increase and `GET /api/v1/agents` returns the running total as
+  `logs_dropped`, shown in the node detail panel. The total restarts with the
+  agent process.
+
+- **Rate limiting can no longer be made to exhaust memory.** A rule keyed on
+  the path or on a query value let a client create one counter per request for
+  as long as the window lasted. The counter table is now capped at 262,144
+  entries across all sites and its keys are fixed-size. At the cap, expired
+  counters and then the lowest counts are dropped first; running bans are
+  never dropped. If the table is still full, requests with a new key go
+  uncounted for that rule (they pass) and the edge logs a warning.
+
 ### Changed
+
+- **Logged request and response bodies share a 32 MiB budget per pool.** The
+  in-flight requests on the edge and the agent's log queue each hold up to
+  2048 entries; with `max_body_log_size` raised to its maximum that could mean
+  256 MiB of bodies in each. Each pool now keeps at most 32 MiB of them: an
+  entry that does not fit is still logged, without its body and marked
+  truncated, with the original size kept. The default `max_body_log_size` of
+  8192 fits the budget exactly, so nothing changes unless that setting was
+  raised. The budget itself is not configurable.
 
 - **Protection copy says what the switches do.** Turning the WAF engine off
   stops managed and custom rules only; IP / geo access rules, bot protection,
