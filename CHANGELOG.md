@@ -10,6 +10,8 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+## [PingWAF 0.32.32] — 2026-11-18
+
 ### Fixed
 
 - **Deleting a site takes it off the edge at once, including the last one.**
