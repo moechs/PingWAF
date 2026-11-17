@@ -2075,8 +2075,11 @@ Patch semantics: omitted fields keep their current value.
 ```
 
 `waf_enabled` is the explicit engine switch (`true` default). With it off the
-data plane skips WAF evaluation for the site entirely — custom rules, managed
-rules, CC and bot checks included. `advanced_mode` raises the managed ruleset
+data plane skips the WAF rule engine for the site — managed rules, custom
+rules and the monitor downgrades. It is not a master switch for the site's
+other protections: IP / geo access rules, bot protection, AI crawl control, CC
+challenges, rate limiting, mTLS and basic auth are built independently and
+keep enforcing. `advanced_mode` raises the managed ruleset
 to the Strict level with body deep inspection. The three `monitor_*` lists
 downgrade matching managed rules to observe-only, described in
 [Monitoring downgrades](#waf-rules).
@@ -2331,6 +2334,11 @@ Update a rule group.
 
 Delete a rule group and its rules.
 
+A group that holds a row linked to a built-in managed rule is rejected with a
+`400`: the delete would cascade to that row and drop its override (see
+[DELETE /sites/{site_id}/rules/{rule_id}](#delete-sitessite_idrulesrule_id)).
+Disable the group or the individual rules instead.
+
 ### GET /sites/{site_id}/rules
 
 List rules.
@@ -2380,6 +2388,17 @@ Update a rule.
 ### DELETE /sites/{site_id}/rules/{rule_id}
 
 Delete a rule.
+
+A seeded row linked to a built-in managed rule (`managed_rule_id` set) cannot
+be deleted. The row is the only record of that rule's `enabled` / `mode`
+override, and the data plane always loads the managed rule itself, so removing
+the row would put a disabled or log-only rule back in blocking mode. The
+request is rejected with a `400`:
+
+```
+400 this rule controls a built-in managed rule and cannot be deleted; disable
+it or set its mode to monitor instead
+```
 
 ---
 
@@ -4186,7 +4205,7 @@ Update bot protection.
 }
 ```
 
-`action` is `block`, `challenge`, `js_challenge`, `log` or `allow` and is applied to traffic classified as a bot (non-browser user agents). `known_bots_whitelist` is a JSON array of case-insensitive User-Agent substrings that always pass.
+`action` is `block`, `challenge`, `js_challenge`, `log` or `allow` and is applied to traffic classified as a bot (non-browser user agents). `allow` lets that traffic through without recording an event — the same as bot protection being disabled. `known_bots_whitelist` is a JSON array of case-insensitive User-Agent substrings that always pass.
 
 Beyond the user agent — trivially spoofed — two stronger signals exist.
 `ip_verification_enabled` plus `verified_ip_group_id` treats client IPs inside

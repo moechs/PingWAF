@@ -313,14 +313,13 @@ impl ControlPlaneClient {
             "Registered with control plane"
         );
 
-        // Apply initial config if provided
+        // The initial config is authoritative even when it lists no site: an
+        // agent that was offline while its last site was deleted must drop
+        // it, not keep serving the copy on disk.
         if let Some(ref site_config) = response.initial_config {
-            if !site_config.sites.is_empty() {
-                if let Err(e) =
-                    self.rule_cache.update_from_site_config(site_config)
-                {
-                    error!(error = %e, "Failed to apply initial site config");
-                }
+            if let Err(e) = self.rule_cache.update_from_site_config(site_config)
+            {
+                error!(error = %e, "Failed to apply initial site config");
             }
         }
 

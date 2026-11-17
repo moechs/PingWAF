@@ -281,41 +281,7 @@ pub async fn notify_all_config_changed(state: &AppState, actor: Option<&str>) {
         let Some(visible) = visible_per_agent.get(&row.id.to_string()) else {
             continue;
         };
-        // An empty visibility set is meaningful too: after a restore removes
-        // the agent's last site, the agent needs the empty bundle rather than
-        // silence while it keeps serving the deleted site.
-        let payload = match bundle_cache.get(visible) {
-            Some(config) => config.clone(),
-            None => {
-                let agent_config = match build_site_config(
-                    &state.db,
-                    Some(visible),
-                )
-                .await
-                {
-                    Ok(config) => config,
-                    Err(err) => {
-                        tracing::warn!(
-                            agent_id = %row.id,
-                            error = %err,
-                            "failed to build the config payload for an agent"
-                        );
-                        continue;
-                    },
-                };
-                bundle_cache.insert(visible.clone(), agent_config.clone());
-                agent_config
-            },
-        };
-        let command = ServerCommand {
-            command_id: Uuid::new_v4().to_string(),
-            r#type: command_type::UPDATE_SITE,
-            issued_at: now_timestamp(),
-            payload: Some(Payload::UpdateSite(UpdateSiteCommand {
-                site_config: Some(payload),
-            })),
-        };
-        if state.agents.send_command(&row.id, command).await {
+        if push_visible_bundle(state, row, visible, &mut bundle_cache).await {
             delivered += 1;
         }
     }
@@ -325,5 +291,121 @@ pub async fn notify_all_config_changed(state: &AppState, actor: Option<&str>) {
         total = agents.len(),
         delivered,
         "global config change pushed to agents"
+    );
+}
+
+/// Sends one agent the authoritative bundle of the sites it serves.
+///
+/// An empty visibility set is meaningful too: once an agent's last site is
+/// gone it needs the empty bundle rather than silence, or it keeps serving the
+/// deleted site. Returns whether the command reached a live stream.
+async fn push_visible_bundle(
+    state: &AppState,
+    row: &agent::Model,
+    visible: &[Uuid],
+    bundle_cache: &mut HashMap<Vec<Uuid>, SiteConfig>,
+) -> bool {
+    let payload = match bundle_cache.get(visible) {
+        Some(config) => config.clone(),
+        None => {
+            let config = match build_site_config(&state.db, Some(visible)).await
+            {
+                Ok(config) => config,
+                Err(err) => {
+                    tracing::warn!(
+                        agent_id = %row.id,
+                        error = %err,
+                        "failed to build the config payload for an agent"
+                    );
+                    return false;
+                },
+            };
+            bundle_cache.insert(visible.to_vec(), config.clone());
+            config
+        },
+    };
+    let command = ServerCommand {
+        command_id: Uuid::new_v4().to_string(),
+        r#type: command_type::UPDATE_SITE,
+        issued_at: now_timestamp(),
+        payload: Some(Payload::UpdateSite(UpdateSiteCommand {
+            site_config: Some(payload),
+        })),
+    };
+    state.agents.send_command(&row.id, command).await
+}
+
+/// Ids of the agents that currently serve `site_id`.
+///
+/// Must be resolved *before* the site row is deleted: afterwards a bound
+/// agent's `site_id` is NULL (`ON DELETE SET NULL`) and the site is gone from
+/// its owner's list, so nothing links the agent to the site any more.
+pub async fn agents_serving_site(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+) -> Result<Vec<Uuid>, DbErr> {
+    let mut serving = Vec::new();
+    for row in agent::Entity::find().all(db).await? {
+        if agent_visible_site_ids(db, &row).await?.contains(&site_id) {
+            serving.push(row.id);
+        }
+    }
+    Ok(serving)
+}
+
+/// Tells the agents that served a deleted site what they serve now.
+///
+/// `agent_ids` comes from [`agents_serving_site`], taken before the delete.
+/// [`notify_config_changed`] cannot do this: it addresses agents by the site
+/// they serve, and no agent serves a site that no longer exists — the edge
+/// kept proxying it until something else happened to trigger a full push.
+/// Visibility is re-read here, after the delete, so a formerly bound agent
+/// receives whatever its unbound state now covers.
+pub async fn notify_site_deleted(
+    state: &AppState,
+    site_id: Uuid,
+    agent_ids: &[Uuid],
+) {
+    if agent_ids.is_empty() {
+        tracing::debug!(%site_id, "no agent served the deleted site");
+        return;
+    }
+    let agents = match agent::Entity::find()
+        .filter(agent::Column::Id.is_in(agent_ids.iter().copied()))
+        .all(&state.db)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(%site_id, error = %err, "failed to list agents for site removal push");
+            return;
+        },
+    };
+
+    let mut bundle_cache: HashMap<Vec<Uuid>, SiteConfig> = HashMap::new();
+    let mut delivered = 0usize;
+    for row in &agents {
+        let visible = match agent_visible_site_ids(&state.db, row).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(
+                    agent_id = %row.id,
+                    %site_id,
+                    error = %err,
+                    "failed to resolve the sites of an agent"
+                );
+                continue;
+            },
+        };
+        if push_visible_bundle(state, row, &visible, &mut bundle_cache).await {
+            delivered += 1;
+        }
+    }
+
+    tracing::info!(
+        %site_id,
+        total = agents.len(),
+        delivered,
+        "site removal pushed to agents"
     );
 }

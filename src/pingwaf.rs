@@ -863,6 +863,8 @@ fn site_has_cache_policy(site: &pingwaf_agent::cache::SiteRules) -> bool {
         })
 }
 
+/// Startup view of the cache: `None` while there is nothing to serve, so the
+/// proxy is not started on an empty or unusable configuration.
 fn cached_rules_to_pingap_config(
     cached: &CachedRules,
     cache_dir: &Path,
@@ -870,7 +872,24 @@ fn cached_rules_to_pingap_config(
     if cached.sites.is_empty() {
         return None;
     }
+    let config = convert_cached_rules(cached, cache_dir);
+    // A site with an ACME certificate but no usable upstream has no location
+    // to proxy to, yet the certificate and its HTTP-01 challenge are still
+    // valid work. Keep the certificate-only config so the challenge handler
+    // and issuance task can run; ordinary requests simply 404/503 until an
+    // upstream is available. Truly empty configs still return None.
+    if config.locations.is_empty() && config.certificates.is_empty() {
+        return None;
+    }
+    Some(config)
+}
 
+/// Converts the cache as it is, including a cache with nothing to serve: the
+/// listeners stay, with no location, upstream or certificate behind them.
+fn convert_cached_rules(
+    cached: &CachedRules,
+    cache_dir: &Path,
+) -> PingapConfig {
     // The cache plugin carries no per-site settings of its own — rules,
     // namespaces and quotas all flow from the agent's rule cache at request
     // time. It only earns a slot in the config when some site actually has
@@ -1398,15 +1417,6 @@ fn cached_rules_to_pingap_config(
         location_names.push(UNMATCHED_HOST_LOCATION_NAME.to_string());
     }
 
-    // A site with an ACME certificate but no usable upstream has no location
-    // to proxy to, yet the certificate and its HTTP-01 challenge are still
-    // valid work. Keep the certificate-only config so the challenge handler
-    // and issuance task can run; ordinary requests simply 404/503 until an
-    // upstream is available. Truly empty configs still return None.
-    if location_names.is_empty() && certificates.is_empty() {
-        return None;
-    }
-
     // TLS is a per-server switch in pingap: `global_certificates` turns it
     // on for every address that server listens on, so 80 and 443 cannot
     // share one server — a merged listener ran plaintext HTTP through TLS
@@ -1481,7 +1491,7 @@ fn cached_rules_to_pingap_config(
         }
     }
 
-    Some(PingapConfig {
+    PingapConfig {
         basic: BasicConf {
             // Always a concrete value, never `None`: pools that do not state
             // their own `verify_cert` resolve against it. The default is
@@ -1496,7 +1506,7 @@ fn cached_rules_to_pingap_config(
         certificates,
         plugins,
         ..Default::default()
-    })
+    }
 }
 
 /// Build a `PingapConfig` from the agent's cached rules.
@@ -1505,6 +1515,13 @@ fn build_pingap_config(rule_cache: &RuleCache) -> Option<PingapConfig> {
         &rule_cache.all_sites(),
         rule_cache.cache_dir(),
     )
+}
+
+/// Reload view of the cache. Unlike [`build_pingap_config`] it never declines:
+/// once the proxy is running, "nothing to serve" has to be applied, otherwise
+/// the locations and certificates of a deleted site stay loaded.
+fn build_reload_config(rule_cache: &RuleCache) -> PingapConfig {
+    convert_cached_rules(&rule_cache.all_sites(), rule_cache.cache_dir())
 }
 
 /// Build the certificate entry a lets-encrypt issuance is driven by.
@@ -2058,13 +2075,14 @@ pub async fn start_data_plane(
                 new = %hash,
                 "data plane: rule change detected, reloading"
             );
-            let Some(converted) = build_pingap_config(&watcher_cache) else {
+            let converted = build_reload_config(&watcher_cache);
+            if converted.locations.is_empty()
+                && converted.certificates.is_empty()
+            {
                 warn!(
-                    "data plane: reload produced no usable config, keeping current"
+                    "data plane: nothing left to serve, unloading every site"
                 );
-                last_hash = hash;
-                continue;
-            };
+            }
             let Ok(new_toml) = toml::to_string_pretty(&converted) else {
                 error!(
                     "data plane: reload config serialization failed, keeping current"
@@ -3720,6 +3738,32 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// Startup declines an empty cache, a reload must not: it is how the
+    /// last deleted site leaves the running proxy.
+    #[test]
+    fn reload_of_an_empty_cache_unloads_every_site() {
+        let config = convert_cached_rules(
+            &CachedRules::default(),
+            Path::new("/tmp/pingwaf-test-cache"),
+        );
+        assert!(config.upstreams.is_empty());
+        assert!(config.locations.is_empty());
+        assert!(config.certificates.is_empty());
+        // Both listeners stay, routing to nothing.
+        assert_eq!(config.servers.len(), 2);
+        for server in config.servers.values() {
+            assert_eq!(server.locations.as_deref(), Some(&[][..]));
+        }
+        // The document survives the config manager's parse and validation.
+        let raw = toml::to_string_pretty(&config).unwrap();
+        let parsed = pingap_config::PingapTomlConfig::from_toml(&raw)
+            .unwrap()
+            .to_pingap_config(true)
+            .unwrap();
+        assert!(parsed.locations.is_empty());
+        assert_eq!(parsed.servers.len(), 2);
     }
 
     #[test]

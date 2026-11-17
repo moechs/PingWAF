@@ -750,7 +750,7 @@ impl SiteContext {
                 .bot_protection
                 .as_ref()
                 .filter(|cfg| cfg.enabled)
-                .map(BotPolicy::build),
+                .and_then(BotPolicy::build),
             ai_bots: ai_bot_rules(site_rules.ai_crawl.as_ref()),
             rate_limits: (!rate_limits.rules.is_empty()).then_some(rate_limits),
             mtls: MtlsPolicy::build(site_rules.ssl_config.as_ref()),
@@ -1179,15 +1179,18 @@ enum BotDecision {
 }
 
 impl BotPolicy {
-    fn build(cfg: &CacheBotProtection) -> Self {
+    /// `None` for the `allow` action: nothing is enforced or recorded, so
+    /// there is no policy to run.
+    fn build(cfg: &CacheBotProtection) -> Option<Self> {
         let action = match cfg.action {
+            CacheWafAction::Allow => return None,
             CacheWafAction::Log => BotAction::Log,
             CacheWafAction::Challenge | CacheWafAction::JsChallenge => {
                 BotAction::Challenge
             },
             _ => BotAction::Block,
         };
-        Self {
+        Some(Self {
             whitelist: cfg
                 .known_bots_whitelist
                 .iter()
@@ -1206,7 +1209,7 @@ impl BotPolicy {
                 })
                 .collect(),
             dns_verification: cfg.dns_verification_enabled,
-        }
+        })
     }
 
     fn denial(&self, detail: String) -> Denial {
@@ -9451,7 +9454,8 @@ inspect_body = true"###,
             known_bots_whitelist: vec!["Googlebot".to_string()],
             verified_bot_ranges: Vec::new(),
             dns_verification_enabled: false,
-        });
+        })
+        .unwrap();
 
         assert!(matches!(
             policy
@@ -9495,6 +9499,26 @@ inspect_body = true"###,
         ));
     }
 
+    /// `allow` used to fall into the catch-all arm and block every scripted
+    /// client; `log` still records without enforcing.
+    #[tokio::test]
+    async fn bot_action_allow_enforces_nothing() {
+        let cfg = |action| CacheBotProtection {
+            enabled: true,
+            action,
+            known_bots_whitelist: Vec::new(),
+            verified_bot_ranges: Vec::new(),
+            dns_verification_enabled: false,
+        };
+        assert!(BotPolicy::build(&cfg(CacheWafAction::Allow)).is_none());
+
+        let log = BotPolicy::build(&cfg(CacheWafAction::Log)).unwrap();
+        assert!(matches!(
+            log.evaluate(None, "curl/8.4.0").await,
+            BotDecision::LogOnly(_)
+        ));
+    }
+
     /// Verified crawler IP ranges pass without any user-agent signal, and a
     /// miss falls through to the user-agent classification. Bare IPs compile
     /// into /32 host ranges; malformed entries are dropped at build time.
@@ -9511,7 +9535,8 @@ inspect_body = true"###,
                 "not-a-range".to_string(),
             ],
             dns_verification_enabled: false,
-        });
+        })
+        .unwrap();
         assert_eq!(policy.verified_ranges.len(), 3);
 
         // Inside the published range: a scripted client nobody whitelisted.

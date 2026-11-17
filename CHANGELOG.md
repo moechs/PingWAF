@@ -10,6 +10,60 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Deleting a site takes it off the edge at once, including the last one.**
+  The delete handler pushed nothing to the agents that served the site, and an
+  agent ignored an empty site list, so a deleted site kept answering until the
+  agent reconnected — and a node whose only site was deleted kept serving it
+  indefinitely. The control plane now resolves the serving agents before the
+  delete and sends each the authoritative remaining list (empty included); the
+  agent accepts an empty configuration and the data plane reloads to "nothing
+  to serve" instead of keeping the previous sites.
+
+- **A rule expression can only reference fields a request has.** An unknown
+  field name (a typo, or `http.response.status`, which the condition builder
+  offered) was stored and then compared as a constant: the rule never fired,
+  or fired on every request under a negated operator. The API now answers 400
+  `validation.expression_invalid` naming the field; the builder no longer
+  offers `http.response.status` for WAF rules (rewrite rules keep it), and the
+  rule-group dialog drops the phase selector whose other options did nothing.
+  Rows already stored with an unknown field keep loading on the edge, but a
+  config rollback or site clone skips them.
+
+- **Built-in rule overrides cannot be deleted.** A seeded row linked to a
+  managed rule is the only record of its "disabled" or "log only" state, and
+  the data plane always loads the managed rule — deleting the row silently put
+  it back in blocking mode. `DELETE` on such a row, or on a rule group that
+  contains one (the group's rules are cascade-deleted), now answers 400, and
+  the console hides those delete buttons.
+
+- **Bot protection action `allow` allows.** It fell through to the default and
+  was enforced as `block`. It now runs no bot policy, the same as turning bot
+  protection off.
+
+- **The log search accepts the actions the edge writes.** `action:monitor` and
+  `action:pass` were rejected as unknown values although they are the two most
+  common decisions in the log; the filter, its hint and the row badge now cover
+  `block`, `challenge`, `monitor`, `pass`, `log`, `js_challenge` and `allow`.
+
+- **Five console messages printed their placeholder instead of the value** —
+  the "allow rules still apply" dialog title, the two cache-purge results, the
+  notification-channel delete prompt and the system-token revoke label showed a
+  literal `{count}` / `{name}` in zh, en and ja.
+
+### Changed
+
+- **Protection copy says what the switches do.** Turning the WAF engine off
+  stops managed and custom rules only; IP / geo access rules, bot protection,
+  AI crawl control, CC protection and rate limiting keep enforcing, and the
+  engine card, its warning banner, the confirmation dialog and the API guide
+  now say so instead of "requests are not inspected or blocked". The backend-stack card
+  explains that ticking a stack downgrades its detections to log-only — it is
+  not a "my site uses this stack" declaration, and no switch turns unused
+  stacks off. The toast after changing the site mode reads "Site protection
+  mode updated" rather than "Mode applied to all rules", which it never did.
+
 ## [PingWAF 0.32.31] — 2026-11-16
 
 ### Performance

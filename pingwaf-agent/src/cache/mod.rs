@@ -3961,6 +3961,21 @@ mod tests {
                 .downstream_timeout_secs,
             60
         );
+
+        // A payload listing no site is authoritative too: it is what the
+        // control plane sends once the agent's last site is deleted.
+        let hash_before = cache.config_hash();
+        cache
+            .update_from_site_config(&proto::SiteConfig {
+                config_hash: "empty".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(cache.get_site_rules_by_id("site-1").is_none());
+        assert!(cache.get_site_rules("a.example.com").is_none());
+        assert!(cache.all_sites().sites.is_empty());
+        // The data plane reloads on a hash change, so the hash must move.
+        assert_ne!(cache.config_hash(), hash_before);
     }
 
     #[test]

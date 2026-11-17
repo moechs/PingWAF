@@ -31,7 +31,9 @@ use crate::api::validation::{
     RuleRowFix,
 };
 use crate::auth::AuthUser;
-use crate::grpc::notify_config_changed;
+use crate::grpc::{
+    agents_serving_site, notify_config_changed, notify_site_deleted,
+};
 use crate::models::{
     acme_challenge, bot_protection, cache_rules, certificate_links,
     challenge_settings, geo_rules, ip_access_rules, ip_group_sites, ip_groups,
@@ -2241,10 +2243,13 @@ async fn remove(
     // Verify ownership first so that the ON DELETE CASCADE rules never run for a
     // site the caller must not see.
     load_site_write(&state.db, id, &current).await?;
+    // Resolved before the delete: afterwards nothing links an agent to the
+    // site, and the edge would keep serving it.
+    let serving = agents_serving_site(&state.db, id).await?;
     site::Entity::delete_by_id(id).exec(&state.db).await?;
 
     tracing::info!(%id, owner = %current.id, "site deleted");
-    notify_config_changed(&state, id, Some(&current.email)).await;
+    notify_site_deleted(&state, id, &serving).await;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }

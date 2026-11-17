@@ -1346,7 +1346,7 @@ mod tests {
         let mut row = rule_row(
             "block",
             "block",
-            r#"http.request.path contains "/admin""#,
+            r#"http.request.uri.path contains "/admin""#,
         );
         assert_eq!(
             RowSanitisation::Keep,
