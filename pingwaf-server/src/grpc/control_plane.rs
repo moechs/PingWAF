@@ -782,15 +782,23 @@ impl ControlPlaneTrait for ControlPlaneService {
         request: Request<Streaming<LogEntry>>,
     ) -> Result<Response<LogAck>, Status> {
         let agent = self.authorize(&Self::metadata_token(&request)).await?;
+        // Kept for the periodic re-authorization below (DR32-08): the token
+        // must be re-verified on the metadata once per refresh window.
+        let agent_token = Self::metadata_token(&request);
         let authenticated_id = agent.id;
-        // The sites this agent serves, resolved once per stream: every entry's
-        // `site_id` is checked against it below (D10).
-        let visible_sites: Vec<Uuid> = self
-            .visible_sites(&agent)
-            .await?
-            .iter()
-            .map(|row| row.id)
-            .collect();
+        // The sites this agent serves, snapshot at connect and refreshed
+        // every [`SITE_VISIBILITY_REFRESH`] inside the loop below (D10 +
+        // DR32-08): a revoked key or an unbound site must stop the flow even
+        // on a stream that stays up for hours.
+        let mut visibility = SiteVisibility::new(
+            self.visible_sites(&agent)
+                .await?
+                .iter()
+                .map(|row| row.id)
+                .collect(),
+        );
+        let mut next_visibility_refresh =
+            tokio::time::Instant::now() + SITE_VISIBILITY_REFRESH;
         let mut inbound = request.into_inner();
         let batch_size = self.config.log_batch_size.max(1);
 
@@ -820,6 +828,45 @@ impl ControlPlaneTrait for ControlPlaneService {
             // or one bad entry fails the whole batch forever (2026-11-13).
             sanitize_log_entry(&mut message);
             let now = Utc::now();
+            // DR32-08: periodic re-check of authentication and site bindings,
+            // once per `SITE_VISIBILITY_REFRESH` — never per entry. An auth
+            // failure (agent deleted, key revoked) ends the stream; entries
+            // received so far are still flushed below.
+            if tokio::time::Instant::now() >= next_visibility_refresh {
+                next_visibility_refresh =
+                    tokio::time::Instant::now() + SITE_VISIBILITY_REFRESH;
+                match self.authorize(&agent_token).await {
+                    Ok(agent) => match self.visible_sites(&agent).await {
+                        Ok(sites) => {
+                            let sites: Vec<Uuid> =
+                                sites.into_iter().map(|row| row.id).collect();
+                            if visibility.refresh(sites) {
+                                tracing::info!(
+                                    agent_id = %authenticated_id,
+                                    sites = visibility.sites.len(),
+                                    "log stream site visibility refreshed"
+                                );
+                            }
+                        },
+                        Err(err) => {
+                            tracing::warn!(
+                                agent_id = %authenticated_id,
+                                error = %err,
+                                "log stream ended: site visibility refresh failed"
+                            );
+                            break;
+                        },
+                    },
+                    Err(err) => {
+                        tracing::info!(
+                            agent_id = %authenticated_id,
+                            error = %err,
+                            "log stream ended: agent is no longer authorised"
+                        );
+                        break;
+                    },
+                }
+            }
             if !message.agent_id.is_empty()
                 && message.agent_id != authenticated_id.to_string()
             {
@@ -832,11 +879,13 @@ impl ControlPlaneTrait for ControlPlaneService {
                 );
                 continue;
             }
-            if !site_stamp_is_visible(&message.site_id, &visible_sites) {
-                // The agent may only write history for the sites it serves.
-                // The entry is dropped rather than answered with an error: a
-                // misbehaving edge would otherwise retry the whole batch
-                // forever, and the batch also carries legitimate entries.
+            if !visibility.allows(&message.site_id) {
+                // The agent may only write history for the sites it serves
+                // (D10), against the snapshot refreshed every refresh window
+                // (DR32-08). The entry is dropped rather than answered with
+                // an error: a misbehaving edge would otherwise retry the
+                // whole batch forever, and the batch also carries legitimate
+                // entries.
                 dropped += 1;
                 tracing::warn!(
                     site_id = %message.site_id,
@@ -961,16 +1010,25 @@ impl ControlPlaneTrait for ControlPlaneService {
         request: Request<Streaming<CertEventEntry>>,
     ) -> Result<Response<CertEventAck>, Status> {
         let agent = self.authorize(&Self::metadata_token(&request)).await?;
+        // Kept for the periodic re-authorization below, same as `ship_logs`.
+        let agent_token = Self::metadata_token(&request);
         let authenticated_id = agent.id;
         // Same tenancy check as `ship_logs`: a certificate event drives a
         // state transition on the site's certificate, so a foreign `site_id`
-        // here would let an edge fail another tenant's renewal (D10).
-        let visible_sites: Vec<Uuid> = self
-            .visible_sites(&agent)
-            .await?
-            .iter()
-            .map(|row| row.id)
-            .collect();
+        // here would let an edge fail another tenant's renewal (D10). The
+        // snapshot is refreshed on the same cadence: a revoked key or an
+        // unbound site must stop the flow even on a connection that lives for
+        // days (review of 0.32.33, H3 — the same defect as DR32-08, fixed here
+        // because the two streams had identical shapes).
+        let mut visibility = SiteVisibility::new(
+            self.visible_sites(&agent)
+                .await?
+                .iter()
+                .map(|row| row.id)
+                .collect(),
+        );
+        let mut next_visibility_refresh =
+            tokio::time::Instant::now() + SITE_VISIBILITY_REFRESH;
         let mut inbound = request.into_inner();
         let batch_size = self.config.log_batch_size.max(1);
         let mut received: u64 = 0;
@@ -996,6 +1054,43 @@ impl ControlPlaneTrait for ControlPlaneService {
                 },
             };
             sanitize_cert_event(&mut message);
+            // Periodic re-authorization and visibility refresh; entries
+            // received so far are still flushed by the batch tail below.
+            if tokio::time::Instant::now() >= next_visibility_refresh {
+                next_visibility_refresh =
+                    tokio::time::Instant::now() + SITE_VISIBILITY_REFRESH;
+                match self.authorize(&agent_token).await {
+                    Ok(agent) => match self.visible_sites(&agent).await {
+                        Ok(sites) => {
+                            let sites: Vec<Uuid> =
+                                sites.into_iter().map(|row| row.id).collect();
+                            if visibility.refresh(sites) {
+                                tracing::info!(
+                                    agent_id = %authenticated_id,
+                                    sites = visibility.sites.len(),
+                                    "certificate event stream visibility refreshed"
+                                );
+                            }
+                        },
+                        Err(err) => {
+                            tracing::warn!(
+                                agent_id = %authenticated_id,
+                                error = %err,
+                                "certificate event stream ended: visibility refresh failed"
+                            );
+                            break;
+                        },
+                    },
+                    Err(err) => {
+                        tracing::info!(
+                            agent_id = %authenticated_id,
+                            error = %err,
+                            "certificate event stream ended: agent no longer authorized"
+                        );
+                        break;
+                    },
+                }
+            }
             let now = Utc::now();
             if !message.agent_id.is_empty()
                 && message.agent_id != authenticated_id.to_string()
@@ -1007,7 +1102,7 @@ impl ControlPlaneTrait for ControlPlaneService {
                 );
                 continue;
             }
-            if !site_stamp_is_visible(&message.site_id, &visible_sites) {
+            if !visibility.allows(&message.site_id) {
                 // Dropped, not rejected: see `ship_logs`. The alert and the
                 // certificate state transition below both act on the site, so
                 // the check has to happen before either.
@@ -2567,6 +2662,18 @@ async fn mark_offline(db: &DatabaseConnection, agent_id: Uuid) {
 /// Soft byte budget for one in-flight log batch. The row-count limit alone
 /// lets a handful of large bodies pin far more memory than intended.
 const LOG_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// DR32-08: how often an established `ship_logs` stream re-checks that its
+/// agent is still authenticated and which sites it may still log for. A log
+/// stream can live for hours; without the refresh, a revoked API key or an
+/// unbound site keeps flowing until the connection happens to drop. 60s
+/// matches `SAMPLE_PERSIST_INTERVAL_SECS`: one authorize + one site query per
+/// stream per minute is negligible next to the write batch flushed in the
+/// same window, while a revocation takes effect in under a minute. The check
+/// is deliberately periodic, never per entry — a per-message DB query would
+/// multiply the ingest load by the batch size.
+const SITE_VISIBILITY_REFRESH: std::time::Duration =
+    std::time::Duration::from_secs(60);
 /// `insert_many` builds one SQL statement per call; cap the row count so a
 /// large batch does not produce an oversized parameter buffer.
 const LOG_INSERT_CHUNK: usize = 64;
@@ -3231,6 +3338,36 @@ fn site_stamp_is_visible(stamped: &str, visible: &[Uuid]) -> bool {
     }
 }
 
+/// Snapshot of the sites an established log stream accepts (DR32-08), plus
+/// the periodic refresh that keeps a revoked key or an unbound site from
+/// flowing for the life of the stream. Pure logic, so the refresh semantics
+/// are testable without a database or `tokio::time`.
+struct SiteVisibility {
+    sites: Vec<Uuid>,
+}
+
+impl SiteVisibility {
+    fn new(sites: Vec<Uuid>) -> Self {
+        Self { sites }
+    }
+
+    /// Replaces the snapshot; returns `true` when the set actually changed
+    /// (so the caller can log one line per real change, not per refresh).
+    fn refresh(&mut self, sites: Vec<Uuid>) -> bool {
+        let changed = sites.len() != self.sites.len()
+            || !sites.iter().all(|id| self.sites.contains(id));
+        if changed {
+            self.sites = sites;
+        }
+        changed
+    }
+
+    /// D10 check for one entry's `site_id` stamp against the snapshot.
+    fn allows(&self, stamped: &str) -> bool {
+        site_stamp_is_visible(stamped, &self.sites)
+    }
+}
+
 /// Drops heartbeat entries stamped with a site the reporting agent does not
 /// serve (D10).
 ///
@@ -3353,6 +3490,33 @@ mod tests {
         assert!(!site_stamp_is_visible("   ", &[site]));
         assert!(!site_stamp_is_visible("not-a-uuid", &[site]));
         assert!(!site_stamp_is_visible(&Uuid::new_v4().to_string(), &[site]));
+    }
+
+    /// DR32-08: after a visibility refresh, a site the agent was unbound from
+    /// is no longer accepted and a newly bound one is; an unchanged set
+    /// reports no change so the periodic refresh logs one line per real
+    /// change only, and an empty refresh (agent unbound everywhere, or the
+    /// key's owner lost the sites) rejects everything.
+    #[test]
+    fn visibility_refresh_updates_the_accepted_site_set() {
+        let old_site = Uuid::new_v4();
+        let mut visibility = SiteVisibility::new(vec![old_site]);
+        assert!(visibility.allows(&old_site.to_string()));
+
+        let new_site = Uuid::new_v4();
+        // Rebound: old site drops out, new site flows.
+        assert!(visibility.refresh(vec![new_site]));
+        assert!(!visibility.allows(&old_site.to_string()));
+        assert!(visibility.allows(&new_site.to_string()));
+
+        // Same set again: no change reported.
+        assert!(!visibility.refresh(vec![new_site]));
+        assert!(visibility.allows(&new_site.to_string()));
+
+        // Agent unbound everywhere: nothing is accepted any more.
+        assert!(visibility.refresh(Vec::new()));
+        assert!(!visibility.allows(&new_site.to_string()));
+        assert!(!visibility.allows(""));
     }
 
     /// D03: an `acme_failed` event from the edge turns the certificate row
