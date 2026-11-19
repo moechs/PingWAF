@@ -55,6 +55,7 @@ jobs:
   # assets.
   release-notes:
     name: Create release from CHANGELOG
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -126,6 +127,7 @@ jobs:
   # + frontend build that used to duplicate the npm critical path.
   web-dist:
     name: Build frontend dist
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -156,6 +158,7 @@ jobs:
     # `release-notes` first: the release must exist (and its notes must have
     # been found in CHANGELOG.md) before any asset is uploaded into it.
     needs: [release-notes, web-dist]
+    if: github.event.repository.fork == false
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 120
     permissions:
@@ -311,6 +314,7 @@ jobs:
   docker:
     name: Docker image (${{ matrix.arch }})
     needs: binaries
+    if: github.event.repository.fork == false
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
     permissions:
@@ -387,6 +391,7 @@ jobs:
   docker-manifest:
     name: Merge multi-arch Docker manifest
     needs: docker
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
