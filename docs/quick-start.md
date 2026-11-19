@@ -82,13 +82,35 @@ Port summary:
 | `80` / `443` | Proxied site traffic | **Only after at least one site is created** |
 | `5432` | PostgreSQL | Your database, internal only |
 
+### Deployment host checklist
+
+Run this on the target host before choosing a path. Every line corresponds to a
+failure that is otherwise reported far from its cause — by `compose up`, by
+`systemctl status`, or by a 403 in the console.
+
+```bash
+uname -m                                   # amd64 or arm64 (the release assets)
+free -m | sed -n 2p                        # 512 MB minimum, 2 GB comfortable
+df -h / | tail -1                          # 1 GB minimum, 10 GB+ with logs
+command -v git curl tar                    # Path 1 needs git, all paths need curl
+docker compose version                     # Path 1: the v2 plugin, not docker-compose
+id -nG | grep -q docker && echo "docker group ok" \
+  || echo "not in docker group: run Docker commands with sudo, or: sudo usermod -aG docker $USER"
+ss -ltn | grep -E ':(80|443|9080|9090|5432)\b' || echo "ports free"
+```
+
+A PostgreSQL that already listens on `5432` is the common case on a machine that
+was set up for something else: Path 1 then needs `POSTGRES_PORT` (or the compose
+installer's `--db-port`), and a native install needs its own database name rather
+than the default `pingwaf` one.
+
 ### Software versions
 
 | Component | Minimum | Notes |
 | --- | --- | --- |
 | Rust | **1.96** (MSRV) | CI tracks stable; the Docker image and the release binaries build with 1.98.1 |
 | Node.js | **26.12.1** | Only needed to build the dashboard frontend — lower versions fail `npm ci` (`engine-strict`, ships the 2026-10 security fixes) |
-| PostgreSQL | **14+** | 16 recommended; Docker Compose ships `postgres:16-alpine` |
+| PostgreSQL | **14+** | Docker Compose ships `postgres:16-alpine`; a native install takes whatever the distribution packages — Ubuntu 26.04 ships `postgresql-18`, 24.04 ships `postgresql-16`. Check with `apt-cache search --names-only '^postgresql-[0-9]+$'` instead of copying a version from this page |
 | Docker Engine | 24+ | With Compose v2 (`docker compose`, not `docker-compose`) |
 | protoc | Any recent release | **Required.** See the warning below |
 
@@ -223,8 +245,28 @@ Compose variables you can set:
 ### Step 3 — Start the stack
 
 ```bash
-docker compose up -d
+sudo docker compose up -d
 ```
+
+If your user is in the `docker` group, drop the `sudo`. Without either, compose
+fails with `permission denied while trying to connect to the Docker API at
+unix:///var/run/docker.sock`.
+
+> ⚠️ **A fresh database rejects every write until the seeded password is
+> changed.** Signing in succeeds, but creating a site or a rule answers
+> `403 {"code":"password_change_required"}`. Before automating anything:
+>
+> ```bash
+> TOKEN=$(curl -sk -X POST https://127.0.0.1:9080/api/v1/auth/login \
+>   -H 'Content-Type: application/json' \
+>   -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASSWORD\"}" \
+>   | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+> curl -sk -X PUT https://127.0.0.1:9080/api/v1/auth/password \
+>   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+>   -d '{"current_password":"OLD","new_password":"NEW"}'
+> ```
+>
+> The change revokes the token you used, so sign in again with the new password.
 
 By default Compose pulls the pre-built image
 `ghcr.io/shuaizend/pingwaf:latest`. **Pin a release for production** — set
@@ -537,8 +579,15 @@ also ships a hardened unit file, [`pingwaf.service`](../pingwaf.service).
 > [Path 2](#path-2-build-from-source), then follow the steps below.
 
 ```bash
-# 1. Copy the binary into place (built via Path 2)
-sudo install -m 0755 target/release/pingwaf /usr/local/bin/pingwaf
+# 1. Put the binary in place — download the release, or use a Path 2 build
+#    (there is no need to compile for a production install)
+cd /tmp && rm -rf pingwaf-rel && mkdir pingwaf-rel && cd pingwaf-rel
+curl -fsSLO https://github.com/shuaiZend/PingWAF/releases/latest/download/pingwaf-linux-amd64.tar.gz
+curl -fsSLO https://github.com/shuaiZend/PingWAF/releases/latest/download/pingwaf-linux-amd64.tar.gz.sha256
+sha256sum -c pingwaf-linux-amd64.tar.gz.sha256    # fail-closed: no checksum, no install
+tar xzf pingwaf-linux-amd64.tar.gz
+sudo install -m 0755 pingwaf-linux-amd64/pingwaf /usr/local/bin/pingwaf
+# on arm64 use pingwaf-linux-arm64.tar.gz
 
 # 2. Create the service user and directories
 sudo useradd --system --home-dir /var/lib/pingwaf --shell /usr/sbin/nologin pingwaf
@@ -550,8 +599,14 @@ sudo cp pingwaf.service /etc/systemd/system/pingwaf.service
 sudo systemctl daemon-reload
 
 # 4. Provide the configuration (a file, environment, or both)
+sudo cp pingwaf-linux-amd64/pingwaf.toml /etc/pingwaf/pingwaf.toml
+sudo chown root:pingwaf /etc/pingwaf/pingwaf.toml
 sudo systemctl edit pingwaf   # drop-in override
 ```
+
+The `cp` is not optional when the drop-in names `PINGWAF_CONFIG`: a missing file
+stops startup with `cannot read config file … No such file or directory` instead
+of falling back to defaults.
 
 In the drop-in, point the process at a configuration file and/or set the
 environment it needs — the environment wins over the file, and a flag on the
@@ -563,6 +618,8 @@ Environment=PINGWAF_CONFIG=/etc/pingwaf/pingwaf.toml
 Environment=PINGWAF_JWT_SECRET=RANDOM_32_BYTE_HEX
 Environment=PINGWAF_ALLOW_REGISTRATION=false
 Environment=RUST_LOG=info,sqlx=warn
+# Only needed when the database is not the default pingwaf/pingwaf@localhost:5432/pingwaf
+Environment=PINGWAF_DATABASE_URL=postgres://pingwaf:CHANGE_ME@localhost:5432/pingwaf
 ```
 
 The file is optional: without it, the `Environment=` lines below are the whole
@@ -579,6 +636,11 @@ sudo systemctl enable --now pingwaf
 sudo systemctl status pingwaf
 sudo journalctl -u pingwaf -f
 ```
+
+A fresh database rejects every write with `403 password_change_required`
+until the seeded password is changed (`PUT /api/v1/auth/password`, or Settings →
+Account). Do that before creating a site, and before pointing automation at the
+API.
 
 Before exposing this to the internet, override every default credential:
 `PINGWAF_JWT_SECRET` (32 random bytes; server floor 16 chars), `PINGWAF_ADMIN_PASSWORD`,

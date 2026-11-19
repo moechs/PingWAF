@@ -5,7 +5,7 @@
 | Requirement | Minimum | Recommended |
 |-------------|---------|-------------|
 | OS | Linux (amd64/arm64), macOS | Ubuntu 22.04+, Debian 12+ |
-| PostgreSQL | 14+ | 16 |
+| PostgreSQL | 14+ | 16+ — native packages follow the distribution (`postgresql-18` on Ubuntu 26.04, `postgresql-16` on 24.04); check with `apt-cache search --names-only '^postgresql-[0-9]+$'` |
 | RAM | 512 MB | 2 GB+ |
 | Disk | 1 GB | 10 GB+ (logs, cache) |
 | Ports | 80, 443, 9080, 9090 | — |
