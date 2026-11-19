@@ -112,12 +112,20 @@ pub struct RestorePlan {
     pub prune_site_ids: Vec<Uuid>,
     pub owner_changes: Vec<Value>,
     pub warnings: Vec<String>,
+    /// DR32-07: rows dropped by [`sanitise_restored_row`] because they fail
+    /// the current write-path validation. A skipped row means the restored
+    /// state is *not* what the snapshot ran, so the count travels with the
+    /// plan, the report and the completion log instead of being silent.
+    pub skipped_rows: usize,
 }
 
 #[derive(Debug, Default)]
 pub struct RestoreReport {
     pub rows_by_table: BTreeMap<String, usize>,
     pub warnings: Vec<String>,
+    /// DR32-07: how many snapshot rows were skipped as invalid. Mirrored
+    /// from [`RestorePlan::skipped_rows`] so the API response carries it.
+    pub skipped_rows: usize,
 }
 
 fn quote_ident(identifier: &str) -> String {
@@ -871,6 +879,7 @@ async fn prepare_restore_inner<C: ConnectionTrait>(
     let mut owner_changes = Vec::new();
     let mut columns = HashMap::new();
     let mut warnings = Vec::new();
+    let mut skipped_rows = 0usize;
 
     for spec in tables_for(scope) {
         let Some(rows) = rows_for(schema, &tables, spec.name)? else {
@@ -981,6 +990,18 @@ async fn prepare_restore_inner<C: ConnectionTrait>(
                         "{spec_name} row {row_id}: invalid ({reason}); skipped",
                         spec_name = spec.name
                     ));
+                    // DR32-07: a skipped row means the restored state is not
+                    // what the snapshot actually ran. The drop itself stays
+                    // (aborting would make older snapshots unrestorable), but
+                    // it must be visible: one warn per row here, a counted
+                    // summary on the report and the completion log.
+                    tracing::warn!(
+                        table = spec.name,
+                        row_id = %row_id,
+                        reason = %reason,
+                        "restored row skipped: it fails the current validation"
+                    );
+                    skipped_rows += 1;
                     continue;
                 },
             }
@@ -1060,6 +1081,7 @@ async fn prepare_restore_inner<C: ConnectionTrait>(
         prune_site_ids,
         owner_changes,
         warnings,
+        skipped_rows,
     })
 }
 
@@ -1224,6 +1246,7 @@ pub async fn apply_restore(
     let mut report = RestoreReport {
         rows_by_table: BTreeMap::new(),
         warnings: plan.warnings.clone(),
+        skipped_rows: plan.skipped_rows,
     };
     let mut by_layer = plan.tables.iter().collect::<Vec<_>>();
     by_layer.sort_by_key(|prepared| prepared.spec.layer);
@@ -1249,6 +1272,15 @@ pub async fn apply_restore(
          WHERE action = 'allow' AND mode = 'off'",
     )
     .await?;
+    // DR32-07: make the gap between the snapshot and what actually came back
+    // visible — `skipped` rows failed validation and were dropped.
+    let restored: usize = report.rows_by_table.values().sum();
+    tracing::info!(
+        restored,
+        skipped = report.skipped_rows,
+        tables = report.rows_by_table.len(),
+        "restore applied"
+    );
     Ok(report)
 }
 
@@ -1268,6 +1300,7 @@ pub fn preview(plan: &RestorePlan) -> Value {
         "sites_to_remove": plan.prune_site_ids,
         "owner_changes": plan.owner_changes,
         "warnings": plan.warnings,
+        "skipped_rows": plan.skipped_rows,
     })
 }
 
@@ -1401,6 +1434,38 @@ mod tests {
             sanitise_restored_row("rules", &mut row),
             RowSanitisation::Skip(_)
         ));
+    }
+
+    /// DR32-07: a skipped row is reported, never silent — its reason must be
+    /// non-empty, human-readable and free of raw control characters, because
+    /// it travels verbatim into the plan warnings, the per-row warn! log and
+    /// the console response.
+    #[test]
+    fn skipped_rows_carry_a_readable_reason() {
+        for (action, mode, expression) in [
+            ("block", "enforce", r#"true"#),
+            ("quarantine", "block", r#"true"#),
+            ("block", "block", "and and"),
+        ] {
+            let mut row = rule_row(action, mode, expression);
+            match sanitise_restored_row("rules", &mut row) {
+                RowSanitisation::Skip(reason) => {
+                    assert!(
+                        !reason.trim().is_empty(),
+                        "empty reason for {action}/{mode}"
+                    );
+                    assert!(
+                        reason
+                            .chars()
+                            .all(|c| c.is_ascii_graphic() || c == ' '),
+                        "unprintable reason: {reason:?}"
+                    );
+                },
+                other => {
+                    panic!("expected Skip for {action}/{mode}, got {other:?}")
+                },
+            }
+        }
     }
 
     fn exception_row(

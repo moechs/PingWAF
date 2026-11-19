@@ -1365,12 +1365,13 @@ fn now_unix_ms() -> u64 {
 // RuleCache — the main public interface
 // ─────────────────────────────────────────────────────────────
 
-/// Minimum spacing between two rule-snapshot writes caused by control-plane
-/// updates. A full sync pushes one bundle per site; rewriting (and fsyncing)
-/// the whole snapshot per bundle is O(S²) bytes for S sites. The first update
-/// after the interval still writes synchronously, so a single change is
-/// durable immediately; a burst marks the cache dirty and the background
-/// flush loop writes it once.
+/// Minimum spacing between two synchronous rule-snapshot writes caused by
+/// control-plane updates. A full sync pushes one bundle per site; rewriting
+/// (and fsyncing) the whole snapshot per bundle is O(S²) bytes for S sites.
+/// The first update after this window still writes synchronously, so a single
+/// change is durable immediately; a burst marks the cache dirty and the
+/// background flush loop (ticking every 5s, see `BLOCK_FLUSH_INTERVAL_SECS`
+/// in the gRPC client) writes the pending state once.
 const RULE_FLUSH_DEBOUNCE_MS: u64 = 1000;
 
 /// Upper bound on dynamically blocked addresses and ranges (single IPs and
@@ -2509,14 +2510,21 @@ impl RuleCache {
         outcome
     }
 
-    /// Persist after a control-plane update, debounced to at most one write
-    /// per [`RULE_FLUSH_DEBOUNCE_MS`].
+    /// Persist after a control-plane update, debounced: synchronous writes
+    /// are spaced at least [`RULE_FLUSH_DEBOUNCE_MS`] apart, and an update
+    /// inside that window only marks the cache dirty. The dirty state is
+    /// flushed by the background loop, which ticks every 5s — so the
+    /// worst-case durability delay for a debounced update is ~5s, not the
+    /// 1s debounce window.
     ///
-    /// A full sync sends one bundle per site. Persisting each one rewrites and
-    /// fsyncs the entire snapshot (O(S²) bytes for S sites), so a burst only
-    /// marks the cache dirty; the first update after the interval writes
+    /// A full sync sends one bundle per site. Persisting each one rewrites
+    /// and fsyncs the entire snapshot (O(S²) bytes for S sites), so a burst
+    /// only marks the cache dirty; the first update after the window writes
     /// synchronously, and the background flush loop (plus shutdown) covers
-    /// the rest.
+    /// the rest. The 5s loop period is a deliberate write-amplification
+    /// trade-off: it caps persist frequency well below the bundle rate while
+    /// keeping crash-loss of a debounced update bounded to a few seconds of
+    /// state that the control plane re-pushes on reconnect anyway.
     fn persist_after_update(&self) -> anyhow::Result<()> {
         let now = now_unix_ms();
         let last = self.last_rules_persist_ms.load(Ordering::Relaxed);
@@ -2738,8 +2746,16 @@ impl RuleCache {
             },
             Err(primary_err) => {
                 let backup = sites_path.with_extension("json.bak");
+                let backup_metadata = metadata_path.with_extension("json.bak");
                 if backup.exists() {
-                    match self.read_snapshot_unstamped(&backup) {
+                    // The backup is validated with the exact same check as
+                    // the primary: its `metadata.json.bak` stamp carries the
+                    // CRC32/length of the snapshot that was rolled, so a
+                    // half-written or bit-rotted backup is discarded instead
+                    // of loaded. A pre-stamp cache has no stamped backup
+                    // metadata, which downgrades to parse validation (the
+                    // legacy behaviour inside `read_snapshot`).
+                    match self.read_snapshot(&backup, &backup_metadata) {
                         Ok(cached) => {
                             self.inner.store(Arc::new(cached));
                             let reason = format!(
@@ -2790,10 +2806,13 @@ impl RuleCache {
         }
     }
 
-    /// Reads and validates a primary snapshot: JSON parse, format version,
-    /// and — when the metadata stamps them — the CRC32 + length of the
-    /// payload. A missing or unreadable metadata file downgrades to parse
-    /// validation only and says so, so pre-integrity snapshots still load.
+    /// Reads and validates a snapshot: JSON parse, format version, and —
+    /// when the paired metadata stamps them — the CRC32 + length of the
+    /// payload. Shared by the primary (`sites.json` + `metadata.json`) and
+    /// the backup (`sites.json.bak` + `metadata.json.bak`) fallback, so a
+    /// backup can never load with less scrutiny than the file it replaces.
+    /// A missing or unreadable metadata file downgrades to parse validation
+    /// only and says so, so pre-integrity snapshots still load.
     fn read_snapshot(
         &self,
         sites_path: &Path,
@@ -2805,12 +2824,18 @@ impl RuleCache {
                 Ok(metadata) => {
                     check_format_version(metadata.version)
                         .map_err(anyhow::Error::msg)?;
-                    if let (Some(crc), Some(len)) =
+                    if let (Some(expected_crc), Some(expected_len)) =
                         (metadata.sites_crc32, metadata.sites_len)
                     {
-                        if !content_matches(&bytes, crc, len) {
+                        if !content_matches(&bytes, expected_crc, expected_len)
+                        {
+                            let actual_crc = content_crc32(&bytes);
                             anyhow::bail!(
-                                "sites.json failed its integrity check (crc32/length mismatch against metadata.json)"
+                                "{} failed its integrity check (crc32/length mismatch against {}: expected crc32 {expected_crc:#010x}/{} bytes, got crc32 {actual_crc:#010x}/{} bytes)",
+                                sites_path.display(),
+                                metadata_path.display(),
+                                expected_len,
+                                bytes.len()
                             );
                         }
                     }
@@ -2825,17 +2850,6 @@ impl RuleCache {
         }
         serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {:?}", sites_path))
-    }
-
-    /// Backup validation: the JSON must parse. A slightly stale backup is
-    /// still better than empty rules, so no integrity stamp is required.
-    fn read_snapshot_unstamped(
-        &self,
-        path: &Path,
-    ) -> anyhow::Result<CachedRules> {
-        let bytes = std::fs::read(path)?;
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing {:?}", path))
     }
 
     /// Loads blocked IPs, dropping entries that expired while persisted.
@@ -4679,6 +4693,83 @@ mod tests {
         let health = third.health_status();
         assert_eq!(health.source, LoadSource::Disk);
         assert!(health.healthy);
+    }
+
+    /// A backup whose bytes still match its `metadata.json.bak` CRC stamp
+    /// loads normally (DR32-06): the restore path must accept the good
+    /// backup, not just reject the bad one.
+    #[test]
+    fn valid_crc_backup_restores_on_primary_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let cache = RuleCache::new(root.clone(), "test".to_string()).unwrap();
+        cache.persist_to_disk().unwrap(); // first snapshot, no backup yet
+        cache.persist_to_disk().unwrap(); // rolls snapshot #1 to .bak
+
+        // Corrupt the primary with still-valid JSON so only the CRC check
+        // can tell it apart from a good snapshot.
+        let sites = root.join("sites.json");
+        let bytes = std::fs::read(&sites).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        value["config_hash"] = serde_json::Value::String("tampered".into());
+        std::fs::write(&sites, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let reloaded = RuleCache::new(root, "test".to_string()).unwrap();
+        let health = reloaded.health_status();
+        assert_eq!(health.source, LoadSource::Backup);
+        assert!(health.healthy, "good backup keeps the agent functional");
+        // The restored rules come from the backup, not the tampered primary.
+        assert_eq!(
+            reloaded.all_sites().config_hash.to_string(),
+            "",
+            "restored snapshot must be the rolled backup, not the tampered primary"
+        );
+    }
+
+    /// A tampered backup (valid JSON, wrong CRC against `metadata.json.bak`)
+    /// must be discarded, not loaded (DR32-06): the agent falls back to the
+    /// no-cache path (empty rules + unhealthy) and re-pulls from the control
+    /// plane instead of trusting an unverified snapshot.
+    #[test]
+    fn tampered_backup_is_rejected_and_degrades_to_no_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let cache = RuleCache::new(root.clone(), "test".to_string()).unwrap();
+        cache.persist_to_disk().unwrap();
+        cache.persist_to_disk().unwrap(); // ensure a stamped backup exists
+
+        // Flip one logical byte in the backup while keeping it valid JSON:
+        // under parse-only validation this tampered snapshot would load.
+        let backup = root.join("sites.json.bak");
+        let bytes = std::fs::read(&backup).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        value["config_hash"] =
+            serde_json::Value::String("tampered-backup".into());
+        std::fs::write(&backup, serde_json::to_string(&value).unwrap())
+            .unwrap();
+
+        // Tear the primary too, so the load path actually reaches the
+        // (now-tampered) backup fallback.
+        let sites = root.join("sites.json");
+        let bytes = std::fs::read(&sites).unwrap();
+        std::fs::write(&sites, &bytes[..bytes.len() / 2]).unwrap();
+
+        let reloaded = RuleCache::new(root, "test".to_string()).unwrap();
+        let health = reloaded.health_status();
+        assert!(
+            !health.healthy,
+            "a backup failing its CRC check must not be loaded"
+        );
+        assert_eq!(health.source, LoadSource::Fresh, "no-cache fallback path");
+        let reason = health.reason.unwrap_or_default();
+        assert!(
+            reason.contains("sites.json.bak") && reason.contains("crc32"),
+            "reason must name the backup and the expected/actual crc32: {reason}"
+        );
     }
 
     /// A tampered (valid JSON, wrong CRC) primary must not be rolled into
