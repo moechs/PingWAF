@@ -4,8 +4,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/deploy/compose/install.sh | bash
 #
 # Downloads the official compose file into ./pingwaf, writes a private .env with
-# the values below, then runs `docker compose up -d`. It never needs root and
-# never overwrites an existing .env: a second run is an upgrade, not a reset.
+# the values below, then runs `docker compose up -d`. It needs access to the
+# Docker daemon: run it with sudo, or as a user in the `docker` group — the
+# preflight below says which one is missing instead of failing inside compose.
+# It never overwrites an existing .env: a second run is an upgrade, not a reset.
 set -euo pipefail
 
 REPO="${PINGWAF_REPO:-shuaiZend/PingWAF}"
@@ -26,6 +28,11 @@ HTTP_PORT="${PINGWAF_HTTP_PORT:-80}"
 HTTPS_PORT="${PINGWAF_HTTPS_PORT:-443}"
 ADMIN_PORT="${PINGWAF_ADMIN_PORT:-9080}"
 GRPC_PORT="${PINGWAF_GRPC_PORT:-9090}"
+# Host port for the PostgreSQL container. Left empty it is 5432, unless another
+# PostgreSQL already listens there — then the first free port from 55432 is
+# used, because a machine that runs its own PostgreSQL is the common case and
+# the compose file would otherwise fail with a raw "address already in use".
+DB_PORT="${PINGWAF_DB_PORT:-}"
 FORCE=false
 DRY_RUN=false
 
@@ -51,6 +58,9 @@ Options:
   --https-port <port>      Host port for HTTPS (default: 443)
   --admin-port <port>      Host port for the console/API (default: 9080)
   --grpc-port <port>       Host port for the agent gRPC endpoint (default: 9090)
+  --db-port <port>         Host port for PostgreSQL (default: 5432, or the first
+                           free port at 55432+ when 5432 is already taken by a
+                           local PostgreSQL)
   --force                  Overwrite an existing .env. The data volumes and the
                            database are kept, and PINGWAF_SECRET_KEY / the admin
                            password are reused from the old .env when present.
@@ -141,6 +151,7 @@ while [[ $# -gt 0 ]]; do
         --https-port) require_value "$1" "${2:-}"; HTTPS_PORT="$2"; shift 2 ;;
         --admin-port) require_value "$1" "${2:-}"; ADMIN_PORT="$2"; shift 2 ;;
         --grpc-port) require_value "$1" "${2:-}"; GRPC_PORT="$2"; shift 2 ;;
+        --db-port) require_value "$1" "${2:-}"; DB_PORT="$2"; shift 2 ;;
         --force) FORCE=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -156,6 +167,7 @@ validate_port "--http-port" "$HTTP_PORT"
 validate_port "--https-port" "$HTTPS_PORT"
 validate_port "--admin-port" "$ADMIN_PORT"
 validate_port "--grpc-port" "$GRPC_PORT"
+[[ -n "$DB_PORT" ]] && validate_port "--db-port" "$DB_PORT"
 
 if [[ -z "$REF" ]]; then
     if [[ "$TAG" == "main" ]]; then
@@ -210,6 +222,21 @@ fi
 
 command -v docker >/dev/null 2>&1 || die "docker is not installed"
 docker compose version >/dev/null 2>&1 || die "docker compose v2 is required (the 'docker compose' plugin, not docker-compose)"
+# Talking to the daemon is a separate permission from having the CLI: a user who
+# is not in the `docker` group gets "permission denied" from deep inside
+# `compose up`, which reads as a broken installer instead of a missing group.
+if ! docker info >/dev/null 2>&1; then
+    cat >&2 <<EOF
+
+Cannot reach the Docker daemon as $(id -un).
+  Run the installer with sudo:
+    curl -fsSL https://raw.githubusercontent.com/${REPO}/main/deploy/compose/install.sh | sudo bash
+  or join the docker group once, then re-login (or run: newgrp docker):
+    sudo usermod -aG docker $(id -un)
+
+EOF
+    exit 1
+fi
 
 mkdir -p "$DIR"
 cd "$DIR"
@@ -263,6 +290,26 @@ if ! grep -q 'PINGWAF_SECRET_KEY' docker-compose.yml; then
     warn "you upgrade to a release whose compose file includes it (or set it in the service)."
 fi
 
+# A machine that already runs PostgreSQL owns 5432. Picking the next free port
+# is friendlier than a raw "address already in use" from the container runtime,
+# and the port is recorded in .env so later `docker compose` runs agree.
+port_in_use() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && exec 3>&- && return 0
+    return 1
+}
+if [[ -z "$DB_PORT" ]]; then
+    if port_in_use 5432; then
+        for candidate in $(seq 55432 55464); do
+            if ! port_in_use "$candidate"; then
+                DB_PORT="$candidate"
+                break
+            fi
+        done
+        [[ -n "$DB_PORT" ]] || die "127.0.0.1:5432 is taken and no free port was found in 55432-55464; pass --db-port"
+        warn "127.0.0.1:5432 is already in use (another PostgreSQL?); this instance will publish PostgreSQL on ${DB_PORT}."
+    fi
+fi
+
 umask 077
 {
     printf 'PINGWAF_TAG=%s\n' "$(env_value "$TAG")"
@@ -274,11 +321,28 @@ umask 077
     [[ "$HTTPS_PORT" != "443" ]] && printf 'PINGWAF_HTTPS_PORT=%s\n' "$HTTPS_PORT"
     [[ "$ADMIN_PORT" != "9080" ]] && printf 'PINGWAF_ADMIN_PORT=%s\n' "$ADMIN_PORT"
     [[ "$GRPC_PORT" != "9090" ]] && printf 'PINGWAF_GRPC_PORT=%s\n' "$GRPC_PORT"
+    [[ -n "$DB_PORT" ]] && printf 'POSTGRES_PORT=%s\n' "$DB_PORT"
 } > .env
 chmod 600 .env
 
 printf 'Starting PingWAF (image tag %s)\n' "$TAG"
-docker compose up -d
+if ! docker compose up -d; then
+    cat >&2 <<EOF
+
+The stack did not start.
+
+  Port already in use?  Re-run with --db-port / --http-port / --https-port /
+                        --admin-port / --grpc-port, or stop whatever owns the port.
+  Container name taken? Another PingWAF stack is running on this host (the compose
+                        file pins the names `pingwaf` and `pingwaf-postgres`).
+                        Stop it first: docker ps --filter name=pingwaf
+  Image pull failure?   Check outbound access to ghcr.io, then: docker compose pull
+  Everything else?      The error above is from the container runtime; the state is
+                        kept in $(pwd), so fix the cause and re-run: docker compose up -d
+
+EOF
+    exit 1
+fi
 
 cat <<EOF
 
@@ -290,6 +354,10 @@ PingWAF is starting.
             remote agents need them, and only after changing the password
   Account : ${ADMIN_EMAIL}
   Password: $([[ "$ADMIN_PASSWORD_GENERATED" == "true" ]] && echo "${ADMIN_PASSWORD} (generated — shown once, store it now)" || echo "stored in $(pwd)/.env")
+
+Before creating a site or a rule, sign in and change this password: a fresh
+database answers every write with 403 password_change_required until it is
+changed (PUT /api/v1/auth/password, or Settings -> Account in the console).
 
 The first boot pulls the image and initialises PostgreSQL; the console can take
 a minute to answer. Follow it with:

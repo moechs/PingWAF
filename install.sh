@@ -1091,6 +1091,9 @@ write_secret_env_file() {
 # key makes previously sealed credentials unreadable (there is no automatic
 # re-encryption), so back it up and do not regenerate it on upgrade.
 PINGWAF_SECRET_KEY=${PINGWAF_SECRET_KEY}
+# The console must not accept sign-ups unless the operator asks for them; the
+# unit reads this file, and an explicit `false` beats the built-in default.
+PINGWAF_ALLOW_REGISTRATION=false
 EOF
     )
     # systemd reads EnvironmentFile as root before dropping to User=pingwaf, so
@@ -1299,19 +1302,45 @@ EOF
 
 install_systemd
 
+# The package name moves with the distribution: Ubuntu 24.04 ships
+# postgresql-16, 26.04 ships 18, Debian tracks its own numbering. Printing the
+# one name that only worked on the machine the message was written on sends the
+# operator into "Unable to locate package".
+postgres_pkg_hint() {
+    local pkg=""
+    if has apt-get; then
+        pkg="$(apt-cache search --names-only '^postgresql-[0-9]+$' 2>/dev/null \
+            | awk '{print $1}' | sort -V | tail -n1)"
+        echo "sudo apt install ${pkg:-postgresql}"
+    elif has dnf; then
+        echo "sudo dnf install postgresql-server"
+    elif has yum; then
+        echo "sudo yum install postgresql-server"
+    elif has apk; then
+        echo "sudo apk add postgresql"
+    else
+        echo "(install PostgreSQL from your distribution's package manager)"
+    fi
+}
+
 # ─── PostgreSQL Check ─────────────────────────────────────────────────────────
+# Sets DB_READY so the caller can refuse to report a successful install on a
+# machine that cannot reach a database: exit 0 with an inactive service is
+# exactly what automation reads as "ready".
+DB_READY=false
 check_postgres() {
     info "Checking PostgreSQL availability..."
 
     if has psql; then
         if postgres_reachable "$DB_URL"; then
             success "PostgreSQL connection successful."
+            DB_READY=true
         else
             # Never echo the connection string: it carries the DB password.
             warn "psql found but cannot connect to: $(mask_db_url "$DB_URL")"
             echo ""
             echo "  To set up PostgreSQL:"
-            echo "    1. Install: sudo apt install postgresql-16"
+            echo "    1. Install: $(postgres_pkg_hint)"
             echo "    2. Create user & database:"
             echo "       sudo -u postgres createuser pingwaf"
             echo "       sudo -u postgres createdb -O pingwaf pingwaf"
@@ -1324,17 +1353,9 @@ check_postgres() {
         echo "  PingWAF requires PostgreSQL 14+. Install it with:"
         echo ""
         if [[ "$OS" == "linux" ]]; then
-            if has apt-get; then
-                echo "    sudo apt install postgresql-16"
-            elif has dnf; then
-                echo "    sudo dnf install postgresql-server"
-            elif has yum; then
-                echo "    sudo yum install postgresql-server"
-            else
-                echo "    (install PostgreSQL from your distribution's package manager)"
-            fi
+            echo "    $(postgres_pkg_hint)"
         else
-            echo "    brew install postgresql@16"
+            echo "    brew install postgresql"
         fi
         echo ""
         echo "  Then create the database:"
@@ -1347,8 +1368,16 @@ check_postgres() {
 
 if [[ "$MODE" == "agent" ]]; then
     info "Agent mode: skipping the PostgreSQL check, nodes keep no database."
+    DB_READY=true
 else
     check_postgres
+    if [[ "$DB_READY" != "true" ]]; then
+        echo ""
+        warn "Installation files are in place, but PingWAF cannot start without a database."
+        warn "Fix PostgreSQL as shown above, then: sudo systemctl enable --now ${SERVICE_NAME}"
+        echo ""
+        exit 1
+    fi
 fi
 
 # ─── Firewall Hints ───────────────────────────────────────────────────────────
@@ -1460,7 +1489,10 @@ else
     echo "    1. Ensure PostgreSQL is running and accessible"
     echo "    2. Edit ${CONFIG_DIR}/pingwaf.toml, then: sudo systemctl restart ${SERVICE_NAME}"
     echo "    3. Start the service: sudo systemctl enable --now ${SERVICE_NAME}"
-    echo "    4. Open the dashboard and add your first site"
+    echo "    4. Sign in and CHANGE the administrator password: a fresh database"
+    echo "       answers every write with 403 password_change_required until it is"
+    echo "       changed (console: Settings -> Account; API: PUT /api/v1/auth/password)"
+    echo "    5. Open the dashboard and add your first site"
     echo ""
     echo "  Upgrade / rollback / uninstall:"
     echo "    Upgrade:   re-run this installer with --version <new>; the config and the"
