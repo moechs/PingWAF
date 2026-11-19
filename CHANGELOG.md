@@ -10,6 +10,8 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+## [PingWAF 0.32.33] — 2026-11-19
+
 ### Fixed
 
 - **A body the parser could not read is no longer a weak signal.** The weak
