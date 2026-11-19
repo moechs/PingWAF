@@ -10,6 +10,48 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+## [PingWAF 0.32.34] — 2026-11-19
+
+### Fixed
+
+- **The install paths no longer depend on knowledge that only existed in the
+  code.** A clean Ubuntu 26.04 host was taken through all four documented
+  routes (manual compose, compose installer, unattended `install.sh`, manual
+  binary + systemd); each one failed once for a reason the docs did not cover:
+  - `docker compose` needs `sudo` or membership in the `docker` group, which
+    the quick start did not say and the compose installer did not check — it
+    died inside `compose up` with `permission denied … docker.sock`;
+  - a host that already runs PostgreSQL owns `127.0.0.1:5432`, so the compose
+    stack failed with `address already in use`. The installer now takes
+    `--db-port` and otherwise picks the first free port from 55432 and records
+    it as `POSTGRES_PORT`;
+  - the manual systemd steps named `PINGWAF_CONFIG` in the drop-in but never
+    created that file, so the service crash-looped on
+    `cannot read config file /etc/pingwaf/pingwaf.toml`;
+  - every route ends at `403 password_change_required` on the first write,
+    because a fresh database must have its seeded password changed first. The
+    quick start, the install page and both installers now say so, with the
+    `PUT /api/v1/auth/password` call and the console path.
+- **`install.sh` refuses to look successful when it cannot.** A missing or
+  unreachable PostgreSQL used to leave an inactive service behind an exit code
+  of 0, which automation reads as ready; it now exits non-zero after naming the
+  fix. The package hint no longer hard-codes `postgresql-16` (absent on Ubuntu
+  26.04, where `postgresql-18` is what apt has): it resolves the available
+  `postgresql-NN` and tells the operator to check rather than copy a version.
+  It also writes `PINGWAF_ALLOW_REGISTRATION=false`, matching the security
+  checklist the installer itself prints.
+
+### Changed
+
+- The manual (binary + systemd) path documents how to fetch a release artifact
+  for people who do not compile, and the drop-in example now carries
+  `PINGWAF_DATABASE_URL` so a non-default database does not silently fall back
+  to the default DSN.
+- The website mirrors the same four fixes in the install page, the quick start
+  and the deployment page (en/zh/ja; the fr/es pages were aligned to keep the
+  content contract green).
+
+
 ## [PingWAF 0.32.33] — 2026-11-19
 
 ### Fixed
