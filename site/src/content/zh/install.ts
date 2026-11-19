@@ -145,7 +145,7 @@ const install = {
         },
         {
           title: "登录控制台",
-          body: "打开 https://<主机>:9080，用 ADMIN_EMAIL / ADMIN_PASSWORD 登录（默认密码会在首次登录时强制修改），然后添加站点。",
+          body: "打开 https://<主机>:9080，用 ADMIN_EMAIL / ADMIN_PASSWORD 登录。新数据库上登录本身会成功，但在修改初始密码之前，任何写操作（建站点、建规则）都会返回 403 {\"code\":\"password_change_required\"}：可在控制台「设置 → 账户」修改，或调用 API——PUT /api/v1/auth/password 传入 current_password / new_password，成功返回 204 并吊销当前 token，之后需要用新密码重新登录。然后再添加站点。",
         }
       ],
       fields: [
@@ -198,10 +198,13 @@ const install = {
       upgradeTitle: "升级",
       upgradeBody:
         "拉取 .env 中指定标签的镜像并按原有卷重建容器——配置、数据与证书在重启后全部保留。需要可控升级时请固定镜像标签。",
-      upgradeCommand: "docker compose pull && docker compose up -d",
+      upgradeCommand:
+        "sudo docker compose pull && sudo docker compose up -d   # 已在 docker 组的用户可以去掉 sudo",
       requirements: [
         "Docker Engine 24+，并安装 Compose v2 插件（docker compose，而非旧的 docker-compose 命令）。",
+        "Docker 权限：不加 sudo（且不在 docker 组）时 compose 会报 permission denied … docker.sock。已在 docker 组的用户可以去掉 sudo。",
         "宿主机 80、443、9080、9090 端口空闲——或在下方字段中改用其他端口。",
+        "宿主机已有 PostgreSQL 占用 5432 时，安装器会自动从 55432 起选择空闲端口（也可显式传 --db-port），并写入 .env 的 POSTGRES_PORT。",
         "无需外部数据库：compose 文件自带 PostgreSQL 16 容器，并使用命名卷持久化。",
         "控制台首次启动以自签名证书提供 HTTPS。可在「设置 → Control plane HTTPS」上传正式证书，或设置 TLS_ENABLED=false 改用纯 HTTP。",
       ],
@@ -317,7 +320,7 @@ const install = {
     items: [
       {
         q: "安装器连不上 PostgreSQL",
-        a: "all-in-one 与 server 模式在首次启动前需要 PostgreSQL 14+。脚本在 psql 无法连接时会给出警告——请先安装数据库，创建 pingwaf 用户与数据库（createuser / createdb），然后重新运行安装器，或编辑 /etc/pingwaf/pingwaf.toml 后执行 systemctl restart pingwaf。",
+        a: "all-in-one 与 server 模式在首次启动前需要 PostgreSQL 14+。脚本在 psql 无法连接时会给出警告——请先安装数据库，创建 pingwaf 用户与数据库（createuser / createdb），然后重新运行安装器，或编辑 /etc/pingwaf/pingwaf.toml 后执行 systemctl restart pingwaf。包名随发行版而异（Ubuntu 24.04 是 postgresql-16，26.04 是 postgresql-18）——用 apt-cache search --names-only '^postgresql-[0-9]+$' 查询当前可用的包，不要照抄版本号。",
       },
       {
         q: "bind() failed on 0.0.0.0:80 或 :443",

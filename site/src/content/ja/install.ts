@@ -146,7 +146,7 @@ const install = {
         },
         {
           title: "コンソールにログイン",
-          body: "https://<ホスト>:9080 を開き、ADMIN_EMAIL / ADMIN_PASSWORD でログインします（既定パスワードは初回ログイン時に変更が必須）。その後サイトを追加します。",
+          body: "https://<ホスト>:9080 を開き、ADMIN_EMAIL / ADMIN_PASSWORD でログインします。新規データベースではログイン自体は成功しますが、初期パスワードを変更するまで、サイト追加やルール作成などすべての書き込み操作は 403 {\"code\":\"password_change_required\"} を返します。変更はコンソールの「設定 → アカウント」から、または API — PUT /api/v1/auth/password に current_password / new_password を渡して実行します（成功時は 204 を返し、現在のトークンは失効するため新しいパスワードで再ログインが必要）。その後サイトを追加します。",
         }
       ],
       fields: [
@@ -199,10 +199,13 @@ const install = {
       upgradeTitle: "アップグレード",
       upgradeBody:
         ".env のタグのイメージを取得し、同じボリュームでコンテナを再作成します — 設定・データ・証明書は再起動後も保持されます。計画的なアップグレードにはタグを固定してください。",
-      upgradeCommand: "docker compose pull && docker compose up -d",
+      upgradeCommand:
+        "sudo docker compose pull && sudo docker compose up -d   # docker グループ所属なら sudo は不要",
       requirements: [
         "Docker Engine 24+ と Compose v2 プラグイン（docker compose。旧 docker-compose コマンドではない）。",
+        "Docker の権限：sudo なし（かつ docker グループ未所属）では compose は permission denied … docker.sock で失敗します。docker グループ所属のユーザーは sudo を省けます。",
         "ホストの 80・443・9080・9090 ポートが空いていること — または下のフィールドで変更できます。",
+        "ホストですでに PostgreSQL が 5432 を使用している場合、インストーラは 55432 以上の空きポートを自動選択し（--db-port での明示指定も可）、.env の POSTGRES_PORT に書き込みます。",
         "外部データベースは不要：compose ファイルには PostgreSQL 16 コンテナが同梱され、名前付きボリュームで永続化されます。",
         "ダッシュボードは初回起動時、自己署名証明書で HTTPS を提供します。「設定 → Control plane HTTPS」から正式な証明書をアップロードするか、TLS_ENABLED=false で平文 HTTP にできます。",
       ],
@@ -329,7 +332,7 @@ const install = {
     items: [
       {
         q: "インストーラーが PostgreSQL に接続できない",
-        a: "all-in-one と server モードは初回起動前に PostgreSQL 14+ が必要です。psql が接続できない場合スクリプトは警告を出します — サーバーをインストールし、pingwaf ユーザーとデータベースを作成し（createuser / createdb）、インストーラーを再実行するか、/etc/pingwaf/pingwaf.toml を編集して systemctl restart pingwaf を実行してください。",
+        a: "all-in-one と server モードは初回起動前に PostgreSQL 14+ が必要です。psql が接続できない場合スクリプトは警告を出します — サーバーをインストールし、pingwaf ユーザーとデータベースを作成し（createuser / createdb）、インストーラーを再実行するか、/etc/pingwaf/pingwaf.toml を編集して systemctl restart pingwaf を実行してください。パッケージ名はディストリビューションによって異なります（Ubuntu 24.04 は postgresql-16、26.04 は postgresql-18）— バージョンを決め打ちせず apt-cache search --names-only '^postgresql-[0-9]+$' で確認してください。",
       },
       {
         q: "0.0.0.0:80 や :443 で bind() failed になる",

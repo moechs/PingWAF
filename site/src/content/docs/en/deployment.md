@@ -33,6 +33,11 @@ docker compose up -d
 
 The compose file starts `ghcr.io/shuaizend/pingwaf:latest` in all-in-one mode next to `postgres:16-alpine`, publishing `80`, `443`, `9080` and `9090`. The database port is bound to `127.0.0.1` by default.
 
+Two failures account for most first-run compose errors:
+
+- `permission denied while trying to connect to the Docker API at unix:///var/run/docker.sock` — your user is not in the `docker` group. Run `sudo docker compose up -d`, or add yourself to the group (`sudo usermod -aG docker $USER`, then log in again).
+- `failed to bind host port 127.0.0.1:5432/tcp: address already in use` — a local PostgreSQL already owns 5432. Set `POSTGRES_PORT=55432` in `.env` (or pass `--db-port 55432` to `deploy/compose/install.sh`, which picks a free port from 55432 up automatically) and start again.
+
 > Keep `hostname` stable. The control plane matches re-registrations by hostname plus API key, so a changing container ID leaves ghost offline agents behind.
 
 ## Source build
@@ -43,7 +48,7 @@ The compose file starts `ghcr.io/shuaizend/pingwaf:latest` in all-in-one mode ne
 | Node.js | 26.12.1+ | Builds the embedded dashboard; `web/.npmrc` sets `engine-strict=true` |
 | `protoc` | recent | gRPC code generation — **mandatory** |
 | `cmake` | recent | TLS backend build |
-| PostgreSQL | 14+ (16 recommended) | Control-plane datastore; the role needs DDL rights |
+| PostgreSQL | 14+; native installs use the distribution's package name (`postgresql-16` on Ubuntu 24.04, `postgresql-18` on 26.04) | Control-plane datastore; the role needs DDL rights |
 
 Without `protoc`, `pingwaf-proto` silently writes placeholder files and the downstream crates fail to compile — install it before you build.
 

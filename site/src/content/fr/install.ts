@@ -202,7 +202,9 @@ const install = {
       upgradeCommand: "docker compose pull && docker compose up -d",
       requirements: [
         "Docker Engine 24+ avec le plugin Compose v2 (docker compose, pas l'ancien binaire docker-compose).",
+        "Permissions Docker : sans sudo (et hors du groupe docker), compose échoue avec permission denied … docker.sock. Les membres du groupe docker peuvent omettre le sudo.",
         "Ports 80, 443, 9080 et 9090 libres sur l'hôte — ou remplacez-les dans les champs ci-dessous.",
+        "Si un PostgreSQL local occupe déjà le 5432, l'installateur choisit automatiquement un port libre à partir de 55432 (ou --db-port) et l'écrit dans POSTGRES_PORT du .env.",
         "Aucune base de données externe requise : le fichier compose embarque son propre conteneur PostgreSQL 16 avec des volumes nommés.",
         "Le tableau de bord sert HTTPS avec un certificat auto-signé au premier démarrage. Téléversez-en un vrai sous Paramètres → Control plane HTTPS, ou mettez TLS_ENABLED=false pour du HTTP simple.",
       ],

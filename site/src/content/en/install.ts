@@ -146,7 +146,7 @@ const install = {
         },
         {
           title: "Sign in",
-          body: "Open https://<host>:9080 and use ADMIN_EMAIL / ADMIN_PASSWORD (the default password must be changed at first sign-in). Then add a site.",
+          body: "Open https://<host>:9080 and use ADMIN_EMAIL / ADMIN_PASSWORD. On a fresh database sign-in succeeds, but every write (add a site, add a rule) answers 403 {\"code\":\"password_change_required\"} until the seeded password is changed: in the console under Settings → Account, or via the API — PUT /api/v1/auth/password with current_password / new_password returns 204 and revokes the current token, so sign in again with the new password. Then add a site.",
         }
       ],
       fields: [
@@ -199,10 +199,13 @@ const install = {
       upgradeTitle: "Upgrading",
       upgradeBody:
         "Pulls the image for the tag in your .env and recreates the container with the same volumes — configuration, data and certificates survive the restart. Pin the tag when you want controlled upgrades.",
-      upgradeCommand: "docker compose pull && docker compose up -d",
+      upgradeCommand:
+        "sudo docker compose pull && sudo docker compose up -d   # drop sudo if your user is in the docker group",
       requirements: [
         "Docker Engine 24+ with the Compose v2 plugin (docker compose, not the legacy docker-compose binary).",
+        "Docker permissions: without sudo (or membership in the docker group) compose fails with permission denied … docker.sock. Users in the docker group can drop the sudo.",
         "Ports 80, 443, 9080 and 9090 free on the host — or override them in the fields below.",
+        "If the host already runs PostgreSQL on 5432, the installer picks a free port from 55432 up (or accept --db-port) and writes it to POSTGRES_PORT in .env.",
         "No external database needed: the compose file ships its own PostgreSQL 16 container with named volumes.",
         "The dashboard serves HTTPS with a self-signed certificate on first boot. Upload a real one under Settings → Control plane HTTPS, or set TLS_ENABLED=false for plain HTTP.",
       ],
@@ -328,7 +331,7 @@ const install = {
     items: [
       {
         q: "The installer cannot reach PostgreSQL",
-        a: "all-in-one and server modes need PostgreSQL 14+ before first boot. The script warns when psql cannot connect — install the server, create the pingwaf user and database (createuser / createdb), then re-run the installer or edit /etc/pingwaf/pingwaf.toml and run systemctl restart pingwaf.",
+        a: "all-in-one and server modes need PostgreSQL 14+ before first boot. The script warns when psql cannot connect — install the server, create the pingwaf user and database (createuser / createdb), then re-run the installer or edit /etc/pingwaf/pingwaf.toml and run systemctl restart pingwaf. The package name follows the distribution (postgresql-16 on Ubuntu 24.04, postgresql-18 on 26.04) — check with apt-cache search --names-only '^postgresql-[0-9]+$' instead of hardcoding a version.",
       },
       {
         q: "bind() failed on 0.0.0.0:80 or :443",

@@ -33,6 +33,11 @@ docker compose up -d
 
 compose 文件以 all-in-one 模式启动 `ghcr.io/shuaizend/pingwaf:latest`，并与 `postgres:16-alpine` 一起运行，发布 `80`、`443`、`9080` 与 `9090`。数据库端口默认只绑定 `127.0.0.1`。
 
+首次用 compose 时最常见的两类报错：
+
+- `permission denied while trying to connect to the Docker API at unix:///var/run/docker.sock`——当前用户不在 `docker` 组。改用 `sudo docker compose up -d`，或把用户加入 `docker` 组（`sudo usermod -aG docker $USER`，重新登录后生效）。
+- `failed to bind host port 127.0.0.1:5432/tcp: address already in use`——本机已有 PostgreSQL 占用 5432。在 `.env` 中设置 `POSTGRES_PORT=55432`（或给 `deploy/compose/install.sh` 传 `--db-port 55432`，它会自动从 55432 起选择空闲端口），再重新启动。
+
 > `hostname` 必须保持稳定。控制面按 hostname 与 API key 匹配重新注册，容器 ID 变化会留下「幽灵离线节点」。
 
 ## 源码构建
@@ -43,7 +48,7 @@ compose 文件以 all-in-one 模式启动 `ghcr.io/shuaizend/pingwaf:latest`，�
 | Node.js | 26.12.1+ | 构建内嵌控制台，`web/.npmrc` 设置了 `engine-strict=true` |
 | `protoc` | 较新版本 | gRPC 代码生成——**必需** |
 | `cmake` | 较新版本 | 构建 TLS 后端 |
-| PostgreSQL | 14+（推荐 16） | 控制面存储，角色需要建表权限 |
+| PostgreSQL | 14+；本机安装以发行版包名为准（Ubuntu 24.04 是 `postgresql-16`，26.04 是 `postgresql-18`） | 控制面存储，角色需要建表权限 |
 
 缺少 `protoc` 时 `pingwaf-proto` 会静默写入占位文件，随后下游 crate 编译失败——构建前先安装它。
 
