@@ -2775,6 +2775,35 @@ struct DeferredBody {
     deadline: Instant,
 }
 
+/// Whether a request whose scan surface was truncated must be answered `413`.
+///
+/// Three exemptions, each with a reason: a `block` verdict keeps its own path
+/// (the block page says more), observation mode never blocks, and the policy
+/// has to actually ask for rejection. Truncation is otherwise the
+/// "pad past the inspection surface" bypass, so the default answer is yes.
+fn truncated_request_rejects(
+    policy: TruncatedBodyPolicy,
+    stage: BodyStagePolicy,
+    action_is_block: bool,
+    observe: bool,
+) -> bool {
+    !observe
+        && !action_is_block
+        && (policy == TruncatedBodyPolicy::Reject
+            || stage == BodyStagePolicy::Strict)
+}
+
+/// Whether a body-stage failure may reject the request.
+///
+/// Observation mode promises "record, never block", so a site in it releases
+/// what it staged and lets the request through even under `strict`. The
+/// decision is a pure function so both body-stage rejections
+/// (`408` on the stage deadline, `413` on the inspection cap) share one rule
+/// and one test.
+fn body_stage_rejects(policy: BodyStagePolicy, observing: bool) -> bool {
+    policy == BodyStagePolicy::Strict && !observing
+}
+
 /// Per-request ACME http-01 path prefix. Requests under it are never
 /// evaluated: blocking or challenging a CA validation request would make
 /// the site's certificate unissuable.
@@ -3414,9 +3443,20 @@ enum BodyStagePolicy {
 impl BodyStagePolicy {
     fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
+            "" => Self::Balanced,
+            "balanced" => Self::Balanced,
             "strict" | "fail_closed" | "fail-closed" => Self::Strict,
             "throughput" => Self::Throughput,
-            _ => Self::Balanced,
+            // A typo used to select the most permissive tier silently. The
+            // operator asked for something; give them the safe reading and
+            // tell them the value was not understood.
+            other => {
+                warn!(
+                    value = %other,
+                    "unknown body_stage_policy; treating it as strict"
+                );
+                Self::Strict
+            },
         }
     }
 }
@@ -3433,8 +3473,17 @@ enum EncodedBodyPolicy {
 impl EncodedBodyPolicy {
     fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
+            "" | "inspect_wire" | "inspect-wire" | "monitor" => {
+                Self::InspectWire
+            },
             "reject" | "fail_closed" | "fail-closed" => Self::Reject,
-            _ => Self::InspectWire,
+            other => {
+                warn!(
+                    value = %other,
+                    "unknown encoded_body_policy; rejecting encoded bodies"
+                );
+                Self::Reject
+            },
         }
     }
 }
@@ -3456,8 +3505,18 @@ enum TruncatedBodyPolicy {
 impl TruncatedBodyPolicy {
     fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
+            // Unset keeps the documented default: forward, but emit an event.
+            "" | "monitor" => Self::Monitor,
             "reject" | "fail_closed" | "fail-closed" => Self::Reject,
-            _ => Self::Monitor,
+            // `strict` is the natural typo for a fail-closed policy and used
+            // to select `monitor`, i.e. the opposite of what was asked.
+            other => {
+                warn!(
+                    value = %other,
+                    "unknown truncated_body_policy; rejecting truncated requests"
+                );
+                Self::Reject
+            },
         }
     }
 }
@@ -3653,7 +3712,7 @@ fn build_site_engine(cfg: &CacheWafConfig) -> WafEngine {
         rules,
         enable_managed_rules: true,
         fast_path_block_on_critical: true,
-        inspection_deadline: WafEngineConfig::default().inspection_deadline,
+        inspection_deadline: pingwaf_waf::engine::DEFAULT_INSPECTION_DEADLINE,
     };
     WafEngine::new(&engine_config)
 }
@@ -4241,15 +4300,27 @@ impl WafPlugin {
         // passing it silently.
         let scan_incomplete = verdict.details.contains("request=truncated")
             || verdict.details.contains("request=deadline");
-        if verdict.action == WafAction::Pass
-            && scan_incomplete
-            && (self.truncated_body_policy == TruncatedBodyPolicy::Reject
-                || self.body_stage_policy == BodyStagePolicy::Strict)
+        // Every verdict except Block passes the request on: Pass forwards it
+        // and Monitor forwards it after logging. Both are exactly the shape a
+        // truncation policy exists to stop, so the gate must not ask for
+        // `Pass` alone — a truncated request almost always scores a weak
+        // Monitor hit, and the 413 never fired (2026-11-19 review, DR32-03).
+        // A Block verdict keeps its own path: the block page and its event
+        // say more than a 413.
+        // Observation mode records and forwards, always: its block/challenge
+        // verdicts are already demoted to monitor, so rejecting here would
+        // reintroduce blocking under the one mode that promises none
+        // (review of 0.32.33, H2). `observe` is the *site's* flag — the same
+        // signal the demotion above uses — not the plugin's global mode: a
+        // site can be in observation while the plugin default stays `block`.
+        if scan_incomplete
+            && truncated_request_rejects(
+                self.truncated_body_policy,
+                self.body_stage_policy,
+                verdict.action == WafAction::Block,
+                observe,
+            )
         {
-            // A truncated-but-clean request is the bypass shape: reject it
-            // and keep the reason visible in the event stream. Block/Monitor
-            // verdicts keep their own path below (the block page and its
-            // event matter more than the 413).
             if !defer_events {
                 Self::log_event(
                     site_id,
@@ -4550,7 +4621,8 @@ impl TryFrom<&PluginConf> for WafPlugin {
             rules: Vec::new(),
             enable_managed_rules: true,
             fast_path_block_on_critical: true,
-            inspection_deadline: WafEngineConfig::default().inspection_deadline,
+            inspection_deadline:
+                pingwaf_waf::engine::DEFAULT_INSPECTION_DEADLINE,
         };
 
         Ok(Self {
@@ -5708,7 +5780,11 @@ impl Plugin for WafPlugin {
             && !entry.passthrough
             && Instant::now() >= entry.deadline
         {
-            if self.body_stage_policy == BodyStagePolicy::Strict {
+            let observing = entry
+                .deferred
+                .as_ref()
+                .is_some_and(|deferred| deferred.observe);
+            if body_stage_rejects(self.body_stage_policy, observing) {
                 warn!(
                     request_id = %request_id,
                     "body stage timeout; rejecting (strict policy)"
@@ -5846,7 +5922,12 @@ impl Plugin for WafPlugin {
                         *body = Some(Bytes::new());
                     },
                     StageAction::Flush(staged) => {
-                        if self.body_stage_policy == BodyStagePolicy::Strict {
+                        let observing = entry
+                            .deferred
+                            .as_ref()
+                            .is_some_and(|deferred| deferred.observe);
+                        if body_stage_rejects(self.body_stage_policy, observing)
+                        {
                             warn!(
                                 request_id = %request_id,
                                 "body exceeded the inspection cap; rejecting (strict policy)"
@@ -6578,6 +6659,60 @@ ml_threshold = 0.75
         assert_eq!(
             TruncatedBodyPolicy::parse("FAIL-CLOSED"),
             TruncatedBodyPolicy::Reject
+        );
+        // Unknown values fail closed: `strict` is the natural typo for a
+        // fail-closed policy and used to select `monitor`, the opposite.
+        assert_eq!(
+            TruncatedBodyPolicy::parse("strict"),
+            TruncatedBodyPolicy::Reject
+        );
+        assert_eq!(
+            TruncatedBodyPolicy::parse("rejcet"),
+            TruncatedBodyPolicy::Reject
+        );
+    }
+
+    /// The 413 gate: rejection only when a policy asks for it, never for a
+    /// block verdict and never in observation mode (review of 0.32.33, H2).
+    #[test]
+    fn truncated_requests_are_rejected_only_when_the_policy_says_so() {
+        use BodyStagePolicy::{Balanced, Strict};
+        use TruncatedBodyPolicy::{Monitor as TruncMon, Reject};
+
+        // Default policy, block-mode site: forward with an event.
+        assert!(!truncated_request_rejects(TruncMon, Balanced, false, false));
+        // Either knob rejects.
+        assert!(truncated_request_rejects(Reject, Balanced, false, false));
+        assert!(truncated_request_rejects(TruncMon, Strict, false, false));
+        // A block verdict keeps its own page.
+        assert!(!truncated_request_rejects(Reject, Strict, true, false));
+        // Observation mode forwards even under the strictest combination.
+        assert!(!truncated_request_rejects(Reject, Strict, false, true));
+    }
+
+    /// Body-stage failures follow the same rule: observation mode releases
+    /// what it staged instead of answering 408/413.
+    #[test]
+    fn body_stage_never_rejects_in_observation_mode() {
+        use BodyStagePolicy::{Balanced, Strict, Throughput};
+
+        assert!(body_stage_rejects(Strict, false));
+        assert!(!body_stage_rejects(Strict, true));
+        assert!(!body_stage_rejects(Balanced, false));
+        assert!(!body_stage_rejects(Throughput, false));
+    }
+
+    #[test]
+    fn body_and_encoded_policies_fail_closed_on_unknown_values() {
+        assert_eq!(BodyStagePolicy::parse(""), BodyStagePolicy::Balanced);
+        assert_eq!(BodyStagePolicy::parse("strictt"), BodyStagePolicy::Strict);
+        assert_eq!(
+            EncodedBodyPolicy::parse(""),
+            EncodedBodyPolicy::InspectWire
+        );
+        assert_eq!(
+            EncodedBodyPolicy::parse("rejcet"),
+            EncodedBodyPolicy::Reject
         );
     }
 
