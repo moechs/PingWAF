@@ -10,6 +10,54 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A body the parser could not read is no longer a weak signal.** The weak
+  (2-point) weighting for body blobs is chosen by the *container*, and the
+  container is attacker-controlled: one missing brace in a JSON body, a
+  multipart part declaring `application/octet-stream`, or a payload past the
+  512th form parameter all landed in the blob path, so a quoted SQL statement
+  scored 2 and the request passed. Blob content is now scored normally when it
+  is textual and was not unpacked into members; genuine binary uploads keep
+  the weak weighting (verified against the Aliyun form+JSON false positive).
+- `truncated_body_policy = reject` and `body_stage_policy = strict` now answer
+  `413` for a truncated request whose verdict is `monitor`, not only `pass` —
+  a truncated request almost always scores a weak monitor hit, so the policy
+  previously never fired.
+  The rejection never applies to a `block` verdict (the block page says more)
+  and never on a site in observation mode, whose contract is to record and
+  forward.
+- An uploaded file stays a weak signal: a `.sql` dump, an access log or an
+  ASCII-heavy PDF that an operator uploads must not block on strings those
+  files legitimately contain. Only content the container *hid* from the parser
+  is scored normally.
+- JSON extraction stops at a member budget; members past it used to be dropped
+  without a mark, so their payload was only weakly scanned. The blob is now
+  scored normally when extraction was partial, the same rule the form cap got.
+- A multipart part longer than the per-value cap is reported as a
+  `multipart-values` cut, not as `multipart-parts`: the first says one field
+  was long, the second says the part list itself was truncated.
+- The inspection deadline is now actually enabled (20 ms default) instead of
+  being constructed from a zeroed default at every call site, so
+  `request=deadline` and the `body_scan_deadline` event can happen.
+- An unknown value in `body_stage_policy`, `truncated_body_policy` or
+  `encoded_body_policy` fails closed and warns; `truncated_body_policy =
+  "strict"` used to select `monitor`, the opposite of what was asked.
+- The agent validates the `.bak` rule snapshot against its own CRC before
+  loading it; a tampered backup degrades to a fresh pull from the control
+  plane instead of installing unverified rules.
+- A `ship_logs` stream re-checks the agent's site visibility every 60 s, and a
+  revoked key or deleted agent ends the stream — the snapshot used to live for
+  the whole connection, so revocation did not apply to it.
+  `ship_cert_events` had the same shape and now shares the refresh.
+- The inspection deadline is documented as on by default (20 ms) in
+  `WafEngineConfig::default`, the engine's own doc comment and the plugin
+  reference, instead of three places disagreeing about whether it runs.
+- Restoring or rolling back a configuration reports how many rows it skipped
+  (and why) instead of dropping them silently, so a rollback that cannot
+  reproduce the old rule set says so.
+
+
 ## [PingWAF 0.32.32] — 2026-11-18
 
 ### Fixed
