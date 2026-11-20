@@ -751,8 +751,14 @@ impl ControlPlaneClient {
                 // and the control-plane link would never recover. Ship a
                 // deterministic prefix and say it is partial, so the server
                 // keeps the rows it did not see.
-                let (blocked_ips, blocked_ips_truncated) =
-                    heartbeat_blocked_ips(rule_cache.blocked_ips_snapshot());
+                // Page directly from the cache: only the bounded prefix is
+                // cloned, never the whole map (see `blocked_ips_page`).
+                let (blocked_ip_entries, blocked_ips_truncated) =
+                    rule_cache.blocked_ips_page(MAX_HEARTBEAT_BLOCKED_IPS);
+                let blocked_ips: Vec<proto::BlockedIp> = blocked_ip_entries
+                    .iter()
+                    .map(to_proto_blocked_ip)
+                    .collect();
                 let config_apply_error = rule_cache.config_apply_error();
                 let hb = proto::AgentHeartbeat {
                     agent_id: agent_id.clone(),
@@ -1867,11 +1873,15 @@ fn to_proto_sample(sample: &HostSample) -> proto::HostSample {
     }
 }
 
-/// Convert a dynamic IP block into its wire representation.
-/// Bounds the block list shipped in one heartbeat.
+/// Sort a block list into a deterministic prefix and report whether anything
+/// was dropped; the control plane uses the flag to keep the rows it did not
+/// see this round.
 ///
-/// Returns the deterministic prefix and whether anything was dropped; the
-/// control plane uses the flag to keep the rows it did not see this round.
+/// Test-only reference: the production heartbeat now calls
+/// `RuleCache::blocked_ips_page` directly. This is the original
+/// "clone-everything, sort, truncate" implementation kept so tests can assert
+/// the page produces an identical prefix.
+#[cfg(test)]
 fn heartbeat_blocked_ips(
     mut entries: Vec<BlockedIpEntry>,
 ) -> (Vec<proto::BlockedIp>, bool) {
@@ -1884,6 +1894,7 @@ fn heartbeat_blocked_ips(
     (entries.iter().map(to_proto_blocked_ip).collect(), truncated)
 }
 
+/// Convert a dynamic IP block into its wire representation.
 fn to_proto_blocked_ip(entry: &BlockedIpEntry) -> proto::BlockedIp {
     proto::BlockedIp {
         ip: entry.ip.clone(),

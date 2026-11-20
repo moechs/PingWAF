@@ -10,6 +10,26 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+## [PingWAF 0.32.35] — 2026-11-21
+
+### Performance
+
+- **Reduced allocation pressure on the agent's dynamic-block path.** Three
+  targeted changes to how the data-plane agent reads and persists IP blocks,
+  verified by 110 unit tests (4 new) and the full `make lint` gate, with no
+  change to blocking, heartbeat, or persistence semantics:
+  - Rule-snapshot persistence now rewrites `blocked_ips.json` only when the
+    block map changed (or the file is missing), instead of cloning and
+    serializing the whole map on every rule persist;
+  - The heartbeat block report selects the bounded prefix it actually ships
+    through a bounded heap, so it no longer clones and sorts the entire block
+    map (up to 100k entries) just to truncate it to 4096 rows;
+  - Exact-address block lookups reuse a per-thread key buffer, removing the
+    per-request `format!` allocation on the hot path, with a re-entrancy-safe
+    fallback.
+
+  Pingora remains at 0.9.1; no dependency changes.
+
 ## [PingWAF 0.32.34] — 2026-11-19
 
 ### Fixed
