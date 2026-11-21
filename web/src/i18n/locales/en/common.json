@@ -1740,7 +1740,7 @@
         "cpuHint": "Total CPU utilisation across all cores.",
         "memory": "Memory",
         "memoryPercent": "Memory usage",
-        "memoryHint": "Area: used memory as a share of the total. Line: the agent process's own RSS.",
+        "memoryHint": "Area: host memory in use. Line: the agent process's own RSS. Both in MB, directly comparable.",
         "disk": "Disk",
         "processes": "Processes",
         "tcpConnections": "{{count}} TCP connections",

@@ -60,7 +60,7 @@ interface ProbePoint {
   load1: number | null
   load5: number | null
   load15: number | null
-  memoryPercent: number | null
+  memoryUsed: number | null
   processRss: number | null
   rxRate: number | null
   txRate: number | null
@@ -188,16 +188,6 @@ export function AgentProbePanel({ agentId }: { agentId: string }) {
             <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border-line)" vertical={false} />
             <XAxis dataKey="time" tick={axisTick} tickLine={false} axisLine={{ stroke: 'var(--color-border-line)' }} minTickGap={28} />
             <YAxis
-              yAxisId="pct"
-              tick={axisTick}
-              tickLine={false}
-              axisLine={false}
-              domain={[0, 100]}
-              tickFormatter={(v: number) => `${v}%`}
-            />
-            <YAxis
-              yAxisId="rss"
-              orientation="right"
               tick={axisTick}
               tickLine={false}
               axisLine={false}
@@ -206,9 +196,8 @@ export function AgentProbePanel({ agentId }: { agentId: string }) {
             <Tooltip contentStyle={tooltipStyle} formatter={memoryTooltipValue} />
             <Legend wrapperStyle={{ fontSize: 12 }} iconType="circle" formatter={(value) => (value === 'processRss' ? t('pages.agents.probe.memoryProcessRss') : value)} />
             <Area
-              yAxisId="pct"
               type="monotone"
-              dataKey="memoryPercent"
+              dataKey="memoryUsed"
               name={t('pages.agents.probe.memory')}
               stroke="#0051c3"
               strokeWidth={2}
@@ -216,7 +205,6 @@ export function AgentProbePanel({ agentId }: { agentId: string }) {
               connectNulls
             />
             <Line
-              yAxisId="rss"
               type="monotone"
               dataKey="processRss"
               name="processRss"
@@ -348,7 +336,7 @@ export function buildProbePoints(samples: HostSample[]): ProbePoint[] {
       load1: sample.load1,
       load5: sample.load5,
       load15: sample.load15,
-      memoryPercent: percent(sample.memory_used_bytes, sample.memory_total_bytes),
+      memoryUsed: sample.memory_used_bytes,
       processRss: sample.process_rss_bytes,
       rxRate: rate(sample.net_rx_bytes, previous?.net_rx_bytes ?? null),
       txRate: rate(sample.net_tx_bytes, previous?.net_tx_bytes ?? null),
@@ -360,13 +348,10 @@ export function buildProbePoints(samples: HostSample[]): ProbePoint[] {
  * Tooltip value for the memory chart: the RSS series is absolute bytes (so it
  * must never be divided by 100 like the percentage series).
  */
-export function memoryTooltipValue(value: unknown, name: unknown): string {
+export function memoryTooltipValue(value: unknown, _name: unknown): string {
   // recharts calls formatter(value, name, item, ...): the FIRST argument is the
-  // value, the SECOND is the series name/dataKey. RSS is absolute bytes and
-  // must never be divided by 100 like the percentage series.
-  return name === 'processRss'
-    ? formatSize(Number(value ?? 0))
-    : formatPercent(Number(value ?? 0) / 100)
+  // value. Both memory series are in bytes now, so format uniformly as a size.
+  return formatSize(Number(value ?? 0))
 }
 
 /** Newest sample by `sampled_at`, which is what the API returns first anyway. */

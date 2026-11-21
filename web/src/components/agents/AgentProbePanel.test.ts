@@ -32,10 +32,10 @@ function sample(overrides: Partial<HostSample> = {}): HostSample {
 }
 
 describe('buildProbePoints', () => {
-  it('maps both series: host memory percent and process RSS', () => {
+  it('maps both series: host memory bytes and process RSS', () => {
     const points = buildProbePoints([sample()])
     expect(points).toHaveLength(1)
-    expect(points[0].memoryPercent).toBe(50)
+    expect(points[0].memoryUsed).toBe(4_294_967_296)
     expect(points[0].processRss).toBe(65_536_000)
   })
 
@@ -43,7 +43,7 @@ describe('buildProbePoints', () => {
     const points = buildProbePoints([
       sample({ process_rss_bytes: null }),
     ])
-    expect(points[0].memoryPercent).toBe(50)
+    expect(points[0].memoryUsed).toBe(4_294_967_296)
     expect(points[0].processRss).toBeNull()
   })
 
@@ -67,12 +67,12 @@ describe('memoryTooltipValue', () => {
     expect(memoryTooltipValue(null, 'processRss')).toBe('0 B')
   })
 
-  it('formats the memory percentage series as a percentage', () => {
-    expect(memoryTooltipValue(50, 'memoryPercent')).toBe('50.0%')
+  it('formats the host memory series as bytes too', () => {
+    expect(memoryTooltipValue(4_294_967_296, 'memoryUsed')).toBe('4.0 GB')
   })
 
   it('renders a real value for BOTH series (no —, no absurd percentage)', () => {
-    expect(memoryTooltipValue(50, 'memoryPercent')).not.toBe('—')
+    expect(memoryTooltipValue(4_294_967_296, 'memoryUsed')).not.toBe('—')
     expect(memoryTooltipValue(65_536_000, 'processRss')).not.toContain('%')
   })
 })

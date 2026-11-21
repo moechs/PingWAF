@@ -1740,7 +1740,7 @@
         "cpuHint": "全コア合計の CPU 使用率。",
         "memory": "メモリ",
         "memoryPercent": "メモリ使用率",
-        "memoryHint": "面：総メモリに占める使用量の割合。折れ線：エージェントプロセス自身の RSS。",
+        "memoryHint": "面：ホストの使用中メモリ。折れ線：エージェントプロセス自身の RSS。単位はいずれも MB で直接比較可能。",
         "disk": "ディスク",
         "processes": "プロセス数",
         "tcpConnections": "TCP 接続 {{count}} 件",
