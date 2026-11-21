@@ -26,6 +26,18 @@ path = "src/main.rs"
 name = "pingwaf"
 path = "src/main.rs"
 
+# Edge-agent-only build: the data plane and its rule cache, without the
+# control plane (PostgreSQL, the REST API and the embedded dashboard). It is
+# compiled as its own release artifact so an agent node does not download or
+# map the control plane's code and assets; `--mode agent` in install.sh fetches
+# it. `required-features` keeps a plain `cargo build` from silently producing a
+# fat agent binary, and `edge` only gates code — it does not change the
+# dependency graph, so the two builds share the cargo cache.
+[[bin]]
+name = "pingwaf-agent"
+path = "src/edge_main.rs"
+required-features = ["edge"]
+
 [lints.clippy]
 # Set the unwrap_used lint level to deny
 unwrap_used = "deny"
@@ -156,6 +168,13 @@ tracing = [
 ]
 full = ["tracing", "imageoptim"]
 perf = ["pyro", "full"]
+# Edge-agent build (`--bin pingwaf-agent --features edge`). It compiles the
+# data plane and its rule cache only: the control-plane modules and the pingap
+# admin plugin (which embeds the dashboard) are `#[cfg(not(feature = "edge"))]`,
+# so the linker never pulls in PostgreSQL, the REST API or the web assets. The
+# feature deliberately changes no dependency, which keeps the release build's
+# cargo cache warm for both binaries.
+edge = []
 
 
 [dev-dependencies]

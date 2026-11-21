@@ -46,7 +46,7 @@ const install = {
       {
         id: "agent",
         label: "Agent",
-        body: "Un nœud du plan de données qui proxifie le trafic et se connecte au plan de contrôle via gRPC. Ne conserve aucune base de données ; requiert --server-url et une clé d'enrôlement.",
+        body: "Un nœud du plan de données qui proxifie le trafic et se connecte au plan de contrôle via gRPC. L'installateur récupère la version agent seule (sans base de données, API REST ni tableau de bord) ; requiert --server-url et une clé d'enrôlement.",
         flags: ["--mode agent", "--server-url https://cp:9090", "--api-key pwk_…"],
       },
     ],

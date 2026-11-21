@@ -69,7 +69,7 @@ curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh -
 curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh | bash -s -- --mode all-in-one
 ```
 
-参数：`--mode all-in-one|server|agent`，`--no-systemd` 跳过单元安装，`--admin-email` / `--admin-password` / `--tls-sans`（或对应的 `PINGWAF_*` 环境变量）免提问写入初始设置，`--dry-run` 只预览安装计划不做改动。
+Agent 模式下安装器会下载仅数据面的归档（`pingwaf-agent-<os>-<arch>`，不含 PostgreSQL、REST API 与控制台），并以 `/usr/local/bin/pingwaf` 名称安装，单元与命令保持不变。参数：`--mode all-in-one|server|agent`，`--no-systemd` 跳过单元安装，`--admin-email` / `--admin-password` / `--tls-sans`（或对应的 `PINGWAF_*` 环境变量）免提问写入初始设置，`--dry-run` 只预览安装计划不做改动。
 
 ## 配置优先级
 

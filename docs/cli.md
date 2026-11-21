@@ -44,6 +44,29 @@ for) with `PINGWAF_CONFIG=/etc/pingwaf/pingwaf.toml` set in the unit;
 `systemctl restart pingwaf` applies any configuration change, and
 `journalctl -u pingwaf -e` shows the service logs.
 
+### The agent-only build (`pingwaf-agent`)
+
+Releases also ship `pingwaf-agent`, built from the same source with the
+control plane compiled out (`--bin pingwaf-agent --features edge`). It is the
+data plane and nothing else: no PostgreSQL, no REST API, no embedded
+dashboard, so an edge node downloads and maps far less code. `install.sh
+--mode agent` fetches that archive and installs it as `/usr/local/bin/pingwaf`,
+so the unit and every command below stay unchanged; `pingwaf --version` marks
+it with `edge`. Both spellings work:
+
+```bash
+pingwaf-agent agent --server-url https://control-plane:9090 --api-key KEY
+pingwaf-agent --server-url https://control-plane:9090 --api-key KEY
+```
+
+The `agent` subcommand is accepted because a self-upgrade replaces the file
+with the control plane's all-in-one build, which still needs it. That also
+means `auto_upgrade` trades the smaller build for the full one: it follows the
+control plane's executable, so re-run the installer in agent mode to get the
+agent-only artifact back. The agent-only build has no
+`server`/`all-in-one`/maintenance subcommands; run those from the full
+`pingwaf` binary.
+
 ## Global options
 
 `server` and `all-in-one` accept these options (the `agent` has its own set,

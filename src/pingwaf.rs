@@ -26,8 +26,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pingap_cache::new_storage_clear_service;
 
 use crate::certificates::{new_certificate_provider, try_update_certificates};
+use crate::cli::AgentOpts;
+#[cfg(not(feature = "edge"))]
 use crate::cli::{
-    AgentOpts, AllInOneOpts, CommonOpts, PingWafCli, PingWafCommand, ServerOpts,
+    AllInOneOpts, CommonOpts, PingWafCli, PingWafCommand, ServerOpts,
 };
 use crate::config_manager::try_init_memory_config_manager;
 use crate::locations::{new_location_provider, try_init_locations};
@@ -55,20 +57,24 @@ use pingwaf_agent::cache::{
     ResponseReplaceConfig, RuleCache, SslConfig,
 };
 use pingwaf_agent::config::AgentConfig;
+#[cfg(not(feature = "edge"))]
 use pingwaf_server::ServerConfig;
 use tracing::{error, info, warn};
 
 /// The operating mode for PingWAF.
 pub enum RunMode {
     /// Control plane only: REST API + gRPC server + PostgreSQL
+    #[cfg(not(feature = "edge"))]
     Server(Box<ServerConfig>),
     /// Data plane only: connects to a remote control plane
     Agent(Box<AgentConfig>),
     /// Both control plane and data plane in a single process
+    #[cfg(not(feature = "edge"))]
     AllInOne(Box<ServerConfig>, Box<AgentConfig>),
 }
 
 /// Convert CLI server options into a `ServerConfig`.
+#[cfg(not(feature = "edge"))]
 fn server_config_from_opts(opts: &ServerOpts) -> ServerConfig {
     let mut config = ServerConfig::from_env();
     // CLI flags override environment
@@ -87,6 +93,7 @@ fn server_config_from_opts(opts: &ServerOpts) -> ServerConfig {
 }
 
 /// Convert CLI all-in-one options into a `ServerConfig`.
+#[cfg(not(feature = "edge"))]
 fn server_config_from_all_in_one(opts: &AllInOneOpts) -> ServerConfig {
     let mut config = ServerConfig::from_env();
     config.db_url = opts.common.db_url.clone();
@@ -107,6 +114,7 @@ fn server_config_from_all_in_one(opts: &AllInOneOpts) -> ServerConfig {
 ///
 /// The SAN list is only replaced when the operator actually spelled one out,
 /// so the built-in defaults survive an invocation without `--tls-sans`.
+#[cfg(not(feature = "edge"))]
 fn apply_tls_opts(config: &mut ServerConfig, opts: &CommonOpts) {
     config.tls_enabled = opts.tls_enabled;
     if !opts.tls_sans.is_empty() {
@@ -116,7 +124,7 @@ fn apply_tls_opts(config: &mut ServerConfig, opts: &CommonOpts) {
 }
 
 /// Convert CLI agent options into an `AgentConfig`.
-fn agent_config_from_opts(opts: &AgentOpts) -> AgentConfig {
+pub(crate) fn agent_config_from_opts(opts: &AgentOpts) -> AgentConfig {
     AgentConfig {
         server_url: opts.server_url.clone(),
         api_key: opts.api_key.clone(),
@@ -147,6 +155,7 @@ fn agent_config_from_opts(opts: &AgentOpts) -> AgentConfig {
 /// at boot (an explicitly configured certificate file is trusted directly;
 /// otherwise `run` injects the self-signed control-plane certificate as
 /// inline PEM once the database is reachable).
+#[cfg(not(feature = "edge"))]
 fn agent_config_from_all_in_one(opts: &AllInOneOpts) -> AgentConfig {
     // Derive the loopback gRPC URL from the configured gRPC address
     let port = extract_port(&opts.common.grpc_addr);
@@ -278,6 +287,7 @@ pub(crate) fn env_flag_is_true(value: Option<&str>) -> bool {
 /// deliberately exhaustive: a new subcommand has to be classified here, which
 /// keeps it from falling through to [`build_run_mode`]'s `unreachable!`
 /// arm at runtime.
+#[cfg(not(feature = "edge"))]
 fn is_maintenance_command(command: &PingWafCommand) -> bool {
     match command {
         PingWafCommand::Server(_)
@@ -295,6 +305,7 @@ fn is_maintenance_command(command: &PingWafCommand) -> bool {
 /// The maintenance commands never reach this: [`main`] routes them to
 /// [`crate::admin::run`] before a run mode is built, and a panic here means
 /// that routing was broken.
+#[cfg(not(feature = "edge"))]
 pub fn build_run_mode(cli: PingWafCli) -> RunMode {
     match cli.command {
         PingWafCommand::Server(ref opts) => {
@@ -2270,6 +2281,7 @@ async fn apply_reload(
 /// This function blocks until shutdown is signalled (SIGINT / SIGTERM).
 pub async fn run(mode: RunMode) -> anyhow::Result<()> {
     match mode {
+        #[cfg(not(feature = "edge"))]
         RunMode::Server(config) => {
             info!(
                 http_addr = %config.http_addr,
@@ -2278,33 +2290,8 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
             );
             pingwaf_server::start_server(*config).await
         },
-        RunMode::Agent(config) => {
-            info!(
-                server_url = %config.server_url,
-                cache_dir = %config.cache_dir,
-                "starting PingWAF in Agent mode (data plane only)"
-            );
-            let agent = pingwaf_agent::start_agent(*config).await?;
-            // Opt-in self-upgrade: follows the control plane's build, then
-            // re-execs this process (see `pingwaf_agent::upgrade`).
-            let upgrade = pingwaf_agent::upgrade::spawn(Arc::clone(&agent));
-            info!("PingWAF agent is running, starting data plane proxy");
-
-            // Start the data plane proxy in the background
-            let rule_cache = Arc::clone(&agent.rule_cache);
-            let proxy_handle = tokio::spawn(async move {
-                if let Err(e) = start_data_plane(rule_cache).await {
-                    error!(error = %e, "data plane proxy exited with error");
-                }
-            });
-
-            // Wait for shutdown signal
-            shutdown_signal().await;
-            upgrade.abort();
-            agent.shutdown().await;
-            proxy_handle.abort();
-            Ok(())
-        },
+        RunMode::Agent(config) => run_agent(*config).await,
+        #[cfg(not(feature = "edge"))]
         RunMode::AllInOne(server_config, mut agent_config) => {
             info!(
                 http_addr = %server_config.http_addr,
@@ -2380,8 +2367,42 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
     }
 }
 
+/// Runs the data-plane agent and its reverse proxy until SIGINT/SIGTERM.
+///
+/// Shared by the `agent` run mode (all-in-one binary) and the agent-only
+/// `pingwaf-agent` binary, so the two builds cannot drift in how they start,
+/// report or shut the data plane down.
+pub(crate) async fn run_agent(config: AgentConfig) -> anyhow::Result<()> {
+    info!(
+        server_url = %config.server_url,
+        cache_dir = %config.cache_dir,
+        "starting PingWAF in Agent mode (data plane only)"
+    );
+    let agent = pingwaf_agent::start_agent(config).await?;
+    // Opt-in self-upgrade: follows the control plane's build, then re-execs
+    // this process (see `pingwaf_agent::upgrade`).
+    let upgrade = pingwaf_agent::upgrade::spawn(Arc::clone(&agent));
+    info!("PingWAF agent is running, starting data plane proxy");
+
+    // Start the data plane proxy in the background
+    let rule_cache = Arc::clone(&agent.rule_cache);
+    let proxy_handle = tokio::spawn(async move {
+        if let Err(e) = start_data_plane(rule_cache).await {
+            error!(error = %e, "data plane proxy exited with error");
+        }
+    });
+
+    // Wait for shutdown signal
+    shutdown_signal().await;
+    upgrade.abort();
+    agent.shutdown().await;
+    proxy_handle.abort();
+    Ok(())
+}
+
 /// Connect to the database, run migrations, and create a bootstrap API key
 /// for the embedded agent in all-in-one mode.
+#[cfg(not(feature = "edge"))]
 async fn bootstrap_agent_key(
     config: &pingwaf_server::ServerConfig,
 ) -> anyhow::Result<String> {
@@ -2416,6 +2437,7 @@ async fn shutdown_signal() {
 }
 
 /// Entry point called from main.rs when PingWAF mode is detected.
+#[cfg(not(feature = "edge"))]
 pub fn main() {
     // The dependency graph enables BOTH rustls crypto providers (ring via
     // pingwaf-server's rustls/tonic, aws-lc-rs via instant-acme/reqwest), so
@@ -2456,8 +2478,30 @@ pub fn main() {
     }
 }
 
+/// Entry point of the agent-only `pingwaf-agent` binary.
+///
+/// It bypasses the subcommand dispatcher (the edge build has no server or
+/// maintenance commands), parses the agent's flags directly, and runs the same
+/// [`run_agent`] path the all-in-one binary uses in `agent` mode.
+#[cfg(feature = "edge")]
+pub fn edge_main() {
+    init_tracing();
+
+    let opts = crate::cli::parse_agent_cli();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to create tokio runtime");
+
+    if let Err(e) = rt.block_on(run_agent(agent_config_from_opts(&opts))) {
+        error!(error = %e, "PingWAF agent exited with error");
+        eprintln!("PingWAF agent error: {e}");
+        std::process::exit(1);
+    }
+}
+
 /// Initialize tracing subscriber for PingWAF modes.
-fn init_tracing() {
+pub(crate) fn init_tracing() {
     use tracing_subscriber::{fmt, prelude::*};
 
     let filter = log_filter();
@@ -2498,6 +2542,7 @@ fn log_directives(rust_log: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "edge"))]
     use clap::Parser as _;
 
     /// Whether some generated listener serves `port`.
@@ -2528,12 +2573,14 @@ mod tests {
 
     /// Parses an invocation the way [`crate::cli::parse_pingwaf_cli`] does,
     /// without reading the process arguments.
+    #[cfg(not(feature = "edge"))]
     fn parse_command(args: &[&str]) -> PingWafCommand {
         PingWafCli::try_parse_from(args)
             .expect("the invocation must parse")
             .command
     }
 
+    #[cfg(not(feature = "edge"))]
     #[test]
     fn config_subcommands_are_maintenance_commands() {
         // Every `config` subcommand talks to PostgreSQL and exits; routing one
@@ -2556,6 +2603,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "edge"))]
     #[test]
     fn only_maintenance_commands_skip_building_a_run_mode() {
         for mode in crate::cli::RUN_MODES {

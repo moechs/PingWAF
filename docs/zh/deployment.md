@@ -47,6 +47,9 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # 期
   `PINGWAF_ADMIN_BIND`/`PINGWAF_GRPC_BIND` 也默认发布在 `127.0.0.1`。只有需要反向代理或远程 agent 时才显式改为
   `0.0.0.0`（或私网地址），并且**先修改管理员口令**；更推荐用 TLS 反向代理暴露，而不是直接公网。
 - **校验 release 校验和**：每个发布资产都有 `.sha256`；缺失、格式错误或不匹配时安装器直接退出，不会安装被篡改/截断的包。
+- **Agent 模式下载专用构建**：`--mode agent` 优先下载 `pingwaf-agent-<os>-<arch>.tar.xz`
+  （仅数据面，不含 PostgreSQL / REST API / 控制台），并以 `/usr/local/bin/pingwaf`
+  名称安装，单元与升级路径不变；更早的 release 没有该资产时回退到完整二进制并告警。
 - **随机管理员口令**：未提供 `--admin-password`/`PINGWAF_ADMIN_PASSWORD` 时生成随机口令并**只打印一次**（结束前保存好）；不再有内置默认口令。
 - **生成 `PINGWAF_SECRET_KEY`**：二进制安装器写入 `/etc/pingwaf/pingwaf.env`（`0600`，属主 `pingwaf`，systemd 通过
   `EnvironmentFile=-/etc/pingwaf/pingwaf.env` 读取）；compose 安装器写入 `.env`（`0600`）。升级时保留已有主密钥——静默轮换会使已密封的渠道/AI/备份凭据无法解密。

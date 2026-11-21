@@ -11,6 +11,8 @@
 # Options:
 #   --version         Install a specific version (default: latest)
 #   --mode            Operating mode: all-in-one, server, agent (default: all-in-one)
+#                     Agent mode installs the agent-only build (no control plane
+#                     or dashboard) as /usr/local/bin/pingwaf
 #   --server-url      Control plane gRPC URL (agent mode)
 #   --api-key         Agent enrollment token (agent mode)
 #   --admin-email     Seed administrator e-mail (server / all-in-one)
@@ -173,7 +175,17 @@ is_loopback_host() {
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 REPO="shuaiZend/PingWAF"
+# Name the binary is installed under. It stays `pingwaf` in every mode so the
+# systemd unit, the config path and an in-place upgrade keep working; what
+# changes is which release asset is downloaded (see ASSET_PREFIX below).
 BINARY_NAME="pingwaf"
+# Release asset/binary name. Agent mode prefers the agent-only build, which
+# links the data plane without the control plane (PostgreSQL, REST API, the
+# embedded dashboard); server/all-in-one keep the full binary.
+ASSET_PREFIX="pingwaf"
+ARCHIVE_BINARY="pingwaf"
+# True once the agent-only archive was actually fetched (not the fallback).
+AGENT_ONLY_BUILD=false
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/pingwaf"
 DATA_DIR="/var/lib/pingwaf"
@@ -225,7 +237,10 @@ Pass options through the pipe with: bash -s -- <options>
 
 Options:
   --version VERSION        Install a specific version (default: latest release)
-  --mode MODE              Operating mode: all-in-one, server, agent
+  --mode MODE              Operating mode: all-in-one, server, agent.
+                           Agent mode downloads the agent-only build
+                           (pingwaf-agent) and installs it as
+                           /usr/local/bin/pingwaf.
   --server-url URL         Control plane gRPC URL (agent mode)
   --server-ca-cert PATH    PEM file with the CA that signed the control plane's
                            gRPC certificate (agent mode, https)
@@ -502,6 +517,17 @@ mask_db_url() {
     printf '%s' "$1" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/]*@#\1***@#'
 }
 
+# The release asset to fetch for a mode: agent mode has its own build, the
+# other modes share the full binary. Kept as a function so the dry-run summary
+# (which runs before the final mode validation) and the download agree.
+asset_prefix() {
+    if [[ "${1:-}" == "agent" ]]; then
+        printf 'pingwaf-agent'
+    else
+        printf 'pingwaf'
+    fi
+}
+
 print_plan_summary() {
     local systemd_state="no"
     local password_state="random (generated at install, printed once)"
@@ -527,6 +553,9 @@ print_plan_summary() {
         echo "  platform:    ${PLATFORM}"
     fi
     echo "  binary:      ${INSTALL_DIR}/${BINARY_NAME}"
+    if [[ -n "${PLATFORM:-}" ]]; then
+        echo "  asset:       $(asset_prefix "${MODE:-all-in-one}")-${OS}-${ARCH}.tar.xz"
+    fi
     echo "  config:      ${CONFIG_DIR}/pingwaf.toml"
     echo "  data:        ${DATA_DIR}"
     echo "  systemd:     ${systemd_state}"
@@ -630,6 +659,11 @@ case "$MODE" in
     all-in-one|server|agent) ;;
     *) fatal "Invalid mode: $MODE (must be: all-in-one, server, agent)" ;;
 esac
+
+# Agent mode installs the data-plane-only build; the binary keeps the name
+# `pingwaf` on disk so the unit and upgrade path do not change.
+ASSET_PREFIX="$(asset_prefix "$MODE")"
+ARCHIVE_BINARY="$ASSET_PREFIX"
 
 validate_install_values
 
@@ -765,7 +799,7 @@ verify_checksum() {
 # Rejects an archive that would write outside the temp directory (absolute
 # paths, `..` components) or that is not the expected single release directory.
 verify_archive_members() {
-    local archive="$1" list="${TMPDIR}/members.txt" prefix="pingwaf-${OS}-${ARCH}/"
+    local archive="$1" list="${TMPDIR}/members.txt" prefix="${ASSET_PREFIX}-${OS}-${ARCH}/"
     case "$archive" in
         *.tar.xz) tar -tJf "$archive" > "$list" ;;
         *.tar.gz) tar -tzf "$archive" > "$list" ;;
@@ -783,49 +817,66 @@ verify_archive_members() {
 }
 
 fetch_asset() {
-    local ext url checksum_url expected downloaded
-    for ext in tar.xz tar.gz; do
-        if [[ "$ext" == "tar.xz" ]] && ! has xz; then
-            info "xz(1) not found — falling back to the .tar.gz asset."
-            continue
-        fi
-        ASSET_NAME="pingwaf-${OS}-${ARCH}.${ext}"
-        url="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}"
-        checksum_url="${url}.sha256"
-        info "Downloading ${ASSET_NAME}..."
-        info "URL: ${url}"
-        downloaded=false
-        if has curl; then
-            if curl -fsSL --proto '=https' "$url" -o "${TMPDIR}/${ASSET_NAME}" \
-                && curl -fsSL --proto '=https' "$checksum_url" -o "${TMPDIR}/${ASSET_NAME}.sha256"; then
-                downloaded=true
+    local ext url checksum_url expected downloaded prefix
+    # Agent mode prefers the agent-only archive. Releases before it existed
+    # only shipped the full binary, so a pinned old version falls back to that
+    # (and says so): `--mode agent --version <old>` keeps working.
+    local prefixes=("$ASSET_PREFIX")
+    if [[ "$MODE" == "agent" && "$ASSET_PREFIX" != "pingwaf" ]]; then
+        prefixes+=("pingwaf")
+    fi
+    for prefix in "${prefixes[@]}"; do
+        for ext in tar.xz tar.gz; do
+            if [[ "$ext" == "tar.xz" ]] && ! has xz; then
+                info "xz(1) not found — falling back to the .tar.gz asset."
+                continue
             fi
-        elif has wget; then
-            if wget -q "$url" -O "${TMPDIR}/${ASSET_NAME}" \
-                && wget -q "$checksum_url" -O "${TMPDIR}/${ASSET_NAME}.sha256"; then
-                downloaded=true
+            ASSET_NAME="${prefix}-${OS}-${ARCH}.${ext}"
+            url="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}"
+            checksum_url="${url}.sha256"
+            info "Downloading ${ASSET_NAME}..."
+            info "URL: ${url}"
+            downloaded=false
+            if has curl; then
+                if curl -fsSL --proto '=https' "$url" -o "${TMPDIR}/${ASSET_NAME}" \
+                    && curl -fsSL --proto '=https' "$checksum_url" -o "${TMPDIR}/${ASSET_NAME}.sha256"; then
+                    downloaded=true
+                fi
+            elif has wget; then
+                if wget -q "$url" -O "${TMPDIR}/${ASSET_NAME}" \
+                    && wget -q "$checksum_url" -O "${TMPDIR}/${ASSET_NAME}.sha256"; then
+                    downloaded=true
+                fi
+            else
+                fatal "Neither curl nor wget found. Please install one of them."
             fi
-        else
-            fatal "Neither curl nor wget found. Please install one of them."
-        fi
-        if [[ "$downloaded" != "true" ]]; then
-            warn "Download failed for ${ASSET_NAME} (asset or its .sha256) — trying the next format."
-            continue
-        fi
-        # Every release ships a .sha256 sidecar; a missing, malformed or
-        # mismatching one is fatal. Nothing is extracted or executed before
-        # this check passes.
-        expected="$(awk 'NR == 1 { print $1 }' "${TMPDIR}/${ASSET_NAME}.sha256")"
-        if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
-            fatal "The .sha256 sidecar for ${ASSET_NAME} is missing or malformed; refusing to install."
-        fi
-        if ! verify_checksum "${TMPDIR}/${ASSET_NAME}" "${TMPDIR}/${ASSET_NAME}.sha256"; then
-            fatal "Checksum mismatch for ${ASSET_NAME} (published: ${expected}). Refusing to install."
-        fi
-        success "Verified the sha256 of ${ASSET_NAME}."
-        return 0
+            if [[ "$downloaded" != "true" ]]; then
+                warn "Download failed for ${ASSET_NAME} (asset or its .sha256) — trying the next format."
+                continue
+            fi
+            # Every release ships a .sha256 sidecar; a missing, malformed or
+            # mismatching one is fatal. Nothing is extracted or executed before
+            # this check passes.
+            expected="$(awk 'NR == 1 { print $1 }' "${TMPDIR}/${ASSET_NAME}.sha256")"
+            if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+                fatal "The .sha256 sidecar for ${ASSET_NAME} is missing or malformed; refusing to install."
+            fi
+            if ! verify_checksum "${TMPDIR}/${ASSET_NAME}" "${TMPDIR}/${ASSET_NAME}.sha256"; then
+                fatal "Checksum mismatch for ${ASSET_NAME} (published: ${expected}). Refusing to install."
+            fi
+            if [[ "$prefix" != "$ASSET_PREFIX" ]]; then
+                warn "No agent-only build in v${VERSION}; falling back to the full binary (larger footprint)."
+                ASSET_PREFIX="$prefix"
+                ARCHIVE_BINARY="$prefix"
+            fi
+            if [[ "$MODE" == "agent" && "$ASSET_PREFIX" == "pingwaf-agent" ]]; then
+                AGENT_ONLY_BUILD=true
+            fi
+            success "Verified the sha256 of ${ASSET_NAME}."
+            return 0
+        done
     done
-    fatal "Download failed. Check that version v${VERSION} exists and has a pingwaf-${OS}-${ARCH} asset."
+    fatal "Download failed. Check that version v${VERSION} exists and has a ${ASSET_PREFIX}-${OS}-${ARCH} asset."
 }
 
 TMPDIR="$(mktemp -d)"
@@ -849,9 +900,9 @@ esac
 # The release archive contains exactly one binary with this name. There is no
 # "first executable" fallback: an unexpected archive layout is an error, not an
 # invitation to install an arbitrary file.
-BINARY_PATH="$(find "${TMPDIR}/pingwaf-${OS}-${ARCH}" -name "$BINARY_NAME" -type f | head -n1)"
+BINARY_PATH="$(find "${TMPDIR}/${ASSET_PREFIX}-${OS}-${ARCH}" -name "$ARCHIVE_BINARY" -type f | head -n1)"
 if [[ -z "$BINARY_PATH" ]]; then
-    fatal "Binary '${BINARY_NAME}' not found in the verified archive."
+    fatal "Binary '${ARCHIVE_BINARY}' not found in the verified archive."
 fi
 
 chmod +x "$BINARY_PATH"
@@ -866,6 +917,17 @@ if ! "$BINARY_PATH" --version >/dev/null 2>&1; then
        Release assets are built on Ubuntu 24.04 and need glibc 2.39 or newer.
        On older distributions (CentOS/RHEL, Debian 11, Ubuntu 20.04, Alpine,
        ...) build from source instead: https://github.com/${REPO}/blob/main/docs/quick-start.md#path-2-build-from-source"
+fi
+# The agent archive must actually contain the agent-only build. The version
+# banner marks it with `edge`; a wrongly packaged (or swapped) artifact would
+# otherwise be installed silently and bring the control plane back.
+if [[ "$AGENT_ONLY_BUILD" == "true" ]]; then
+    # stdout only: the allocator's startup notice goes to stderr and would
+    # otherwise be the first line captured here.
+    agent_version="$("$BINARY_PATH" --version 2>/dev/null | head -n1 || true)"
+    if [[ "$agent_version" != *"edge"* ]]; then
+        fatal "The agent-only archive does not contain an agent-only binary: ${agent_version}"
+    fi
 fi
 
 info "Installing binary to ${INSTALL_DIR}/${BINARY_NAME}..."
@@ -1429,6 +1491,9 @@ echo "${BOLD}${GREEN}  PingWAF v${VERSION} installed successfully!${NO_COLOR}"
 echo "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════${NO_COLOR}"
 echo ""
 echo "  Binary:    ${INSTALL_DIR}/${BINARY_NAME}"
+if [[ "$AGENT_ONLY_BUILD" == "true" ]]; then
+    echo "  Build:     agent-only (data plane; no control plane, REST API or dashboard)"
+fi
 if [[ "$OS" == "linux" ]]; then
     echo "  Config:    ${CONFIG_DIR}/pingwaf.toml"
     echo "  Secrets:   ${CONFIG_DIR}/pingwaf.env (0600, holds PINGWAF_SECRET_KEY)"

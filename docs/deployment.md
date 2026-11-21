@@ -254,12 +254,15 @@ the script resolved from your options.
 > Prebuilt release assets are published for **Linux** (amd64/arm64) only; on
 > macOS, [build from source](./quick-start.md#path-2-build-from-source).
 >
-> Each release ships two archives per architecture:
-> `pingwaf-linux-{amd64,arm64}.tar.xz` (primary, smaller) and
-> `pingwaf-linux-{amd64,arm64}.tar.gz` (compatibility fallback), each with a
-> `.sha256` sidecar. `install.sh` prefers the `.tar.xz` asset, skips straight
-> to `.tar.gz` when `xz(1)` is not installed locally, and falls back on a
-> failed download (e.g. releases that predate `.tar.xz`).
+> Each release ships four archives per architecture:
+> `pingwaf-linux-{amd64,arm64}.tar.xz` / `.tar.gz` for the control plane and
+> all-in-one modes, and `pingwaf-agent-linux-{amd64,arm64}.tar.xz` / `.tar.gz`
+> for the agent-only build (no PostgreSQL, REST API or embedded dashboard),
+> each with a `.sha256` sidecar. `install.sh --mode agent` prefers the
+> `pingwaf-agent` asset and installs it as `/usr/local/bin/pingwaf`; a release
+> that predates it falls back to the full binary with a warning. The installer
+> prefers the `.tar.xz` asset, skips straight to `.tar.gz` when `xz(1)` is not
+> installed locally, and falls back on a failed download.
 >
 > The binaries are linked against the glibc of the runner that builds them
 > (Ubuntu 24.04, **glibc 2.39**), so they run on Debian 12+/Ubuntu 24.04+ and

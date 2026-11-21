@@ -769,6 +769,10 @@ pingwaf agent \
   --cache-dir /var/lib/pingwaf/cache
 ```
 
+A node installed with `install.sh --mode agent` runs the agent-only build
+(`pingwaf-agent`) under the same `/usr/local/bin/pingwaf` name and command, so
+nothing above changes; see [cli.md → the agent-only build](cli.md#the-agent-only-build-pingwaf-agent).
+
 Choose it when sites span multiple hosts or regions, when you need central
 visibility and one-click rule rollout, or when the management plane must be
 isolated from traffic-facing nodes. Only port `9090` has to be reachable from

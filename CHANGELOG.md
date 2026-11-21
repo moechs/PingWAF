@@ -8,6 +8,28 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [PingWAF Unreleased]
+
+### Added
+
+- **The edge agent now ships as its own binary, and `install.sh --mode agent`
+  installs it.** The agent used to be a mode of the all-in-one `pingwaf`
+  binary, which meant an edge node downloaded, stored and mapped the control
+  plane too (PostgreSQL/sqlx, the REST API and the embedded dashboard). The
+  new `pingwaf-agent` target (`cargo build --bin pingwaf-agent --features
+  edge`) compiles the same data plane with the control-plane modules and the
+  dashboard-embedding admin plugin compiled out; the release pipeline publishes
+  `pingwaf-agent-linux-{amd64,arm64}.tar.xz` / `.tar.gz` alongside the existing
+  archives, with the same `.sha256` sidecars and build-provenance attestations.
+  `install.sh --mode agent` downloads that archive and installs it as
+  `/usr/local/bin/pingwaf`, so the systemd unit, the config path and the
+  upgrade path are unchanged; `pingwaf --version` marks the build with `edge`.
+  Releases that predate the asset fall back to the full binary with a warning.
+  The agent-only binary accepts both `pingwaf-agent agent ...` (the spelling
+  the unit uses, and what a self-upgraded all-in-one binary still understands)
+  and `pingwaf-agent ...`. `server`, `all-in-one` and the maintenance commands
+  remain available only from the full `pingwaf` binary.
+
 ## [PingWAF 0.32.37] — 2026-11-21
 
 ### Fixed
