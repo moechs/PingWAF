@@ -105,6 +105,8 @@ The installer copies `--server-ca-cert` to `/etc/pingwaf/grpc-ca.pem` and refere
 
 The shipped `pingwaf.service` runs as the `pingwaf` user with `Restart=always`, `LimitNOFILE=65536`, `ProtectSystem=strict` and write access limited to `/var/lib/pingwaf` and `/etc/pingwaf`. There is no reload signal: configuration changes are applied by the control plane, and a binary or unit change needs `systemctl restart pingwaf`.
 
+For a manual tarball install, `pingwaf.service` and `pingwaf.toml` are inside `pingwaf-linux-<arch>/`. The unit sets `WorkingDirectory=/var/lib/pingwaf` so the relative `cache_dir` persists; without it `ProtectSystem=strict` makes the cache read-only. Use `PINGWAF_DB_URL` (not `PINGWAF_DATABASE_URL`), set `PINGWAF_SECRET_KEY` and an admin password before the first start, and pin `MIMALLOC_ARENA_RESERVE` on hosts below 4 GiB. When switching an existing agent host to all-in-one, move `/var/lib/pingwaf/cache` aside first: the fail-open snapshot can contain another control plane's sites and certificates.
+
 ## TLS on the control plane
 
 The dashboard is HTTPS from the first boot with a generated self-signed certificate. Set `PINGWAF_TLS_SANS` to the hostname you actually use (comma separated) before generating it, or upload a real certificate under **Settings → Control plane HTTPS**. When the console sits behind a TLS-terminating proxy, set `PINGWAF_TLS_ENABLED=false`.

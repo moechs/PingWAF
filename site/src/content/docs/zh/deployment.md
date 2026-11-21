@@ -103,6 +103,8 @@ pingwaf agent
 
 仓库自带的 `pingwaf.service` 以 `pingwaf` 用户运行，设置 `Restart=always`、`LimitNOFILE=65536`、`ProtectSystem=strict`，只允许写入 `/var/lib/pingwaf` 与 `/etc/pingwaf`。没有 reload 信号：配置变更由控制面应用，二进制或单元变更需要 `systemctl restart pingwaf`。
 
+手动 tarball 安装时，`pingwaf.service` 与 `pingwaf.toml` 位于 `pingwaf-linux-<arch>/` 子目录。unit 已设置 `WorkingDirectory=/var/lib/pingwaf`，相对 `cache_dir` 才能持久化；否则 `ProtectSystem=strict` 会让缓存只读。数据库变量是 `PINGWAF_DB_URL`（不是 `PINGWAF_DATABASE_URL`）；首次启动前设置 `PINGWAF_SECRET_KEY` 和管理员口令；小于 4 GiB 的主机需固定 `MIMALLOC_ARENA_RESERVE`。把已有 agent 主机切换为 all-in-one 前，先移走 `/var/lib/pingwaf/cache`，因为 fail-open 快照可能包含另一个控制面的站点与证书。
+
 ## 控制面 TLS
 
 控制台从首次启动起就使用生成的自签证书提供 HTTPS。请在生成前用 `PINGWAF_TLS_SANS`（逗号分隔）指定实际访问的主机名，或在 **设置 → 控制面 HTTPS** 上传真实证书。若控制台位于 TLS 终止代理之后，设置 `PINGWAF_TLS_ENABLED=false`。

@@ -278,15 +278,26 @@ the script resolved from your options.
 > Alpine, ...) `install.sh` stops with the loader's error — build from source
 > there, or run the container image.
 
+> **Manual tarball install.** The archive contains `pingwaf`, `pingwaf.service`
+> and `pingwaf.toml` **inside** `pingwaf-linux-<arch>/`; copy the unit from
+> there, not from the top of the extraction directory. Use `PINGWAF_DB_URL`
+> (not `PINGWAF_DATABASE_URL`) for a non-default database, set
+> `PINGWAF_SECRET_KEY` and an admin password before the first start, and keep
+> the unit's `WorkingDirectory=/var/lib/pingwaf` so the relative
+> `cache_dir = "./data/cache"` is writable under `ProtectSystem=strict`. A
+> manual unit has no memory probe; pin `MIMALLOC_ARENA_RESERVE` on hosts below
+> 4 GiB. The full checklist is in [quick-start Path 3](./quick-start.md#path-3-binary--systemd-production).
+
 ### 2. Set Up PostgreSQL
 
 ```bash
-# Install PostgreSQL
-sudo apt install postgresql-16
+# Install PostgreSQL (use the distribution's default package; Ubuntu 26.04
+# ships postgresql-18 and has no postgresql-16. Anything 14+ works.)
+sudo apt install postgresql
 
-# Create user and database
-sudo -u postgres createuser pingwaf
-sudo -u postgres createdb -O pingwaf pingwaf
+# Create user and database (idempotent: skip an existing role/database)
+sudo -u postgres createuser pingwaf 2>/dev/null || true
+sudo -u postgres createdb -O pingwaf pingwaf 2>/dev/null || true
 sudo -u postgres psql -c "ALTER USER pingwaf PASSWORD 'your-secure-password';"
 ```
 
@@ -351,8 +362,8 @@ file and in the environment is taken from the environment.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `db_url` | string | `postgres://pingwaf:pingwaf@localhost:5432/pingwaf` | PostgreSQL DSN |
-| `admin_addr` | string | `0.0.0.0:9080` | REST API + dashboard address |
-| `grpc_addr` | string | `0.0.0.0:9090` | gRPC control plane address |
+| `admin_addr` | string | `0.0.0.0:9080` (CLI default; the example config and installer use `127.0.0.1:9080`) | REST API + dashboard address |
+| `grpc_addr` | string | `0.0.0.0:9090` (CLI default; the example config and installer use `127.0.0.1:9090`) | gRPC control plane address |
 | `grpc_tls_mode` | string | `tls` | `tls` (default) or `off`. With `tls` and no certificate configured, a self-signed CA + server certificate is generated on first boot and reused after |
 | `grpc_tls_cert` | string | — | PEM certificate for the gRPC listener; takes priority over the self-signed pair (requires `grpc_tls_key`) |
 | `grpc_tls_key` | string | — | PEM private key for `grpc_tls_cert` |

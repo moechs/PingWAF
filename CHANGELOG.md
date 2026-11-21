@@ -18,7 +18,7 @@ verbatim for reference and attribution, and is not maintained here.
   the next reboot and every gRPC handshake failed with an opaque certificate
   error. The installer now copies it to `/etc/pingwaf/grpc-ca.pem` and
   references that path. It also restarts an already-running unit (`enable
-  --now` does not restart), waits up to 30 s for `Registered with control
+  --now` does not restart), waits up to 60 s for `Registered with control
   plane`, and exits nonzero instead of printing "installed successfully" when
   the node never registers.
 - **Agent install docs state the unbound all-sites scope and the control-plane
@@ -31,6 +31,25 @@ verbatim for reference and attribution, and is not maintained here.
   control plane. The `PINGAP_DISABLE_ACME=true` mitigation and the fact that
   the console's generated install command omits the CA/`--server-tls-name` are
   documented too.
+
+- **Manual binary + systemd installs no longer lose the cache or expose the
+  console by default.** The shipped unit now sets
+  `WorkingDirectory=/var/lib/pingwaf`; without it the example config's relative
+  `cache_dir = "./data/cache"` resolved to `/data/cache`, which
+  `ProtectSystem=strict` made read-only, so the agent cache and ACME state
+  failed to persist (`Failed to create cache directory ... Read-only file
+  system`). The example config now binds the dashboard and gRPC to loopback
+  instead of `0.0.0.0`, matching the installer's default; use `0.0.0.0` only
+  behind a proxy or for remote agents.
+- **The manual install documentation matches the archive and the binary.**
+  Path 3 now copies `pingwaf-linux-amd64/pingwaf.service` from inside the
+  extracted directory, creates the `pingwaf` user idempotently, installs the
+  distribution's PostgreSQL package (`postgresql-18` on Ubuntu 26.04, not the
+  non-existent `postgresql-16`), uses `PINGWAF_DB_URL` instead of the ignored
+  `PINGWAF_DATABASE_URL`, and tells the operator to change the example
+  `pingwaf123` admin password and set `PINGWAF_SECRET_KEY` before first start.
+  It also documents the manual unit's missing mimalloc arena pin and the need
+  to move an old agent cache aside when switching to all-in-one.
 
 ## [PingWAF 0.32.40] — 2026-11-22
 

@@ -469,9 +469,12 @@ docker run -d --name pingwaf-postgres \
 **Option B — local install (Debian/Ubuntu):**
 
 ```bash
-sudo apt install -y postgresql-16
-sudo -u postgres createuser pingwaf
-sudo -u postgres createdb -O pingwaf pingwaf
+# Use the distribution's default PostgreSQL package. Ubuntu 26.04 ships 18;
+# `postgresql-16` does not exist there. Anything 14+ works.
+sudo apt install -y postgresql
+# Idempotent: a reinstall or a host that already has the role/database is fine.
+sudo -u postgres createuser pingwaf 2>/dev/null || true
+sudo -u postgres createdb -O pingwaf pingwaf 2>/dev/null || true
 sudo -u postgres psql -c "ALTER USER pingwaf PASSWORD 'pingwaf';"
 ```
 
@@ -537,8 +540,11 @@ curl -sf http://localhost:9080/healthz
 The health endpoint answers on both schemes, so a plain-HTTP probe keeps
 working; everything else is served over HTTPS and redirects otherwise.
 
-Then open <https://localhost:9080> and log in with `admin@pingwaf.local` /
-the `--admin-password` you passed, or the random password the installer printed once at the end (there is no built-in default).
+Then open <https://localhost:9080> and log in with `admin@pingwaf.local`.
+For a manual install that copied the example config, the seeded password is
+`pingwaf123` unless you changed it; for an `install.sh` install it is the
+`--admin-password` you passed, or the random password printed once at the end.
+Change it before exposing the console.
 
 Stop with `Ctrl-C` in the foreground, or `kill <pid>` when backgrounded.
 
@@ -589,13 +595,16 @@ tar xzf pingwaf-linux-amd64.tar.gz
 sudo install -m 0755 pingwaf-linux-amd64/pingwaf /usr/local/bin/pingwaf
 # on arm64 use pingwaf-linux-arm64.tar.gz
 
-# 2. Create the service user and directories
-sudo useradd --system --home-dir /var/lib/pingwaf --shell /usr/sbin/nologin pingwaf
+# 2. Create the service user and directories (idempotent: an upgrade or a
+#    host that already ran an agent install has the user)
+id -u pingwaf >/dev/null 2>&1 || \
+  sudo useradd --system --home-dir /var/lib/pingwaf --shell /usr/sbin/nologin pingwaf
 sudo mkdir -p /var/lib/pingwaf /etc/pingwaf
 sudo chown -R pingwaf:pingwaf /var/lib/pingwaf /etc/pingwaf
 
-# 3. Install the systemd unit
-sudo cp pingwaf.service /etc/systemd/system/pingwaf.service
+# 3. Install the systemd unit (it lives inside the extracted directory, not at
+#    the top of /tmp/pingwaf-rel)
+sudo cp pingwaf-linux-amd64/pingwaf.service /etc/systemd/system/pingwaf.service
 sudo systemctl daemon-reload
 
 # 4. Provide the configuration (a file, environment, or both)
@@ -614,13 +623,41 @@ command line wins over both:
 
 ```ini
 [Service]
+WorkingDirectory=/var/lib/pingwaf
 Environment=PINGWAF_CONFIG=/etc/pingwaf/pingwaf.toml
 Environment=PINGWAF_JWT_SECRET=RANDOM_32_BYTE_HEX
+Environment=PINGWAF_ADMIN_PASSWORD=RANDOM_ADMIN_PASSWORD
 Environment=PINGWAF_ALLOW_REGISTRATION=false
 Environment=RUST_LOG=info,sqlx=warn
 # Only needed when the database is not the default pingwaf/pingwaf@localhost:5432/pingwaf
-Environment=PINGWAF_DATABASE_URL=postgres://pingwaf:CHANGE_ME@localhost:5432/pingwaf
+Environment=PINGWAF_DB_URL=postgres://pingwaf:CHANGE_ME@localhost:5432/pingwaf
+# Manual units have no memory probe; on a host below 4 GiB pin the first arena:
+# Environment=MIMALLOC_ARENA_RESERVE=268435456
+# Environment=MIMALLOC_ARENA_EAGER_COMMIT=0
 ```
+
+`PINGWAF_DB_URL` is the database variable; `PINGWAF_DATABASE_URL` is not read.
+The example config ships `admin_password = "pingwaf123"` and `jwt_secret =
+"change-me-in-production"`; change both before the first start, or set the
+environment variables above. The fresh database rejects every write with `403
+password_change_required` until the admin password is changed, but the seeded
+password is known, so do not expose the console before changing it.
+
+The unit now sets `WorkingDirectory=/var/lib/pingwaf`; without it systemd starts
+in `/`, the relative `cache_dir = "./data/cache"` resolves to `/data/cache`, and
+`ProtectSystem=strict` makes it read-only (`Failed to create cache directory ...
+Read-only file system`). If you use an older unit, set the working directory or
+an absolute `cache_dir` yourself.
+
+If `/var/lib/pingwaf/cache` was left by a previous **agent** install, move it
+aside before starting all-in-one. The agent cache is fail-open and can contain
+another control plane's sites and certificates; the all-in-one would serve that
+snapshot until its own control plane pushes a new bundle.
+
+The example config binds the dashboard and gRPC to `127.0.0.1`. For a remote
+dashboard or remote agents, set `admin_addr`/`grpc_addr` to `0.0.0.0` (or use
+`--listen-public` with the installer) only behind a reverse proxy or trusted
+network, and change the admin password first.
 
 The file is optional: without it, the `Environment=` lines below are the whole
 configuration. If you point `PINGWAF_CONFIG` at a path, start from the example —
@@ -629,6 +666,16 @@ for you) — and remember that an unreadable path stops startup rather than bein
 ignored. Its `[server]` and `[agent]` tables take the flag names with
 underscores (`admin_addr`, `max_body_log_size`, …) as described in the
 [configuration cheat sheet](#configuration-cheat-sheet).
+
+Generate the instance key the unit's `EnvironmentFile` reads (a manual install
+does not create it; without it sealed notification/AI/backup credentials are
+stored in clear text):
+
+```bash
+sudo install -m 0600 -o pingwaf -g pingwaf /dev/null /etc/pingwaf/pingwaf.env
+echo "PINGWAF_SECRET_KEY=$(openssl rand -hex 32)" | \
+  sudo tee -a /etc/pingwaf/pingwaf.env >/dev/null
+```
 
 ```bash
 # 5. Start and enable

@@ -69,8 +69,14 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # 期
   可在 agent 单元设置 `PINGAP_DISABLE_ACME=true` 停止重试，并改用上传证书。
 - **CA 持久化**：安装器会把 `--server-ca-cert` 复制到 `/etc/pingwaf/grpc-ca.pem`，配置和单元引用该持久路径；
   源文件可以放在临时目录。控制台生成的安装命令不含 CA / `--server-tls-name`，自签控制面需要手动补上。
-- **重启与注册校验**：安装器会重启已运行的 agent 单元（`enable --now` 不会重启），并在 30 秒内等待
+- **重启与注册校验**：安装器会重启已运行的 agent 单元（`enable --now` 不会重启），并在 60 秒内等待
   `Registered with control plane`；未注册会以非零退出，而不是只打印 “installed successfully”。
+- **手动 tarball 安装（all-in-one）**：归档内的 `pingwaf.service` / `pingwaf.toml` 在
+  `pingwaf-linux-<arch>/` 子目录；unit 需要 `WorkingDirectory=/var/lib/pingwaf`（仓库已加），否则相对
+  `cache_dir = "./data/cache"` 会落到 `/data/cache`，被 `ProtectSystem=strict` 拒绝并导致缓存/ACME 状态无法持久化。
+  非默认数据库使用 `PINGWAF_DB_URL`（**不是** `PINGWAF_DATABASE_URL`）；首次启动前设置 `PINGWAF_SECRET_KEY`
+  和管理员口令；小于 4 GiB 的主机需固定 `MIMALLOC_ARENA_RESERVE`。从 agent 切换为 all-in-one 前，先移走旧的
+  `/var/lib/pingwaf/cache`，否则会加载另一个控制面的站点/证书快照。
 - **443 的 `wrong version number`**：这是客户端用明文 HTTP 访问 TLS 端口（扫描器/误配客户端），不是 agent
   连控制面的错误；公网边缘会持续出现，建议在日志采集侧过滤或限速，而不是关闭该监听目标的错误日志。
 - **不删数据卷**：compose 安装器 `--force` 只重写 `.env`，保留 `postgres-data`/`pingwaf-data`/`pingwaf-certs`；
