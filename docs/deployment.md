@@ -512,7 +512,30 @@ the host agents dial, set `server_tls_name` to a SAN it does carry — the
 parameter requires 0.32.17 or newer; on older binaries, point the SAN name at
 the control plane in `/etc/hosts` instead.
 
-Generate an agent API key from the dashboard: **Settings → API Keys → Create Key**.
+Create the enrollment key from the console's **Nodes → Add node** flow (or
+`POST /api/v1/agents/enroll`); it returns the install command. A generic
+**Settings → API Keys** key is also accepted, but both are unbound: an agent
+receives **every site owned by the key's owner**, not just one site. The
+control plane's own dashboard site (typically `waf.<domain>` with upstream
+`127.0.0.1:9080`) is included; on an edge that loopback has no dashboard and
+the site returns 502. There is no per-node site binding yet, so use a
+dedicated control plane or remove sites an edge must not run.
+
+For ACME, the control plane must be **0.32.40 or newer**: that release syncs
+the PEMs issued by its embedded data plane into `site_certificates` and pushes
+them to the agents. An older control plane sends `acme_email` without a PEM,
+so each agent starts its own HTTP-01 order; the CA validation request reaches
+the host that owns port 80 (usually the control plane), not the agent, and the
+order fails with `acme_failed`. If the control plane cannot be upgraded yet,
+set `PINGAP_DISABLE_ACME=true` in the agent unit and upload certificates
+instead. An agent that really is the HTTP-01 endpoint for its domains can
+still issue locally, but a remote agent behind the control plane cannot.
+
+The installer copies `--server-ca-cert` to `/etc/pingwaf/grpc-ca.pem` and
+writes that durable path into the config/unit; the source file may live in a
+temporary directory. The console's generated command does not include the CA
+or `--server-tls-name`, so add them when the control plane uses its
+self-signed certificate.
 
 The log, certificate-event and metric shipping streams authenticate with the
 agent token sent as `x-agent-token` gRPC metadata. **In distributed

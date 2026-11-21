@@ -652,7 +652,11 @@ print_plan_summary() {
     echo "  systemd:     ${systemd_state}"
     if [[ "${MODE:-all-in-one}" == "agent" ]]; then
         echo "  control:     ${SERVER_URL}"
-        echo "  control CA:  ${SERVER_CA_CERT:-none (bundled webpki roots)}"
+        if [[ -n "$SERVER_CA_CERT" ]]; then
+            echo "  control CA:  ${SERVER_CA_CERT} -> ${CONFIG_DIR}/grpc-ca.pem"
+        else
+            echo "  control CA:  none (bundled webpki roots)"
+        fi
         echo "  tls name:    ${SERVER_TLS_NAME:-URL host}"
         echo "  api key:     ${api_key_state}"
     else
@@ -1081,6 +1085,36 @@ if [[ "$OS" == "linux" ]]; then
     success "Created ${CONFIG_DIR} and ${DATA_DIR}"
 fi
 
+# Copies the control-plane CA the operator pointed at into /etc/pingwaf. The
+# generated unit and [agent] table must reference a durable path: a CA kept in
+# /tmp or a release download directory disappears on the next reboot, and the
+# agent then fails every gRPC handshake with an opaque certificate error.
+install_agent_ca() {
+    [[ "$MODE" == "agent" ]] || return 0
+    [[ -n "$SERVER_CA_CERT" ]] || return 0
+
+    local dest="${CONFIG_DIR}/grpc-ca.pem"
+    if [[ "$SERVER_CA_CERT" == "$dest" ]]; then
+        return 0
+    fi
+    if [[ "$(readlink -f "$SERVER_CA_CERT" 2>/dev/null || printf '%s' "$SERVER_CA_CERT")" == \
+          "$(readlink -f "$dest" 2>/dev/null || printf '%s' "$dest")" ]]; then
+        SERVER_CA_CERT="$dest"
+        return 0
+    fi
+
+    local cmd=""
+    [[ -w "$CONFIG_DIR" ]] || cmd="sudo"
+    $cmd cp "$SERVER_CA_CERT" "$dest" || \
+        fatal "Could not copy the control-plane CA to ${dest}."
+    $cmd chmod 0644 "$dest" 2>/dev/null || true
+    $cmd chown root:pingwaf "$dest" 2>/dev/null || true
+    SERVER_CA_CERT="$dest"
+    success "Control-plane CA installed at ${dest}"
+}
+
+install_agent_ca
+
 # ─── Write Default Configuration ─────────────────────────────────────────────
 write_config() {
     local config_file="${CONFIG_DIR}/pingwaf.toml"
@@ -1450,11 +1484,40 @@ EOF
     # first boot.
     if [[ "$MODE" == "agent" ]]; then
         info "Starting the agent service..."
-        if $cmd systemctl enable --now "$SERVICE_NAME"; then
-            success "Service enabled and started: ${SERVICE_NAME}"
+        # `enable --now` does not restart an already-running unit, so an
+        # upgrade would install the new binary and keep the old process (and
+        # the old config) alive until the next manual restart. Always restart.
+        if $cmd systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 && \
+           $cmd systemctl restart "$SERVICE_NAME"; then
+            success "Service enabled and restarted: ${SERVICE_NAME}"
         else
             warn "The service did not start — inspect: journalctl -u ${SERVICE_NAME} -e"
             warn "After fixing, start it with: sudo systemctl enable --now ${SERVICE_NAME}"
+            return 1
+        fi
+
+        # An active unit is not a working node: a wrong key, URL or CA leaves
+        # the agent retrying forever while the installer still prints success.
+        # Wait for the registration line before claiming the install worked.
+        info "Waiting for the agent to register..."
+        local start_epoch registered=false
+        start_epoch=$(( $(date +%s) - 2 ))
+        for _ in $(seq 1 60); do
+            if $cmd journalctl -u "$SERVICE_NAME" -b --no-pager \
+                --since "@${start_epoch}" 2>/dev/null \
+                | grep -q "Registered with control plane"; then
+                registered=true
+                break
+            fi
+            sleep 1
+        done
+        if [[ "$registered" == "true" ]]; then
+            success "Agent registered with the control plane."
+        else
+            warn "The agent service is active but did not register within 60s."
+            warn "Check the control-plane URL, API key and CA:"
+            warn "  journalctl -u ${SERVICE_NAME} -e"
+            return 1
         fi
         return
     fi
@@ -1464,7 +1527,10 @@ EOF
     echo "  sudo systemctl status ${SERVICE_NAME}"
 }
 
-install_systemd
+if ! install_systemd; then
+    error "Installation stopped before the node was verified."
+    exit 1
+fi
 
 # The package name moves with the distribution: Ubuntu 24.04 ships
 # postgresql-16, 26.04 ships 18, Debian tracks its own numbering. Printing the

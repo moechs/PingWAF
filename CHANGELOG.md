@@ -8,6 +8,30 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [PingWAF Unreleased]
+
+### Fixed
+
+- **The agent installer keeps the control-plane CA and verifies the node
+  actually registered.** `--server-ca-cert` used to be written into the
+  config/unit as the source path, so a CA downloaded to `/tmp` disappeared on
+  the next reboot and every gRPC handshake failed with an opaque certificate
+  error. The installer now copies it to `/etc/pingwaf/grpc-ca.pem` and
+  references that path. It also restarts an already-running unit (`enable
+  --now` does not restart), waits up to 30 s for `Registered with control
+  plane`, and exits nonzero instead of printing "installed successfully" when
+  the node never registers.
+- **Agent install docs state the unbound all-sites scope and the control-plane
+  version requirement.** Every agent currently receives every site owned by
+  the API key's owner, including the control-plane dashboard site whose
+  upstream is `127.0.0.1:9080`; on an edge that loopback has no dashboard and
+  the site returns 502. The docs now say so, and explain that an ACME-issuing
+  control plane must be 0.32.40+ to sync and push issued PEMs; older control
+  planes make each agent start its own HTTP-01 order, which fails behind the
+  control plane. The `PINGAP_DISABLE_ACME=true` mitigation and the fact that
+  the console's generated install command omits the CA/`--server-tls-name` are
+  documented too.
+
 ## [PingWAF 0.32.40] — 2026-11-22
 
 ### Fixed

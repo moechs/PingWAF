@@ -60,6 +60,17 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # 期
   `systemctl edit pingwaf` 覆盖。
 - **已有配置优先**：如果 `/etc/pingwaf/pingwaf.toml` 已存在，安装器不会改写它，`--server-url` / `--api-key`
   不会生效；agent 模式以文件为准。以启动日志里的 `server_url=...` 为准，需要变更时编辑 `[agent]` 后重启。
+- **Agent 未绑定站点**：当前 agent 会收到 API key 属主的**全部站点**，而不是单个站点；控制面自身的控制台站点
+  （通常上游为 `127.0.0.1:9080`）也会被下发，在边缘节点上该回环地址没有控制台，站点会 502。尚无按节点绑定站点的
+  API，部署边缘时应使用专用控制面，或删除边缘不应运行的站点。
+- **控制面版本要求**：如果控制面是 ACME 签发者（常见 all-in-one），需 **0.32.40+** 才会把内嵌数据面签发的 PEM
+  同步到 `site_certificates` 并推送给 agent。旧控制面只下发 `acme_email`、没有 PEM，每个 agent 会自己发起
+  HTTP-01；验证请求落到 80 端口所属实例（通常是控制面）而不是 agent，最终 `acme_failed`。暂不能升级控制面时，
+  可在 agent 单元设置 `PINGAP_DISABLE_ACME=true` 停止重试，并改用上传证书。
+- **CA 持久化**：安装器会把 `--server-ca-cert` 复制到 `/etc/pingwaf/grpc-ca.pem`，配置和单元引用该持久路径；
+  源文件可以放在临时目录。控制台生成的安装命令不含 CA / `--server-tls-name`，自签控制面需要手动补上。
+- **重启与注册校验**：安装器会重启已运行的 agent 单元（`enable --now` 不会重启），并在 30 秒内等待
+  `Registered with control plane`；未注册会以非零退出，而不是只打印 “installed successfully”。
 - **443 的 `wrong version number`**：这是客户端用明文 HTTP 访问 TLS 端口（扫描器/误配客户端），不是 agent
   连控制面的错误；公网边缘会持续出现，建议在日志采集侧过滤或限速，而不是关闭该监听目标的错误日志。
 - **不删数据卷**：compose 安装器 `--force` 只重写 `.env`，保留 `postgres-data`/`pingwaf-data`/`pingwaf-certs`；

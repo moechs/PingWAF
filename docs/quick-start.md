@@ -759,15 +759,31 @@ pingwaf server \
   --grpc-addr 0.0.0.0:9090 \
   --jwt-secret "$(openssl rand -hex 32)"
 
-# Each edge node — create the API key in Settings → API Keys → Create Key.
-# Point --server-ca-cert at the CA the server generated
-# (e.g. /var/lib/pingwaf/data/grpc-ca.pem on the control plane)
+# Each edge node — use the console's Nodes → Add node flow (or
+# POST /api/v1/agents/enroll) to mint the enrollment key and command.
+# The generated command does not include the control plane's CA; add it
+# when the control plane uses its self-signed certificate.
 pingwaf agent \
   --server-url "https://control-plane:9090" \
   --server-ca-cert /etc/pingwaf/grpc-ca.pem \
   --api-key "YOUR_AGENT_KEY" \
   --cache-dir /var/lib/pingwaf/cache
 ```
+
+> **Agent scope and certificate source.** Agent nodes are currently
+> **unbound**: an agent receives every site owned by the API key's owner, not
+> just one site. The control plane's own dashboard site (typically
+> `waf.<domain>` with upstream `127.0.0.1:9080`) is included too; on an edge
+> that loopback has no dashboard and the site returns 502. There is no
+> per-node site binding yet — use a dedicated control plane or remove sites an
+> edge must not run. For ACME, the control plane must be **0.32.40 or newer**
+> so the PEMs issued by its embedded data plane are synced into
+> `site_certificates` and pushed to agents. An older control plane sends
+> `acme_email` without a PEM, so each agent starts its own HTTP-01 order; the
+> CA validation request reaches the host that owns port 80 (usually the
+> control plane), not the agent, and fails with `acme_failed`. If the control
+> plane cannot be upgraded yet, set `PINGAP_DISABLE_ACME=true` in the agent
+> unit to stop the retry loop and upload certificates instead.
 
 A node installed with `install.sh --mode agent` runs the agent-only build
 (`pingwaf-agent`) under the same `/usr/local/bin/pingwaf` name and command, so

@@ -95,6 +95,10 @@ pingwaf agent
 
 纳管密钥在控制台创建（`POST /api/v1/agents/enroll` 会返回安装命令）。空的 `PINGWAF_API_KEY` 只在 all-in-one 模式的回环自动注册中有效。
 
+当前 agent **未绑定站点**：会收到 API key 属主的全部站点，而不是单个站点；控制面自身的控制台站点（通常上游 `127.0.0.1:9080`）也会下发，在边缘节点上该回环地址没有控制台，站点会 502。尚无按节点绑定站点的 API，部署边缘时应使用专用控制面，或删除边缘不应运行的站点。
+
+如果控制面是 ACME 签发者，需 **0.32.40+** 才会把内嵌数据面签发的 PEM 同步并推送给 agent。旧控制面只下发 `acme_email`、没有 PEM，每个 agent 会自己发起 HTTP-01，验证请求落到控制面而不是 agent，最终 `acme_failed`。暂不能升级控制面时，可在 agent 单元设置 `PINGAP_DISABLE_ACME=true` 停止重试，并改用上传证书。安装器会把 `--server-ca-cert` 复制到 `/etc/pingwaf/grpc-ca.pem`，控制台生成的命令不含 CA / `--server-tls-name`，自签控制面需手动补上。
+
 ## systemd
 
 仓库自带的 `pingwaf.service` 以 `pingwaf` 用户运行，设置 `Restart=always`、`LimitNOFILE=65536`、`ProtectSystem=strict`，只允许写入 `/var/lib/pingwaf` 与 `/etc/pingwaf`。没有 reload 信号：配置变更由控制面应用，二进制或单元变更需要 `systemctl restart pingwaf`。

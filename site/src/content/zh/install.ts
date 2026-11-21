@@ -46,7 +46,7 @@ const install = {
       {
         id: "agent",
         label: "Agent",
-        body: "代理流量的数据面节点，通过 gRPC 连接控制面。安装器会下载仅数据面的构建（不含数据库、REST API 与控制台）；需要 --server-url 与注册密钥。",
+        body: "代理流量的数据面节点，通过 gRPC 连接控制面。安装器会下载仅数据面的构建（不含数据库、REST API 与控制台）；需要 --server-url 与注册密钥。控制面需 0.32.40+ 才能分发证书；agent 当前未绑定站点，会收到密钥属主的全部站点。",
         flags: ["--mode agent", "--server-url https://cp:9090", "--api-key pwk_…"],
       },
     ],

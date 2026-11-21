@@ -67,6 +67,13 @@ agent-only artifact back. The agent-only build has no
 `server`/`all-in-one`/maintenance subcommands; run those from the full
 `pingwaf` binary.
 
+> An agent-only node is currently **unbound**: it receives every site owned by
+> the API key's owner, not one site. The control plane must be **0.32.40 or
+> newer** when it is the ACME issuer, so issued PEMs are synced and pushed;
+> otherwise each agent starts its own HTTP-01 order and fails behind the
+> control plane. See [deployment.md → Edge Agent](deployment.md#edge-agent)
+> for the CA, `server_tls_name`, and `PINGAP_DISABLE_ACME` details.
+
 ## Global options
 
 `server` and `all-in-one` accept these options (the `agent` has its own set,

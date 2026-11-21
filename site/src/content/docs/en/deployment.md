@@ -95,6 +95,12 @@ pingwaf agent
 
 Enrollment keys are created from the console (`POST /api/v1/agents/enroll` returns an install command). An empty `PINGWAF_API_KEY` is only valid for loopback auto-registration in all-in-one mode.
 
+Agents are currently **unbound**: an agent receives every site owned by the API key's owner, not one site. The control plane's own dashboard site (typically `waf.<domain>` with upstream `127.0.0.1:9080`) is included; on an edge that loopback has no dashboard and the site returns 502. There is no per-node site binding yet — use a dedicated control plane or remove sites an edge must not run.
+
+For ACME, the control plane must be **0.32.40 or newer** so the PEMs issued by its embedded data plane are synced into `site_certificates` and pushed to agents. An older control plane sends `acme_email` without a PEM, so each agent starts its own HTTP-01 order; the CA validation request reaches the host that owns port 80 (usually the control plane), not the agent, and fails. If the control plane cannot be upgraded yet, set `PINGAP_DISABLE_ACME=true` in the agent unit and upload certificates instead.
+
+The installer copies `--server-ca-cert` to `/etc/pingwaf/grpc-ca.pem` and references that durable path; the console's generated command does not include the CA or `--server-tls-name`, so add them for a self-signed control plane.
+
 ## systemd
 
 The shipped `pingwaf.service` runs as the `pingwaf` user with `Restart=always`, `LimitNOFILE=65536`, `ProtectSystem=strict` and write access limited to `/var/lib/pingwaf` and `/etc/pingwaf`. There is no reload signal: configuration changes are applied by the control plane, and a binary or unit change needs `systemctl restart pingwaf`.
