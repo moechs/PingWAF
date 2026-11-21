@@ -60,8 +60,13 @@ jobs:
     permissions:
       contents: write # create the release
     steps:
+      # Full history is required: the Full Changelog link below resolves the
+      # previous tag with `git describe --tags`, which needs tags in the clone
+      # (actions/checkout defaults to --depth=1 and fetches no tags).
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Verify the tag matches the workspace version
         run: |
@@ -101,10 +106,22 @@ jobs:
             echo "the CHANGELOG section for ${VERSION} is empty" >&2
             exit 1
           fi
+          # Resolve the previous tag. A failure here is only acceptable when
+          # the repository has no tags at all (true first release): otherwise
+          # it would silently produce a `v0.0.0...` compare link that 404s.
+          PREV_TAG="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)"
+          if [ -z "$PREV_TAG" ]; then
+            if git tag --list | grep -q .; then
+              echo "::error::previous tag not resolvable from ${GITHUB_REF_NAME}, but the repository has tags; refusing to build a v0.0.0 compare link" >&2
+              exit 1
+            fi
+            echo "::notice::no previous tags found, treating this as the first release"
+            PREV_TAG="v0.0.0"
+          fi
           {
             cat /tmp/notes.md
             echo
-            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo v0.0.0)...${GITHUB_REF_NAME}"
+            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
           } > /tmp/body.md
           echo "--- body ---"
           cat /tmp/body.md

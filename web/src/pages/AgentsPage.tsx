@@ -707,8 +707,8 @@ export function AgentsPage() {
               />
               <MetricTile
                 icon={<Desktop weight="duotone" className="h-4 w-4" />}
-                label={t('pages.agents.os')}
-                value={detail.os_info ?? '—'}
+                label={t('pages.agents.binaryMemory')}
+                value={detail.process_rss_bytes != null ? formatSize(detail.process_rss_bytes) : '—'}
               />
               <MetricTile
                 icon={<Lightning weight="duotone" className="h-4 w-4" />}
@@ -722,6 +722,7 @@ export function AgentsPage() {
               <DetailRow label={t('pages.agents.publicIp')} value={detail.public_ip} mono />
               <DetailRow label={t('pages.agents.privateIp')} value={detail.private_ip} mono />
               <DetailRow label={t('pages.agents.ipAddress')} value={detail.ip_address} />
+              <DetailRow label={t('pages.agents.os')} value={detail.os_info ?? '—'} />
               <DetailRow
                 label={t('pages.agents.peerIp')}
                 value={

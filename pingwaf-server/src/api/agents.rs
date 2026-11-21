@@ -109,6 +109,9 @@ pub struct AgentResponse {
     /// RAM in use on the node, in bytes, as reported by the last heartbeat.
     /// `None` until the first heartbeat after migration 000064.
     pub used_memory_bytes: Option<i64>,
+    /// RSS of the agent process itself, as reported by the last heartbeat.
+    /// `None` = never reported (pre-field agent build); not zero.
+    pub process_rss_bytes: Option<i64>,
     pub status: String,
     /// Why the node is `degraded`: the reload its data plane could not apply,
     /// as of the last heartbeat. `null` when the configuration is in effect
@@ -772,6 +775,7 @@ async fn enrich(
             memory_bytes: row.memory_bytes,
             total_memory_bytes: row.total_memory_bytes,
             used_memory_bytes: row.used_memory_bytes,
+            process_rss_bytes: row.process_rss_bytes,
             status: row.status,
             status_reason: state.agents.apply_error(&row.id).await,
             logs_dropped: state.agents.log_drops(&row.id).await,

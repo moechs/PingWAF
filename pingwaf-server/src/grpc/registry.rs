@@ -135,6 +135,11 @@ pub struct AgentRegistry {
 /// A zero is what the agent reported, not "unknown": the wire fields are plain
 /// integers, so the two cannot be told apart here. A node with no entry has not
 /// heartbeated since it connected and is reported as unknown by the API.
+///
+/// The one exception is `process_rss_bytes`: it is the first tri-state counter,
+/// an `Option` on the wire. `None` means the agent never reported it (an agent
+/// older than the field), which is distinct from `Some(0)`. The other counters
+/// keep the zero-sentinel convention for wire compatibility.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HeartbeatMetrics {
     /// CPU usage over the agent's last heartbeat interval, in percent.
@@ -145,6 +150,9 @@ pub struct HeartbeatMetrics {
     pub connections: u64,
     /// Requests per second the edge served over the last interval.
     pub rps: u64,
+    /// RSS of the agent process itself, in bytes. The first tri-state counter:
+    /// `None` = the agent never reported it (pre-field build), not zero.
+    pub process_rss_bytes: Option<u64>,
 }
 
 /// Snapshot of one live connection, used by the `/api/v1/agents` endpoints.
@@ -895,6 +903,7 @@ mod tests {
         HeartbeatMetrics {
             cpu_percent,
             memory_bytes: 3 << 30,
+            process_rss_bytes: Some(256 << 20),
             connections: 17,
             rps,
         }
@@ -922,6 +931,10 @@ mod tests {
         assert_eq!(entry.memory_bytes, 3 << 30);
         assert_eq!(entry.connections, 17);
         assert_eq!(entry.rps, 42);
+        // The tri-state field survives the retention verbatim: the None that
+        // means "never reported" must not collapse into Some(0) on the way
+        // through the registry.
+        assert_eq!(entry.process_rss_bytes, Some(256 << 20));
 
         // A superseded stream finishing must not erase the live counters.
         registry.disconnect(&agent, generation + 1).await;

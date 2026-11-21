@@ -818,6 +818,7 @@ impl ControlPlaneClient {
                     // loss into site.upstream_* alerts.
                     upstream_health: crate::upstream_health::heartbeat_statuses(
                     ),
+                    process_rss_bytes: system_metrics.process_rss_bytes,
                 };
 
                 if hb_tx.send(hb).await.is_err() {
@@ -1870,6 +1871,7 @@ fn to_proto_sample(sample: &HostSample) -> proto::HostSample {
         process_count: sample.process_count,
         tcp_connections: sample.tcp_connections,
         uptime_secs: sample.uptime_secs,
+        process_rss_bytes: sample.process_rss_bytes,
     }
 }
 

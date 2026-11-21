@@ -2155,13 +2155,13 @@ impl RuleCache {
                 key.clear();
                 let _ = write!(key, "{}:{}", site_id, ip);
                 self.blocked_lookup_with_key(site_id, ip, key, extract)
-            }
+            },
             Err(_) => {
                 let owned = RefCell::new(String::with_capacity(96));
                 let mut key = owned.borrow_mut();
                 let _ = write!(key, "{}:{}", site_id, ip);
                 self.blocked_lookup_with_key(site_id, ip, key, extract)
-            }
+            },
         })
     }
 
@@ -2208,12 +2208,14 @@ impl RuleCache {
 
         // Slow path: any CIDR entry of this site covering the address. Uses
         // each entry's stored `key` String, so the shared buffer is untouched
-        // here and cannot be clobbered mid-iteration.
+        // here and cannot be clobbered mid-iteration. The current time is read
+        // once for the whole scan instead of once per entry.
         let addr = normalize_mapped(parsed?);
         let index = self.cidr_index.get(site_id)?;
+        let now = Utc::now();
         for entry in index.iter() {
             if let Some(exp) = entry.expires_at {
-                if Utc::now() >= exp {
+                if now >= exp {
                     continue;
                 }
             }
@@ -2492,7 +2494,10 @@ impl RuleCache {
     /// so only entries that can make the cut are ever cloned. The whole map is
     /// never cloned: cost is `O(B log limit)` comparisons with `O(limit)`
     /// retained keys instead of `O(B log B)` and `O(B)` clones.
-    pub fn blocked_ips_page(&self, limit: usize) -> (Vec<BlockedIpEntry>, bool) {
+    pub fn blocked_ips_page(
+        &self,
+        limit: usize,
+    ) -> (Vec<BlockedIpEntry>, bool) {
         use std::collections::BinaryHeap;
         // Max-heap on (site_id, ip): retain the `limit` lexicographically
         // smallest live entries.
@@ -2698,7 +2703,9 @@ impl RuleCache {
         // 5s `flush_blocked_ips` loop and the shutdown path gate on the same
         // flag. Caller holds the lock; the inner variant must not re-lock.
         let blocked_path = self.cache_dir.join("blocked_ips.json");
-        if self.blocked_dirty.swap(false, Ordering::AcqRel) || !blocked_path.exists() {
+        if self.blocked_dirty.swap(false, Ordering::AcqRel)
+            || !blocked_path.exists()
+        {
             if let Err(e) = self.persist_blocked_ips_inner() {
                 // Restore the flag so the next flush retries the pending
                 // write instead of silently dropping it.
@@ -3883,7 +3890,8 @@ mod tests {
         // Block then flush: the map is clean (dirty=false) and the file exists.
         cache.block_ip("site-1", "203.0.113.7", None, "waf: sqli");
         cache.flush_blocked_ips();
-        let before = std::fs::read(&blocked_path).expect("flush wrote the file");
+        let before =
+            std::fs::read(&blocked_path).expect("flush wrote the file");
 
         // A rule persist with no blocked change must NOT rewrite the file.
         cache.persist_to_disk().unwrap();

@@ -104,6 +104,7 @@ mod m20240101_000096_allow_rule_mode_monitor;
 mod m20240101_000097_path_exception_regex;
 pub mod m20240101_000098_rule_managed_rule_id;
 mod m20240101_000099_agent_peer_ip;
+mod m20240101_000100_agent_process_rss;
 
 use sea_orm_migration::prelude::*;
 
@@ -223,6 +224,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20240101_000097_path_exception_regex::Migration),
             Box::new(m20240101_000098_rule_managed_rule_id::Migration),
             Box::new(m20240101_000099_agent_peer_ip::Migration),
+            Box::new(m20240101_000100_agent_process_rss::Migration),
         ]
     }
 }
@@ -234,7 +236,7 @@ mod tests {
     #[test]
     fn migrations_are_ordered_and_unique() {
         let migrations = Migrator::migrations();
-        assert_eq!(migrations.len(), 99);
+        assert_eq!(migrations.len(), 100);
         let names: Vec<String> =
             migrations.iter().map(|m| m.name().to_owned()).collect();
         let mut sorted = names.clone();

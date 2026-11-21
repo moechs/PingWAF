@@ -1019,7 +1019,7 @@ The Agents page shows:
 - Log entries the node discarded before the control plane stored them (detail
   panel, shown only when non-zero)
 - Last heartbeat time
-- System info (hostname, OS, CPU, memory)
+- System info (hostname, OS, CPU cores, host memory, agent binary memory)
 - Agent version
 - Pending commands
 
@@ -1050,6 +1050,15 @@ different questions:
 When graphing or alerting on node CPU, group by `cpu_source`: `probe` and
 `heartbeat` figures are different measures and must not be mixed in one
 series.
+
+**Binary memory vs host memory.** The detail panel shows memory twice, and
+they answer different questions: **Host memory** is the node's RAM (capacity
+at registration, usage once the host probe reports), while **Binary memory**
+is the RSS of the agent process itself (`process_rss_bytes`) — the figure that
+answers "how much memory is the WAF binary using". It shows `—` until an agent
+build that reports the field connects: `null` means unknown, not zero. The
+probe memory chart overlays the process RSS as a separate line on its own
+byte axis.
 
 ### Agent Commands
 
@@ -1094,7 +1103,7 @@ Switch between the **IP rules** and **Geo restrictions** tabs with `?tab=ip` / `
 | Note | Why this rule exists (audit) |
 | Priority | Lower values are matched first |
 
-IP rules are evaluated before the WAF. Bulk import accepts one IP or CIDR per line.
+IP rules are evaluated before the WAF. Bulk import accepts one IP or CIDR per line. Entries are validated at save time: each must be a valid IP address or CIDR, and an invalid value (e.g. `10.0.0.0/33`) is rejected with a `400` naming it — it is never stored as a rule that silently matches nothing.
 
 ### Geo Restrictions
 
@@ -1111,6 +1120,8 @@ A "Requests by country" chart (last 24 hours) sits next to the policy editor.
 ### Global IP Groups
 
 **IP Groups** (in the sidebar) manages named collections of IP ranges, either **global** (applied to all sites) or **per-site** (assigned to selected sites). Each group has an action: `block` or `allow`.
+
+Range entries are validated when a group is saved: each must be a valid IP address or CIDR, and an invalid value is rejected with `400` naming it. Subscription syncs skip fetched lines that are not valid IP/CIDR entries.
 
 Groups can subscribe to an external list instead of (or in addition to) manually entered ranges:
 

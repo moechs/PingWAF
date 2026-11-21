@@ -8,7 +8,52 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
-## [Unreleased]
+## [PingWAF 0.32.36] — 2026-11-21
+
+### Added
+
+- **Agents now report their own process memory (binary RSS) to the control
+  plane.** The heartbeat and per-sample telemetry carry a new optional
+  `process_rss_bytes` field, the agent's own resident set size, distinct from
+  the whole-node memory usage already reported. In the agent detail panel the
+  "OS" metric tile is replaced by a "Binary memory" reading, and the memory
+  chart now overlays the process RSS as a separate line on its own byte axis
+  alongside the host-memory percentage. Agents that predate the field render as
+  unknown (`—`), never `0`. The field is exposed through `GET /api/v1/agents`,
+  `GET /api/v1/agents/{id}/samples`, and `GET /api/v1/system/nodes`, and the
+  `agents` and `host_samples` tables gain a nullable `process_rss_bytes` column
+  (migration 000100). No changes to rule sync, blocking, or existing memory
+  fields.
+
+### Changed
+
+- **Invalid IP group / rule ranges are rejected at write time instead of
+  failing open.** The IP group, IP rule and bulk-import endpoints previously
+  validated only the address part before `/` in a range entry, so malformed
+  prefixes such as `10.0.0.0/33`, `2001:db8::/129` or `10.0.0.0/abc` were
+  stored successfully — and then silently dropped by the data plane, which
+  made a `block` group or `allow` rule quietly match nothing. Each entry must
+  now parse as a whole IP address or CIDR; anything else is rejected with a
+  `400` naming the offending value (`POST`/`PUT /ip-groups`,
+  `POST`/`PUT /sites/{site_id}/ip-rules` and the bulk-import endpoint).
+  Subscription syncs skip fetched lines that are not valid IP/CIDR entries,
+  and an agent that still receives legacy malformed ranges logs a warning and
+  keeps enforcing the valid remainder instead of failing silently.
+
+### Performance
+
+- **Cheaper IP matching and blocked-IP lookups on the edge agent.** Three
+  internal optimizations with no change to matching semantics or API
+  behaviour:
+  - `IpRules` lookups binary-search sorted, merged address ranges instead of
+    scanning every CIDR entry linearly, so miss-path cost no longer grows
+    with the size of the group (matching is verified against a naive
+    linear-scan reference on randomized v4/v6 sets);
+  - identical IP range sets — e.g. one global group referenced by many sites
+    — are compiled once and shared process-wide instead of being re-parsed
+    per site;
+  - the blocked-IP CIDR slow path reads the current time once per lookup
+    instead of once per indexed entry.
 
 ## [PingWAF 0.32.35] — 2026-11-21
 

@@ -4,7 +4,8 @@
 > 两处不一致时，**以英文版为准**。章节标题保留英文原文，便于对照；小节内的
 > 「详见」链接指向英文原文对应锚点。
 >
-> 注意：文中「证书链接幂等」「`cpu_source`」「`site_hosts` 告警」以及响应替换的
+> 注意：文中「证书链接幂等」「`cpu_source`」「`process_rss_bytes`」
+> 「`site_hosts` 告警」以及响应替换的
 > `br`/`zstd` 支持属于 **Unreleased**（见 [`CHANGELOG.md`](../../CHANGELOG.md)）
 > 行为；英文版现已同步这些变更，本镜像与之保持一致。
 >
@@ -313,6 +314,7 @@ warn 日志（见 [CHANGELOG Unreleased](../../CHANGELOG.md) 的 `site_hosts` �
       "cpu_percent": 23.4,
       "cpu_source": "probe",
       "memory_bytes": 1073741824,
+      "process_rss_bytes": 268435456,
       "connections": 128,
       "rps": null,
       "sites": 1,
@@ -357,6 +359,7 @@ warn 日志（见 [CHANGELOG Unreleased](../../CHANGELOG.md) 的 `site_hosts` �
 | `cpu_percent` | 节点 CPU 负载，百分比；`null` = 尚无读数 |
 | `cpu_source` | `cpu_percent` 的来源（Unreleased 新增）：`probe` = agent 主机探针的 5 秒区间差分样本，跨 agent 版本可比；`heartbeat` = 无探针样本时回退到心跳值（注意：0.28.3 之前的心跳值是自启动以来的平均，口径不同）；`none` = 两个来源都没有读数 |
 | `memory_bytes` | 节点内存使用，字节；`null` = 尚无样本 |
+| `process_rss_bytes`（Unreleased 新增） | agent 进程自身的 RSS——即二进制自身的内存占用，区别于节点的 `memory_bytes`——单位字节；`null` = 从未上报（早于该字段的 agent 版本），不等于 0 |
 | `connections` | 边缘进程当前处理的连接数；`null` = 从未上报（如指标上报被禁用） |
 | `rps` | 边缘每秒处理请求数；**当前所有节点均为 `null`**——心跳携带计数器但控制面不保留每 agent 副本，字段暂无数据源，保留在契约中因为它是最常被问到的数字 |
 | `sites` | 该 agent 服务的站点数：绑定 agent 为 `1`；全局（未绑定）agent 为其 API key 属主的全部站点——与配置推送相同的可见性 |
