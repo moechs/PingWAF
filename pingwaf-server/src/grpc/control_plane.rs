@@ -1103,17 +1103,33 @@ impl ControlPlaneTrait for ControlPlaneService {
                 );
                 continue;
             }
-            if !visibility.allows(&message.site_id) {
+            if !visibility
+                .allows_cert_event(&message.site_id, &message.certificate_id)
+            {
                 // Dropped, not rejected: see `ship_logs`. The alert and the
                 // certificate state transition below both act on the site, so
-                // the check has to happen before either.
+                // the check has to happen before either. An empty stamp is a
+                // global ACME event (environment/account/authorization lines)
+                // and is accepted; only a non-empty foreign site is dropped.
+                // An empty site that names a certificate is not global: it
+                // would let an agent fail another tenant's certificate by id,
+                // so it is dropped too.
                 dropped += 1;
-                tracing::warn!(
-                    site_id = %message.site_id,
-                    agent_id = %authenticated_id,
-                    dropped,
-                    "certificate event stamped with a site this agent does not serve"
-                );
+                if message.site_id.is_empty() {
+                    tracing::warn!(
+                        certificate_id = %message.certificate_id,
+                        agent_id = %authenticated_id,
+                        dropped,
+                        "certificate event without a site stamp names a certificate; dropped"
+                    );
+                } else {
+                    tracing::warn!(
+                        site_id = %message.site_id,
+                        agent_id = %authenticated_id,
+                        dropped,
+                        "certificate event stamped with a site this agent does not serve"
+                    );
+                }
                 continue;
             }
             received += 1;
@@ -3379,6 +3395,20 @@ impl SiteVisibility {
     fn allows(&self, stamped: &str) -> bool {
         site_stamp_is_visible(stamped, &self.sites)
     }
+
+    /// Certificate events may be global: the ACME environment/account/
+    /// authorization lines carry no site, and the `certificate_events.site_id`
+    /// column is nullable for exactly that reason. Only a non-empty foreign
+    /// stamp is dropped. An empty stamp that still names a certificate is not
+    /// global — it could fail another tenant's certificate by id — so it is
+    /// rejected. The heartbeat/log/security paths keep using [`Self::allows`],
+    /// which rejects an empty stamp.
+    fn allows_cert_event(&self, site_id: &str, certificate_id: &str) -> bool {
+        if site_id.is_empty() {
+            return certificate_id.is_empty();
+        }
+        self.allows(site_id)
+    }
 }
 
 /// Drops heartbeat entries stamped with a site the reporting agent does not
@@ -3503,6 +3533,25 @@ mod tests {
         assert!(!site_stamp_is_visible("   ", &[site]));
         assert!(!site_stamp_is_visible("not-a-uuid", &[site]));
         assert!(!site_stamp_is_visible(&Uuid::new_v4().to_string(), &[site]));
+    }
+
+    /// Global certificate events (no `site_id`) must be accepted: the ACME
+    /// environment/account/authorization lines have no site, and the column is
+    /// nullable. Dropping them also logged the misleading "site this agent
+    /// does not serve" warning with an empty `site_id`.
+    #[test]
+    fn an_empty_certificate_stamp_is_global_not_foreign() {
+        let site = Uuid::new_v4();
+        let visibility = SiteVisibility::new(vec![site]);
+        // Global ACME lines: no site and no certificate binding.
+        assert!(visibility.allows_cert_event("", ""));
+        // A site-scoped event follows the same visibility rule as the rest.
+        assert!(visibility.allows_cert_event(&site.to_string(), "cert"));
+        assert!(
+            !visibility.allows_cert_event(&Uuid::new_v4().to_string(), "cert")
+        );
+        // An empty site with a certificate id could target another tenant.
+        assert!(!visibility.allows_cert_event("", "cert"));
     }
 
     /// DR32-08: after a visibility refresh, a site the agent was unbound from

@@ -721,6 +721,15 @@ Configure through the dashboard:
 
 Certificates are automatically renewed before expiry.
 
+In **all-in-one** mode the embedded data plane is the ACME issuer. The control
+plane mirrors the PEMs it issues (from the data plane's `acme_state.toml`) into
+the ACME-managed `site_certificates` rows every 30 seconds and pushes the
+updated bundle to every agent, so an edge agent whose port 80 points at the
+control plane does not have to issue (and fail) its own HTTP-01 order. Set
+`PINGWAF_ACME_STATE` to override the file path. A remote agent that is itself
+the HTTP-01 endpoint can still issue locally; use **DNS-01** when it is not the
+instance owning the domain's port 80.
+
 ### Manual Certificates
 
 Upload PEM-encoded certificate and key through the dashboard or API:

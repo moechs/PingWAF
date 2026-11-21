@@ -45,6 +45,8 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
 use crate::api::state::AppState;
+
+mod acme_state_sync;
 use crate::es::{ensure_index_template, ElasticsearchClient};
 use crate::grpc::{AgentRegistry, ControlPlaneService};
 use crate::migration::Migrator;
@@ -212,6 +214,14 @@ pub async fn start_server(mut config: ServerConfig) -> anyhow::Result<()> {
         control_tls: control_tls.clone(),
         protection: Arc::new(api::self_protection::SelfProtection::new()),
     };
+
+    // All-in-one: the embedded data plane issues ACME certificates into its
+    // local acme_state.toml. Mirror them into site_certificates so every
+    // agent receives the PEM instead of each trying (and failing) its own
+    // HTTP-01 order. A server-only deployment has no path and skips this.
+    if let Some(path) = shared_config.acme_state_path.as_deref() {
+        acme_state_sync::spawn(state.clone(), std::path::PathBuf::from(path));
+    }
 
     // ── 6d. Control plane self-protection ───────────────────────────────────
     // Load the initial policy (access log, IP allowlist, WAF), start the log

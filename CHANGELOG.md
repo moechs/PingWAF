@@ -8,6 +8,37 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [PingWAF Unreleased]
+
+### Fixed
+
+- **ACME-issued PEMs are synced from the embedded data plane into the control
+  plane and pushed to every agent.** In all-in-one mode the data plane's
+  lets-encrypt task issued the certificate into its local `acme_state.toml`,
+  but `site_certificates.cert_pem` stayed empty. `build_site_config` therefore
+  told every other agent "ACME enabled, no PEM", and each tried its own
+  HTTP-01 order. The CA's validation request reaches whichever instance owns
+  port 80 — the control plane — which never had the token the issuing edge
+  saved, so the order failed with `token not found` and the edge never got a
+  certificate to serve. The control plane now mirrors the PEMs (and their
+  issuer/validity) from `acme_state.toml` into the ACME-managed
+  `site_certificates` rows every 30 seconds and pushes the updated bundle to
+  the agents. `PINGWAF_ACME_STATE` overrides the file path; a remote agent
+  that is not the HTTP-01 endpoint should still use DNS-01.
+- **Global certificate events are no longer dropped as "foreign site".**
+  `ShipCertEvents` rejected an empty `site_id`, so the ACME environment,
+  account and authorization lines — which have no site — were discarded with
+  a misleading `site this agent does not serve` warning. Empty stamps are now
+  stored as global events (`site_id = NULL`); only a non-empty invisible site
+  is dropped. An empty stamp that still names a `certificate_id` is rejected
+  too, so an agent cannot fail another tenant's certificate by id. The
+  heartbeat/log/security paths still reject empty stamps.
+- **The benign pingora bodyless-upstream warning no longer floods the log.**
+  pingora 0.9.1 logs `Upstream body is already finished. Nothing to write` for
+  every HTTP/2 GET whose upstream is HTTP/1.1, which turned a crawler into
+  hundreds of WARN lines per hour. The fmt layer now drops exactly that
+  message; the real fix is in pingora.
+
 ## [PingWAF 0.32.39] — 2026-11-21
 
 ### Fixed

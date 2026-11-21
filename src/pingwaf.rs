@@ -116,6 +116,19 @@ fn server_config_from_all_in_one(opts: &AllInOneOpts) -> ServerConfig {
     config.default_admin_password = opts.admin_password.clone();
     config.serve_frontend = opts.serve_frontend;
     apply_tls_opts(&mut config, &opts.common);
+    // The embedded data plane mirrors its ACME state (issued PEMs and
+    // challenge tokens) into this file. The control plane syncs the PEMs into
+    // site_certificates so every agent can serve them; without this an edge
+    // agent that never received the PEM keeps issuing HTTP-01 orders it
+    // cannot answer. `PINGWAF_ACME_STATE` can point elsewhere.
+    if config.acme_state_path.is_none() {
+        config.acme_state_path = Some(
+            std::path::Path::new(&opts.cache_dir)
+                .join("acme_state.toml")
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
     config
 }
 
@@ -2509,6 +2522,66 @@ pub fn edge_main() {
     }
 }
 
+/// The pingora-proxy warning emitted for every bodyless HTTP/2 request whose
+/// upstream is HTTP/1.1. It is benign (the response is already complete) but
+/// pingora 0.9.1 logs it per request, which turns a crawler into a log flood.
+/// The fmt layer drops exactly this message; the real fix is upstream.
+fn is_noisy_pingora_body_warning(target: &str, message: &str) -> bool {
+    target == "pingora_proxy::proxy_h1"
+        && message.contains("Upstream body is already finished")
+}
+
+struct DropPingoraBodyWarning;
+
+impl<S: tracing::Subscriber> tracing_subscriber::layer::Filter<S>
+    for DropPingoraBodyWarning
+{
+    fn enabled(
+        &self,
+        _metadata: &tracing::Metadata<'_>,
+        _cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        true
+    }
+
+    fn event_enabled(
+        &self,
+        event: &tracing::Event<'_>,
+        _cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        if event.metadata().target() != "pingora_proxy::proxy_h1" {
+            return true;
+        }
+        let mut visitor = MessageVisitor { message: None };
+        event.record(&mut visitor);
+        !visitor.message.as_deref().is_some_and(|message| {
+            is_noisy_pingora_body_warning("pingora_proxy::proxy_h1", message)
+        })
+    }
+}
+
+struct MessageVisitor {
+    message: Option<String>,
+}
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &dyn std::fmt::Debug,
+    ) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}"));
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_string());
+        }
+    }
+}
+
 /// Initialize tracing subscriber for PingWAF modes.
 pub(crate) fn init_tracing() {
     use tracing_subscriber::{fmt, prelude::*};
@@ -2519,7 +2592,11 @@ pub(crate) fn init_tracing() {
     // control plane, so certificate-issuance logs show up on the admin panel.
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_target(true))
+        .with(
+            fmt::layer()
+                .with_target(true)
+                .with_filter(DropPingoraBodyWarning),
+        )
         .with(pingwaf_agent::cert_events::AcmeCaptureLayer)
         .init();
 }
@@ -2635,6 +2712,69 @@ mod tests {
                 "{args:?} must be routed to admin::run"
             );
         }
+    }
+
+    #[test]
+    fn only_the_pingora_bodyless_warning_is_dropped() {
+        assert!(is_noisy_pingora_body_warning(
+            "pingora_proxy::proxy_h1",
+            "Upstream body is already finished. Nothing to write",
+        ));
+        assert!(!is_noisy_pingora_body_warning(
+            "pingora_proxy::proxy_h1",
+            "something else",
+        ));
+        assert!(!is_noisy_pingora_body_warning(
+            "pingora_proxy::proxy_h2",
+            "Upstream body is already finished. Nothing to write",
+        ));
+    }
+
+    #[test]
+    fn the_fmt_filter_drops_only_the_pingora_bodyless_warning() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Buffer;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(Buffer(Arc::clone(&buffer)))
+                .with_filter(DropPingoraBodyWarning),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: "pingora_proxy::proxy_h1",
+                "Upstream body is already finished. Nothing to write"
+            );
+            tracing::warn!(target: "pingora_proxy::proxy_h1", "keep me");
+        });
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains("Upstream body is already finished"));
+        assert!(output.contains("keep me"));
     }
 
     #[test]

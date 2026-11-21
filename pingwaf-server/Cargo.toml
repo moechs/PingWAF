@@ -64,6 +64,8 @@ sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Parses the embedded data plane's acme_state.toml for certificate sync.
+toml = { workspace = true }
 # Certificate generation and parsing for the managed mTLS CAs. `rcgen` carries
 # its own crypto backend, so no TLS stack is pulled into the control plane.
 # WebAuthn (passkey) ceremony handling. Pure Rust (p256/coset/ciborium), so the

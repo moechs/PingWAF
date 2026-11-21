@@ -85,7 +85,10 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # 期
 ## 6. TLS
 
 - **控制面 9080**：首启自动生成自签名证书；生产建议在 **Settings → Control plane HTTPS** 上传正式证书，并用 `PINGWAF_TLS_SANS` 指定主机名。
-- **业务站点**：使用 ACME（Let's Encrypt）或上传证书，启用 HSTS 并强制 HTTPS。
+- **业务站点**：使用 ACME（Let's Encrypt）或上传证书，启用 HSTS 并强制 HTTPS。all-in-one 模式下由内嵌数据面签发，
+  控制面每 30 秒把 `acme_state.toml` 中签发的 PEM 同步到 `site_certificates` 并下发给所有 agent；这样 80 端口
+  指向控制面的 edge agent 不必自己发起（也必然失败的）HTTP-01 订单。路径可用 `PINGWAF_ACME_STATE` 覆盖。
+  远程 agent 若不是该域名 80 端口的落点，应改用 **DNS-01**。
 - **gRPC 9090**：默认 TLS（首启生成自签 CA）；仅在完全受控的环回 all-in-one 场景才考虑 `grpc_tls_mode = "off"`。
 
 ## 7. 安全加固清单
