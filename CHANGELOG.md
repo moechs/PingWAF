@@ -8,6 +8,42 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [PingWAF 0.32.39] — 2026-11-21
+
+### Fixed
+
+- **The installer now sizes mimalloc's first arena from the memory ceiling.**
+  mimalloc creates its first arena at load time, before
+  `allocator_tune::apply()` can call `mi_option_set`, and an existing arena
+  cannot be shrunk. On a small host the generated systemd unit therefore kept
+  the 1 GiB default reserve (a 894 MiB host showed a 1 GiB anonymous mapping
+  and the "below the 2 GiB minimum" warning) even though the startup log
+  printed the adaptive value. `install.sh` now writes
+  `MIMALLOC_ARENA_RESERVE` and `MIMALLOC_ARENA_EAGER_COMMIT` into the unit's
+  environment from the cgroup v2/v1 limit or `MemTotal`: 64 MiB below 1 GiB,
+  256 MiB below 4 GiB, 512 MiB up to 16 GiB, else 1 GiB; eager commit is on
+  only at 4 GiB and above. The dry-run plan prints the computed values.
+  This reduces virtual/committed memory and removes the startup warning on
+  small hosts; it does not shrink the live data-plane heap, which the binary
+  split does not change either.
+- **The allocator warning now checks whether the standard env var is set.**
+  `allocator_tune` only warned below a 2 GiB ceiling and never looked at
+  `MIMALLOC_ARENA_RESERVE`, so a pinned unit still printed the warning, while
+  2–16 GiB hosts (adaptive 256/512 MiB) silently kept the 1 GiB default
+  without any warning. The condition now covers the whole range where the
+  adaptive reserve is below mimalloc's default, uses the effective value in
+  the message, and is suppressed when `MIMALLOC_ARENA_RESERVE` is present in
+  the process environment.
+- **The agent-only binary keeps the full binary's tracing target.** Logs from
+  `src/pingwaf.rs` used the module path, so the edge build reported
+  `pingwaf_agent::pingwaf` while the full build reported `pingwaf::pingwaf`;
+  filters, alerts and dashboards keyed on the target missed edge nodes. Both
+  builds now use `pingwaf::pingwaf`.
+- **`--version` / `--help` no longer print allocator diagnostics.** The
+  allocator probe runs before the CLI, so asking for the version printed the
+  startup banner and (on small hosts) the arena warning to stderr first.
+  Informational flags now skip the probe; a real startup still logs it.
+
 ## [PingWAF 0.32.38] — 2026-11-21
 
 ### Added
