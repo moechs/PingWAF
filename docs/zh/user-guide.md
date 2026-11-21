@@ -164,7 +164,9 @@
 编排告警或画图时按 `cpu_source` 分组解读：`probe` 与 `heartbeat` 数值不可直接
 混排。其余字段沿用既有口径——控制面尚不知道的字段以 `null` 而非 `0` 表达；
 `agents.memory_bytes` 在 agent 首次心跳之前携带主机总内存（注册清单值），之后是
-探针的使用内存（既知漂移，尚未修复）。`boots[]` 记录控制面启动史：相邻两行的
+探针的使用内存（既知漂移，尚未修复）。新增 `process_rss_bytes`（Unreleased）是
+agent 进程自身的 RSS，区别于整机内存；旧版 agent 不上报该字段，响应中为 `null`
+（未知，不是 0）。`boots[]` 记录控制面启动史：相邻两行的
 间隔即上一进程存活时间；**几分钟内多次启动通常意味着容器被循环杀死**，而一周前
 的一次启动只是正常发版。
 详见：[GET /system/nodes](../api.md#get-systemnodes)。

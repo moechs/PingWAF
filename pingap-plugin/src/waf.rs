@@ -674,6 +674,65 @@ pub(crate) fn path_exception_skips_challenge(host: &str, path: &str) -> bool {
     })
 }
 
+/// Compiled IP/CIDR ranges shared by content, keyed by the normalised range
+/// strings. Many sites (or rules within one site) repeat the same
+/// range list — e.g. the same allowlist uploaded per site — and without this
+/// cache each copy parsed its ranges and kept a private `IpRules`. The cache
+/// collapses those into one parse and one allocation per distinct set.
+///
+/// Mirrors `PATH_EXCEPTION_CACHE`: entries are never invalidated individually;
+/// when the map exceeds the cap it is cleared wholesale, and a stale hit costs
+/// nothing because identical content always re-derives an identical
+/// `IpRules`.
+static IP_RULES_CACHE: LazyLock<DashMap<String, Arc<IpRules>>> =
+    LazyLock::new(DashMap::new);
+
+/// Returns the `IpRules` compiled from `ranges`, shared process-wide with
+/// every identical range set. The key is the whitespace-trimmed, `\0`-joined
+/// range list, so equal content always maps to one entry and distinct
+/// content never collides into a wrong share. Callers must treat the result
+/// as immutable.
+fn shared_ip_rules(ranges: &[String]) -> Arc<IpRules> {
+    let key = ranges_cache_key(ranges);
+    if let Some(cached) = IP_RULES_CACHE.get(&key) {
+        return Arc::clone(&cached);
+    }
+    if IP_RULES_CACHE.len() > 1024 {
+        IP_RULES_CACHE.clear();
+    }
+    Arc::clone(
+        &IP_RULES_CACHE
+            .entry(key)
+            .or_insert_with(|| Arc::new(IpRules::new(ranges))),
+    )
+}
+
+/// Cache key: whitespace-trimmed, sorted, `\0`-joined range list. Sorting makes
+/// the key order-independent, so `["a","b"]` and `["b","a"]` share one entry.
+fn ranges_cache_key(ranges: &[String]) -> String {
+    let mut trimmed: Vec<&str> = ranges.iter().map(|r| r.trim()).collect();
+    trimmed.sort_unstable();
+    trimmed.join("\u{0}")
+}
+
+/// Like `shared_ip_rules`, but reuses an already-parsed `IpRules` so the caller
+/// does not pay for a second parse (used after `IpRules::try_new` validated the
+/// input).
+fn shared_ip_rules_parsed(ranges: &[String], parsed: IpRules) -> Arc<IpRules> {
+    let key = ranges_cache_key(ranges);
+    if let Some(cached) = IP_RULES_CACHE.get(&key) {
+        return Arc::clone(&cached);
+    }
+    if IP_RULES_CACHE.len() > 1024 {
+        IP_RULES_CACHE.clear();
+    }
+    Arc::clone(
+        &IP_RULES_CACHE
+            .entry(key)
+            .or_insert_with(|| Arc::new(parsed)),
+    )
+}
+
 /// Site data resolved from the agent cache, compiled once per config
 /// fingerprint: the WAF engine, the access restrictions and the custom rule
 /// names used to label security events.
@@ -889,7 +948,9 @@ struct IpRule {
     id: String,
     name: String,
     action: IpRuleAction,
-    ranges: IpRules,
+    /// Shared with every identical range set in the process
+    /// (see [`shared_ip_rules`]).
+    ranges: Arc<IpRules>,
     /// Empty scope = the whole site.
     path: Option<PathFilter>,
 }
@@ -986,11 +1047,41 @@ impl AccessPolicy {
                         None
                     },
                 };
+                // Malformed entries (`10.0.0.0/33`, `/abc`, …) are dropped
+                // silently by `IpRules::new`, which made a block rule
+                // degrade without a trace; the control plane now rejects
+                // them at write time, so landing here means legacy or
+                // out-of-band data — warn with the offending values and
+                // keep enforcing the valid remainder.
+                let ranges = match IpRules::try_new(&rule.ip_ranges) {
+                    Ok(parsed) => shared_ip_rules_parsed(&rule.ip_ranges, parsed),
+                    Err(err) => {
+                        warn!(
+                            site_id = %site_rules.site_id,
+                            rule_id = %rule.id,
+                            rule_name = %rule.name,
+                            error = %err,
+                            "ip access rule contains invalid IP ranges; \
+                             they are ignored"
+                        );
+                        let valid: Vec<String> = rule
+                            .ip_ranges
+                            .iter()
+                            .filter(|r| {
+                                let r = r.trim();
+                                r.parse::<IpNet>().is_ok()
+                                    || r.parse::<IpAddr>().is_ok()
+                            })
+                            .cloned()
+                            .collect();
+                        shared_ip_rules(&valid)
+                    },
+                };
                 Some(IpRule {
                     id: rule.id.clone(),
                     name: rule.name.clone(),
                     action,
-                    ranges: IpRules::new(&rule.ip_ranges),
+                    ranges,
                     path,
                 })
             })
@@ -6285,6 +6376,25 @@ pub(crate) mod tests {
         assert_eq!(deferred_body_max_entries(8 * 1024 * 1024), 8);
         assert_eq!(deferred_body_max_entries(0), 1024);
         assert_eq!(deferred_body_max_entries(usize::MAX), 1);
+    }
+
+    #[test]
+    fn identical_ip_ranges_share_one_compiled_instance() {
+        let a = vec!["10.0.0.0/24".to_string(), "192.168.1.1".to_string()];
+        // Same content, different vector instances (what two sites carry).
+        let b = vec!["10.0.0.0/24".to_string(), "192.168.1.1".to_string()];
+        let shared_a = shared_ip_rules(&a);
+        let shared_b = shared_ip_rules(&b);
+        assert!(Arc::ptr_eq(&shared_a, &shared_b));
+        assert!(Arc::strong_count(&shared_a) > 1);
+
+        // A different set must not share.
+        let c = vec!["10.0.1.0/24".to_string()];
+        assert!(!Arc::ptr_eq(&shared_a, &shared_ip_rules(&c)));
+        // Whitespace-only differences normalise to the same content.
+        let a_trimmed =
+            vec![" 10.0.0.0/24 ".to_string(), " 192.168.1.1 ".to_string()];
+        assert!(Arc::ptr_eq(&shared_a, &shared_ip_rules(&a_trimmed)));
     }
 
     #[test]

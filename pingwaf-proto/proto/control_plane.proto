@@ -175,6 +175,12 @@ message AgentHeartbeat {
   // a value lower than the previous heartbeat's means the agent restarted.
   // Always 0 from agents that predate the field.
   uint64 logs_dropped_total = 23;
+
+  // Resident set size of the agent process itself, in bytes — the binary's
+  // own memory, distinct from `memory_usage_bytes` (whole-node usage).
+  // Absent on agents that predate the field: the control plane must render
+  // unknown, never 0.
+  optional uint64 process_rss_bytes = 24;
 }
 
 // Backend health of one upstream, reported per heartbeat.
@@ -246,6 +252,10 @@ message HostSample {
   uint32 process_count = 17;
   uint32 tcp_connections = 18;
   uint64 uptime_secs = 19;
+
+  // RSS of the agent process at this sample, in bytes. Absent (or on older
+  // agents: not sent at all) = unknown, not 0.
+  optional uint64 process_rss_bytes = 20;
 }
 
 message ServerCommand {

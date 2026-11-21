@@ -1740,7 +1740,7 @@
         "cpuHint": "全コア合計の CPU 使用率。",
         "memory": "メモリ",
         "memoryPercent": "メモリ使用率",
-        "memoryHint": "総メモリに占める使用量の割合。",
+        "memoryHint": "面：ホストの使用中メモリ。折れ線：エージェントプロセス自身の RSS。単位はいずれも MB で直接比較可能。",
         "disk": "ディスク",
         "processes": "プロセス数",
         "tcpConnections": "TCP 接続 {{count}} 件",
@@ -1750,7 +1750,8 @@
         "network": "ネットワークスループット",
         "networkHint": "累積カウンタから算出した受信・送信レート。",
         "rx": "受信",
-        "tx": "送信"
+        "tx": "送信",
+        "memoryProcessRss": "プロセス RSS"
       },
       "allSitesHint": "単一サイトにバインドされておらず、オーナーの全サイトに自動同期します",
       "hostMemory": "ホストメモリ容量",
@@ -1760,7 +1761,8 @@
       "peerIp": "接続元アドレス",
       "peerIpHint": "コントロールプレーンがこのエージェントの接続を受け付けたときの対向アドレスです。NAT 配下の場合は実質的なグローバル IP になります。",
       "peerVia": "{{ip}} 経由",
-      "peerPrivateHint": "自己申告されたアドレスはプライベートアドレス（コンテナ / 内部網）で、外部からは到達できません。Connection source がコントロールプレーンが実際に認識しているアドレスです。"
+      "peerPrivateHint": "自己申告されたアドレスはプライベートアドレス（コンテナ / 内部網）で、外部からは到達できません。Connection source がコントロールプレーンが実際に認識しているアドレスです。",
+      "binaryMemory": "バイナリメモリ"
     },
     "notifications": {
       "title": "通知",

@@ -70,6 +70,10 @@ pub mod agents {
         /// RAM in use on the node, as reported by the last heartbeat. `None`
         /// until the first heartbeat after migration 000064.
         pub used_memory_bytes: Option<i64>,
+        /// RSS of the agent process itself, as reported by the last heartbeat.
+        /// `None` until the first heartbeat that carries it: unlike the memory
+        /// counters there is no zero sentinel, so `None` is genuinely unknown.
+        pub process_rss_bytes: Option<i64>,
         pub status: String,
         pub api_key_id: Option<Uuid>,
         pub config_hash: Option<String>,

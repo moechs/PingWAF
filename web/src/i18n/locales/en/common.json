@@ -1740,7 +1740,7 @@
         "cpuHint": "Total CPU utilisation across all cores.",
         "memory": "Memory",
         "memoryPercent": "Memory usage",
-        "memoryHint": "Used memory as a share of the total.",
+        "memoryHint": "Area: host memory in use. Line: the agent process's own RSS. Both in MB, directly comparable.",
         "disk": "Disk",
         "processes": "Processes",
         "tcpConnections": "{{count}} TCP connections",
@@ -1750,7 +1750,8 @@
         "network": "Network throughput",
         "networkHint": "Receive and transmit rates derived from the counters.",
         "rx": "Receive",
-        "tx": "Transmit"
+        "tx": "Transmit",
+        "memoryProcessRss": "Process RSS"
       },
       "allSitesHint": "Not bound to a single site; automatically serves every site of its owner",
       "hostMemory": "Host memory capacity",
@@ -1760,7 +1761,8 @@
       "peerIp": "Connection source",
       "peerIpHint": "Address the control plane accepted this agent's connection from — the closest thing to its public IP when the agent sits behind NAT.",
       "peerVia": "via {{ip}}",
-      "peerPrivateHint": "The self-reported address is a private one (container / RFC1918) and is not reachable from outside — the Connection source is the address the control plane actually sees."
+      "peerPrivateHint": "The self-reported address is a private one (container / RFC1918) and is not reachable from outside — the Connection source is the address the control plane actually sees.",
+      "binaryMemory": "Binary memory"
     },
     "notifications": {
       "title": "Notifications",

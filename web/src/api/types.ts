@@ -1130,6 +1130,8 @@ export interface Agent {
   /** Used memory (kept as `memory_bytes` for compatibility). */
   used_memory_bytes: number | null
   memory_bytes: number | null
+  /** Agent 进程自身 RSS（字节）；null = 旧 agent 未上报。 */
+  process_rss_bytes: number | null
   status: AgentStatus | string
   /**
    * Why the node is degraded: the reload its data plane could not apply.
@@ -1179,6 +1181,8 @@ export interface HostSample {
   memory_total_bytes: number | null
   memory_used_bytes: number | null
   memory_available_bytes: number | null
+  /** Agent 进程自身 RSS（字节）；null = 旧 agent 未上报。 */
+  process_rss_bytes: number | null
   swap_total_bytes: number | null
   swap_used_bytes: number | null
   disk_total_bytes: number | null

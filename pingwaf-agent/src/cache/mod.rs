@@ -2139,31 +2139,66 @@ impl RuleCache {
         ip: &str,
         extract: impl Fn(&BlockedIpEntry) -> T,
     ) -> Option<T> {
-        // Fast path: an exact single-address (or exact CIDR-string) entry.
-        let key = format!("{}:{}", site_id, ip);
-        if let Some(entry) = self.blocked_ips.get(&key) {
+        use std::cell::RefCell;
+        use std::fmt::Write as _;
+        thread_local! {
+            /// Per-thread key buffer reused across block lookups, eliminating
+            /// the per-request `format!` heap allocation on the hot path.
+            static BLOCK_LOOKUP_KEY: RefCell<String> =
+                RefCell::new(String::with_capacity(96));
+        }
+        // `try_borrow_mut` keeps this re-entrant-safe: if an `extract` closure
+        // (or any nested lookup) already holds the buffer, fall back to an
+        // owned buffer instead of panicking on the `RefCell` borrow.
+        BLOCK_LOOKUP_KEY.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut key) => {
+                key.clear();
+                let _ = write!(key, "{}:{}", site_id, ip);
+                self.blocked_lookup_with_key(site_id, ip, key, extract)
+            },
+            Err(_) => {
+                let owned = RefCell::new(String::with_capacity(96));
+                let mut key = owned.borrow_mut();
+                let _ = write!(key, "{}:{}", site_id, ip);
+                self.blocked_lookup_with_key(site_id, ip, key, extract)
+            },
+        })
+    }
+
+    fn blocked_lookup_with_key<T>(
+        &self,
+        site_id: &str,
+        ip: &str,
+        mut key: std::cell::RefMut<'_, String>,
+        extract: impl Fn(&BlockedIpEntry) -> T,
+    ) -> Option<T> {
+        use std::fmt::Write as _;
+        // Fast path: an exact single-address (or exact CIDR-string) entry. The
+        // key was written by the caller into the shared buffer.
+        if let Some(entry) = self.blocked_ips.get(key.as_str()) {
             if entry.is_expired() {
                 drop(entry);
-                self.blocked_ips.remove(&key);
-                self.index_remove_key(&key);
+                self.blocked_ips.remove(key.as_str());
+                self.index_remove_key(key.as_str());
             } else {
                 return Some(extract(&entry));
             }
         }
 
         // The control plane stores mapped-v6 client addresses collapsed to
-        // their IPv4 form; probe that spelling too, so `::ffff:203.0.113.5`
-        // hits the entry stored as `203.0.113.5`.
+        // their IPv4 form; probe that spelling too, reusing the same buffer,
+        // so `::ffff:203.0.113.5` hits the entry stored as `203.0.113.5`.
         let parsed = ip.parse::<std::net::IpAddr>().ok();
         if let Some(addr) = parsed.map(normalize_mapped) {
             let normalized = addr.to_string();
             if normalized != ip {
-                let key = format!("{}:{}", site_id, normalized);
-                if let Some(entry) = self.blocked_ips.get(&key) {
+                key.clear();
+                let _ = write!(key, "{}:{}", site_id, normalized);
+                if let Some(entry) = self.blocked_ips.get(key.as_str()) {
                     if entry.is_expired() {
                         drop(entry);
-                        self.blocked_ips.remove(&key);
-                        self.index_remove_key(&key);
+                        self.blocked_ips.remove(key.as_str());
+                        self.index_remove_key(key.as_str());
                     } else {
                         return Some(extract(&entry));
                     }
@@ -2171,12 +2206,16 @@ impl RuleCache {
             }
         }
 
-        // Slow path: any CIDR entry of this site covering the address.
+        // Slow path: any CIDR entry of this site covering the address. Uses
+        // each entry's stored `key` String, so the shared buffer is untouched
+        // here and cannot be clobbered mid-iteration. The current time is read
+        // once for the whole scan instead of once per entry.
         let addr = normalize_mapped(parsed?);
         let index = self.cidr_index.get(site_id)?;
+        let now = Utc::now();
         for entry in index.iter() {
             if let Some(exp) = entry.expires_at {
-                if Utc::now() >= exp {
+                if now >= exp {
                     continue;
                 }
             }
@@ -2447,6 +2486,61 @@ impl RuleCache {
             .collect()
     }
 
+    /// Page of at most `limit` unexpired blocks in deterministic
+    /// `(site_id, ip)` order, plus whether any live block was dropped.
+    ///
+    /// Unlike [`Self::blocked_ips_snapshot`] (clone-everything then let the
+    /// caller sort + truncate), this uses a bounded max-heap of size `limit`
+    /// so only entries that can make the cut are ever cloned. The whole map is
+    /// never cloned: cost is `O(B log limit)` comparisons with `O(limit)`
+    /// retained keys instead of `O(B log B)` and `O(B)` clones.
+    pub fn blocked_ips_page(
+        &self,
+        limit: usize,
+    ) -> (Vec<BlockedIpEntry>, bool) {
+        use std::collections::BinaryHeap;
+        // Max-heap on (site_id, ip): retain the `limit` lexicographically
+        // smallest live entries.
+        let mut heap: BinaryHeap<(String, String)> = BinaryHeap::new();
+        let mut alive = 0usize;
+        for e in self.blocked_ips.iter() {
+            let v = e.value();
+            if v.is_expired() {
+                continue;
+            }
+            alive += 1;
+            if heap.len() == limit {
+                if let Some(max) = heap.peek() {
+                    // Compare without cloning; skip entries that cannot
+                    // displace the current maximum.
+                    if (v.site_id.as_str(), v.ip.as_str())
+                        >= (max.0.as_str(), max.1.as_str())
+                    {
+                        continue;
+                    }
+                }
+            }
+            heap.push((v.site_id.clone(), v.ip.clone()));
+            if heap.len() > limit {
+                heap.pop();
+            }
+        }
+        let mut keys: Vec<(String, String)> = heap.into_vec();
+        keys.sort();
+        // Invariant: the map key is always `format!("{}:{}", site_id, ip)`
+        // (every writer — `block_ip`, `load_blocked_ips` — builds it the same
+        // way), so the rebuilt key resolves. An entry that vanished between
+        // selection and read is skipped (concurrent unblock/expiry).
+        let entries = keys
+            .iter()
+            .filter_map(|(site, ip)| {
+                let key = format!("{}:{}", site, ip);
+                self.blocked_ips.get(&key).map(|e| e.value().clone())
+            })
+            .collect::<Vec<_>>();
+        (entries, alive > limit)
+    }
+
     // ─── Disk Persistence ───────────────────────────────────
 
     /// Outcome of the latest cache load, for the heartbeat report.
@@ -2601,8 +2695,24 @@ impl RuleCache {
         let meta_json = serde_json::to_string(&metadata)?;
         write_atomic(&metadata_path, meta_json.as_bytes())?;
 
-        // Caller holds the lock; the inner variant must not re-lock.
-        self.persist_blocked_ips_inner()?;
+        // Rewrite blocked_ips.json when the map changed since the last
+        // successful write (dirty), OR when the snapshot file is missing so a
+        // deleted/lost file is still rebuilt on rule persist (preserving the
+        // old unconditional behavior). Only unchanged persists with an intact
+        // snapshot skip the full-table clone + pretty-JSON serialization. The
+        // 5s `flush_blocked_ips` loop and the shutdown path gate on the same
+        // flag. Caller holds the lock; the inner variant must not re-lock.
+        let blocked_path = self.cache_dir.join("blocked_ips.json");
+        if self.blocked_dirty.swap(false, Ordering::AcqRel)
+            || !blocked_path.exists()
+        {
+            if let Err(e) = self.persist_blocked_ips_inner() {
+                // Restore the flag so the next flush retries the pending
+                // write instead of silently dropping it.
+                self.blocked_dirty.store(true, Ordering::Release);
+                return Err(e);
+            }
+        }
 
         debug!("Persisted rule cache to disk");
         Ok(())
@@ -3767,6 +3877,142 @@ mod tests {
             RuleCache::new(dir.path().to_path_buf(), "test".to_string())
                 .unwrap();
         assert_eq!(reloaded.blocked_reason("site-1", "203.0.113.7"), None);
+    }
+
+    #[test]
+    fn rule_persist_skips_blocked_write_when_not_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        let blocked_path = dir.path().join("blocked_ips.json");
+
+        // Block then flush: the map is clean (dirty=false) and the file exists.
+        cache.block_ip("site-1", "203.0.113.7", None, "waf: sqli");
+        cache.flush_blocked_ips();
+        let before =
+            std::fs::read(&blocked_path).expect("flush wrote the file");
+
+        // A rule persist with no blocked change must NOT rewrite the file.
+        cache.persist_to_disk().unwrap();
+        let after = std::fs::read(&blocked_path).unwrap();
+        assert_eq!(
+            before, after,
+            "an unchanged blocked map must not be rewritten on rule persist"
+        );
+
+        // A new block marks dirty; the next rule persist rewrites the file.
+        cache.block_ip("site-1", "203.0.113.9", None, "waf: xss");
+        cache.persist_to_disk().unwrap();
+        let entries: Vec<BlockedIpEntry> =
+            serde_json::from_slice(&std::fs::read(&blocked_path).unwrap())
+                .unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "a dirty blocked map must be persisted on rule persist"
+        );
+    }
+
+    #[test]
+    fn rule_persist_rebuilds_missing_blocked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        let blocked_path = dir.path().join("blocked_ips.json");
+
+        cache.block_ip("site-1", "203.0.113.7", None, "waf: sqli");
+        cache.flush_blocked_ips();
+        assert!(blocked_path.exists());
+
+        // Delete the snapshot out from under the cache: the map is clean
+        // (dirty=false) but the next rule persist must rebuild the file.
+        std::fs::remove_file(&blocked_path).unwrap();
+        cache.persist_to_disk().unwrap();
+        assert!(
+            blocked_path.exists(),
+            "a missing snapshot must be rebuilt even when not dirty"
+        );
+        let entries: Vec<BlockedIpEntry> =
+            serde_json::from_slice(&std::fs::read(&blocked_path).unwrap())
+                .unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn blocked_page_matches_sorted_snapshot_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        for i in 0..50 {
+            cache.block_ip("site-a", &format!("203.0.113.{}", i), None, "waf");
+            cache.block_ip("site-b", &format!("198.51.100.{}", i), None, "waf");
+        }
+
+        let limit = 10;
+        let (page, truncated) = cache.blocked_ips_page(limit);
+        assert!(
+            truncated,
+            "more live blocks than the limit must mark truncated"
+        );
+        assert_eq!(page.len(), limit);
+
+        // Reference: the full snapshot sorted by (site_id, ip), truncated.
+        let mut all = cache.blocked_ips_snapshot();
+        all.sort_by(|a, b| {
+            (a.site_id.as_str(), a.ip.as_str())
+                .cmp(&(b.site_id.as_str(), b.ip.as_str()))
+        });
+        all.truncate(limit);
+
+        let page_ids: Vec<(&str, &str)> = page
+            .iter()
+            .map(|e| (e.site_id.as_str(), e.ip.as_str()))
+            .collect();
+        let all_ids: Vec<(&str, &str)> = all
+            .iter()
+            .map(|e| (e.site_id.as_str(), e.ip.as_str()))
+            .collect();
+        assert_eq!(
+            page_ids, all_ids,
+            "the page must equal the sorted snapshot prefix"
+        );
+
+        // A limit larger than the live set returns everything, not truncated.
+        let (all_page, all_truncated) = cache.blocked_ips_page(1000);
+        assert!(!all_truncated);
+        assert_eq!(all_page.len(), 100);
+    }
+
+    #[test]
+    fn blocked_lookup_semantics_and_reentrancy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        cache.block_ip("site-1", "203.0.113.7", None, "waf: sqli");
+        cache.block_ip("site-1", "10.3.0.0/16", None, "manual: range");
+
+        // Fast-path hit, plain miss, mapped-v6 hit, and CIDR slow-path hit.
+        assert_eq!(
+            cache.blocked_reason("site-1", "203.0.113.7").as_deref(),
+            Some("waf: sqli")
+        );
+        assert_eq!(cache.blocked_reason("site-1", "203.0.113.200"), None);
+        assert!(cache.is_ip_blocked("site-1", "::ffff:203.0.113.7"));
+        assert_eq!(
+            cache.blocked_reason("site-1", "10.3.44.5").as_deref(),
+            Some("manual: range")
+        );
+
+        // Re-entrancy: an `extract` closure that itself performs a lookup must
+        // not panic on the shared key buffer (it falls back to an owned one).
+        let nested = cache.blocked_lookup("site-1", "203.0.113.7", |_e| {
+            cache.is_ip_blocked("site-1", "10.3.44.5")
+        });
+        assert_eq!(nested, Some(true));
     }
 
     #[test]

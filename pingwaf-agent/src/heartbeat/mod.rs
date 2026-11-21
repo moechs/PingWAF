@@ -65,6 +65,8 @@ pub struct SystemMetrics {
     pub requests_per_second: u64,
     pub blocked_requests_total: u64,
     pub requests_total: u64,
+    /// Resident set size of this process; `None` when unavailable.
+    pub process_rss_bytes: Option<u64>,
 }
 
 /// Collects system and application metrics for the agent heartbeat.
@@ -170,6 +172,7 @@ impl MetricsCollector {
             requests_per_second: rps,
             blocked_requests_total: self.blocked_requests_total(),
             requests_total: self.requests_total(),
+            process_rss_bytes: probe::process_rss_bytes(),
         }
     }
 
@@ -198,6 +201,7 @@ impl MetricsCollector {
             requests_per_second: rps,
             blocked_requests_total: self.blocked_requests_total(),
             requests_total: self.requests_total(),
+            process_rss_bytes: probe::process_rss_bytes(),
         }
     }
 

@@ -1740,7 +1740,7 @@
         "cpuHint": "所有核心的总 CPU 使用率。",
         "memory": "内存",
         "memoryPercent": "内存使用率",
-        "memoryHint": "已用内存占总内存的比例。",
+        "memoryHint": "面积：主机已用内存。折线：agent 进程自身的 RSS 占用，单位均为 MB，可直接对比。",
         "disk": "磁盘",
         "processes": "进程数",
         "tcpConnections": "{{count}} 个 TCP 连接",
@@ -1750,7 +1750,8 @@
         "network": "网络吞吐",
         "networkHint": "由累计计数器换算出的收发速率。",
         "rx": "接收",
-        "tx": "发送"
+        "tx": "发送",
+        "memoryProcessRss": "进程 RSS"
       },
       "allSitesHint": "未单独绑定站点，自动同步属主账号全部站点的配置",
       "hostMemory": "主机内存容量",
@@ -1760,7 +1761,8 @@
       "peerIp": "连接来源地址",
       "peerIpHint": "控制面实际接受该代理连接时看到的对端地址；代理位于 NAT 之后时，这是最接近其公网地址的一项。",
       "peerVia": "连接自 {{ip}}",
-      "peerPrivateHint": "自报地址是私网地址（容器 / 内网），无法从外部访问；Connection source 才是控制面实际看到的地址。"
+      "peerPrivateHint": "自报地址是私网地址（容器 / 内网），无法从外部访问；Connection source 才是控制面实际看到的地址。",
+      "binaryMemory": "二进制内存占用"
     },
     "notifications": {
       "title": "通知",

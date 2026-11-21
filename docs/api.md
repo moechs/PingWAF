@@ -1829,6 +1829,7 @@ List registered agents.
       "os_info": "Linux 6.1.0",
       "cpu_cores": 4,
       "memory_bytes": 8589934592,
+      "process_rss_bytes": 268435456,
       "status": "online",
       "status_reason": null,
       "logs_dropped": 0,
@@ -1860,6 +1861,12 @@ with every heartbeat, so it resets when the agent restarts; the control plane
 also writes a warning to its own log each time the total grows. `0` means
 nothing was lost, or that this control plane instance has not heard from the
 node since it started.
+
+`process_rss_bytes` is the RSS of the agent process itself — the binary's own
+memory, distinct from `memory_bytes` (whole-node usage). It is tri-state:
+`null` = the agent build predates the field and has never reported it, which is
+not the same as a reported zero. The node view (`GET /system/nodes`) carries
+the same field under the same name.
 
 `name` is the operator-facing label: it is `display_name` when one is set,
 otherwise it falls back to `hostname`. `hostname` is the identity the agent
@@ -1993,7 +2000,8 @@ Rules:
 
 ### GET /agents/{agent_id}/samples
 
-Host probe history (CPU, memory, network, disk), newest first. Cumulative counters (network and disk totals) are returned raw; difference consecutive rows to obtain rates.
+Host probe history (CPU, memory, network, disk, plus the agent process's own
+RSS as `process_rss_bytes`), newest first. Cumulative counters (network and disk totals) are returned raw; difference consecutive rows to obtain rates.
 
 **Query params:** `from`, `to` (RFC 3339), `page`, `page_size`.
 
@@ -3540,7 +3548,7 @@ Create an IP rule. Set either `ip_ranges` (manual mode) or `group_id` (reference
 }
 ```
 
-`action` is `block`, `allow`, `challenge`, `js_challenge` or `basic_auth`. Sending `group_id` instead of `ip_ranges` makes the rule track the group's latest ranges. A `basic_auth` rule challenges the matched clients and continues to the remaining checks once they authenticate; configure the credentials under [Basic Auth](#basic-auth) first.
+`action` is `block`, `allow`, `challenge`, `js_challenge` or `basic_auth`. Every `ip_ranges` entry must be a valid IP address or CIDR (up to 1000 per rule, trimmed and deduplicated); an invalid entry — e.g. `10.0.0.0/33` or `10.0.0.0/abc` — is rejected with `400` and a message naming the value. The same check applies to `PUT` and to the bulk-import endpoint below. Sending `group_id` instead of `ip_ranges` makes the rule track the group's latest ranges. A `basic_auth` rule challenges the matched clients and continues to the remaining checks once they authenticate; configure the credentials under [Basic Auth](#basic-auth) first.
 
 **Path scope (`path`, `match_type`):** every rule also accepts an optional
 path scope — empty `path` = the whole site; a non-empty scope applies the
@@ -3714,7 +3722,7 @@ groups ship with the control plane — Google, Yandex, DuckDuckGo and Cloudflare
 verifier/CDN ranges as static snapshots, seeded on first start — and `url`
 groups pull a plain-text or CIDR list over HTTP. Both are refreshed
 automatically by a daily background job (`subscription_enabled: false` opts
-out); `last_synced_at` and `last_sync_error` report the last run. Range
+out); `last_synced_at` and `last_sync_error` report the last run. Fetched lines that are not a valid IP address or CIDR are skipped during a sync instead of being stored. Range
 changes propagate: sites that use the group for access rules, route gating,
 bot verification or proxy trust get their configuration re-pushed
 immediately.
@@ -3791,6 +3799,8 @@ List IP groups (paginated), each with a `site_count`.
 ### POST /ip-groups
 
 Create an IP group (up to 10000 ranges). Requires write access (`admin`).
+
+Every `ip_ranges` entry is trimmed, deduplicated and must be a valid IP address or CIDR (e.g. `203.0.113.7` or `198.51.100.0/24`); anything else — `10.0.0.0/33`, `2001:db8::/129`, `10.0.0.0/abc` — is rejected with `400` and a message naming the offending value. The same validation applies to `PUT /ip-groups/{group_id}`.
 
 **Request:**
 ```json
@@ -5697,6 +5707,7 @@ is the fleet" in one call.
       "cpu_percent": 23.4,
       "cpu_source": "probe",
       "memory_bytes": 1073741824,
+      "process_rss_bytes": 268435456,
       "connections": 128,
       "rps": null,
       "sites": 1,
@@ -5752,6 +5763,7 @@ table does not reshuffle between polls:
 | `cpu_percent` | CPU load of the node, percent; `null` = no reading from either source |
 | `cpu_source` | Where `cpu_percent` came from: `probe` = the agent host probe's ~5 s delta sample, comparable across agent versions (values can move sharply between polls); `heartbeat` = no probe sample available, so the live heartbeat's value is used — for agents that have not reported a probe sample yet that figure can be an **average since boot**, a different measure; `none` = neither source carried a reading |
 | `memory_bytes` | Memory in use on the node, bytes; `null` = no sample retained yet |
+| `process_rss_bytes` | RSS of the agent process itself — the binary's own memory, distinct from the node's `memory_bytes` — in bytes; `null` = never reported (an agent build older than the field), not zero |
 | `connections` | Connections currently handled by the edge process; `null` = never reported (e.g. metric shipping disabled) |
 | `rps` | Requests per second handled by the edge; **`null` for every node today** — the heartbeat carries the counter but the control plane retains no per-agent copy, so the field has no data source. It stays in the contract because it is the figure operators ask for first |
 | `sites` | Sites this agent serves: `1` for a bound agent; for a global (unbound) agent, every site of its API key's owner — the same visibility the config push uses |

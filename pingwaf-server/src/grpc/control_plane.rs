@@ -510,6 +510,7 @@ impl ControlPlaneTrait for ControlPlaneService {
                     total_memory_bytes: Set(total_memory),
                     // Usage starts unknown: the first heartbeat fills it.
                     used_memory_bytes: Set(None),
+                    process_rss_bytes: Set(None),
                     status: Set(status),
                     api_key_id: Set(Some(key.id)),
                     config_hash: Set(None),
@@ -1449,10 +1450,13 @@ fn heartbeat_metrics(message: &AgentHeartbeat) -> HeartbeatMetrics {
         memory_bytes: message.memory_usage_bytes,
         connections: message.active_connections,
         rps: message.requests_per_second,
+        // Normalize at the boundary: a live process never has RSS 0, so 0 means
+        // "not reported". Filtering here keeps the in-memory view and the DB
+        // writer (which also drops 0) consistent — Some(0) never reaches the UI.
+        process_rss_bytes: message.process_rss_bytes.filter(|bytes| *bytes > 0),
     }
 }
 
-/// Persists the runtime counters of one heartbeat.
 /// What a dual-stack listener reports for an IPv4 peer is `::ffff:a.b.c.d`;
 /// operators type `a.b.c.d` into firewalls, so collapse the mapped form.
 fn canonical_peer_ip(ip: std::net::IpAddr) -> String {
@@ -1534,6 +1538,7 @@ async fn reconcile_agent_config(
     }
 }
 
+/// Persists the runtime counters of one heartbeat.
 async fn persist_heartbeat(
     db: &DatabaseConnection,
     agent_id: Uuid,
@@ -1601,6 +1606,11 @@ async fn persist_heartbeat(
         // is the unambiguous copy (migration 000064).
         active.memory_bytes = Set(Some(used));
         active.used_memory_bytes = Set(Some(used));
+    }
+    // Tri-state: an agent that predates the field (None) keeps whatever the
+    // row last held — NotSet means no update, not a clear.
+    if let Some(rss) = message.process_rss_bytes.filter(|b| *b > 0) {
+        active.process_rss_bytes = Set(Some(rss.min(i64::MAX as u64) as i64));
     }
     // Sync timestamps come from the agent's own clock, but they only feed
     // the dashboard's "last synced" display, so a skewed clock cannot make
@@ -2233,6 +2243,9 @@ async fn persist_host_samples(
             process_count: Set(i32::try_from(sample.process_count).ok()),
             tcp_connections: Set(i32::try_from(sample.tcp_connections).ok()),
             uptime_secs: Set(sample_i64(sample.uptime_secs)),
+            process_rss_bytes: Set(sample
+                .process_rss_bytes
+                .and_then(sample_i64)),
             created_at: Set(now),
             ..Default::default()
         })
