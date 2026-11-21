@@ -246,6 +246,14 @@ the script resolved from your options.
   systemd unit reads it through `EnvironmentFile=-/etc/pingwaf/pingwaf.env`.
   An existing key is kept on upgrade: rotating it silently would make every
   sealed notification/AI/backup credential unreadable.
+- **mimalloc arena** — the generated unit pins `MIMALLOC_ARENA_RESERVE` and
+  `MIMALLOC_ARENA_EAGER_COMMIT` from the memory ceiling (cgroup v2/v1 limit,
+  else `MemTotal`): 64 MiB below 1 GiB, 256 MiB below 4 GiB, 512 MiB up to
+  16 GiB, else 1 GiB; eager commit is enabled only at 4 GiB and above. This is
+  required because mimalloc creates its first arena before
+  `allocator_tune::apply()` can set the option, and an existing arena cannot
+  be shrunk. Override the values with `systemctl edit pingwaf` when the host
+  has a non-standard memory layout.
 - **Listen addresses** — `127.0.0.1:9080` (console) and `127.0.0.1:9090`
   (gRPC) by default. `--listen-public` (or `PINGWAF_LISTEN_PUBLIC=1`) publishes
   them on `0.0.0.0` and prints a reminder to change the administrator password
@@ -1411,6 +1419,19 @@ psql "postgres://pingwaf:password@localhost:5432/pingwaf" -c "SELECT 1"
 2. Check the API key is valid
 3. Review agent logs: `RUST_LOG=debug pingwaf agent --server-url ...`
 4. Ensure clocks are synchronized (NTP)
+
+`wrong version number` on port **443** is not a control-plane connection
+error: it means a client spoke plaintext HTTP to the TLS listener (a scanner
+or a misconfigured client). It is expected noise on a public edge; filter or
+rate-limit it in the log collector rather than disabling the listener's error
+target. Control-plane TLS problems are the `UnknownIssuer` / `NotValidForName`
+family covered under [Agent Can't Reach the Control Plane](#agent-cant-reach-the-control-plane).
+
+If `/etc/pingwaf/pingwaf.toml` already exists, `install.sh --server-url …`
+and `--api-key …` do **not** rewrite it: in agent mode the file wins over the
+unit's environment. The effective URL is the one in the startup log
+(`server_url=…`); edit `[agent]` in the file and restart when it differs from
+what the installer was given.
 
 TLS handshake errors (`GoAway … FRAME_SIZE_ERROR`, `UnknownIssuer`,
 `NotValidForName`) have a dedicated walkthrough under

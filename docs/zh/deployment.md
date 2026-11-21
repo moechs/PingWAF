@@ -53,6 +53,15 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # 期
 - **随机管理员口令**：未提供 `--admin-password`/`PINGWAF_ADMIN_PASSWORD` 时生成随机口令并**只打印一次**（结束前保存好）；不再有内置默认口令。
 - **生成 `PINGWAF_SECRET_KEY`**：二进制安装器写入 `/etc/pingwaf/pingwaf.env`（`0600`，属主 `pingwaf`，systemd 通过
   `EnvironmentFile=-/etc/pingwaf/pingwaf.env` 读取）；compose 安装器写入 `.env`（`0600`）。升级时保留已有主密钥——静默轮换会使已密封的渠道/AI/备份凭据无法解密。
+- **mimalloc arena**：生成的 systemd 单元会根据内存上限（cgroup v2/v1 限制，否则 `MemTotal`）写入
+  `MIMALLOC_ARENA_RESERVE` 与 `MIMALLOC_ARENA_EAGER_COMMIT`：小于 1 GiB 用 64 MiB，小于 4 GiB 用 256 MiB，
+  不超过 16 GiB 用 512 MiB，否则 1 GiB；仅 4 GiB 及以上开启 eager commit。原因是 mimalloc 在
+  `allocator_tune::apply()` 之前就创建了第一个 arena，已存在的 arena 无法缩小。主机内存布局特殊时可用
+  `systemctl edit pingwaf` 覆盖。
+- **已有配置优先**：如果 `/etc/pingwaf/pingwaf.toml` 已存在，安装器不会改写它，`--server-url` / `--api-key`
+  不会生效；agent 模式以文件为准。以启动日志里的 `server_url=...` 为准，需要变更时编辑 `[agent]` 后重启。
+- **443 的 `wrong version number`**：这是客户端用明文 HTTP 访问 TLS 端口（扫描器/误配客户端），不是 agent
+  连控制面的错误；公网边缘会持续出现，建议在日志采集侧过滤或限速，而不是关闭该监听目标的错误日志。
 - **不删数据卷**：compose 安装器 `--force` 只重写 `.env`，保留 `postgres-data`/`pingwaf-data`/`pingwaf-certs`；
   清理主机磁盘只能显式运行 `scripts/sweep-host-storage.sh --prune-volumes`，且它**永不删除 `waf_*`** 数据卷。
 - **旧 tag 提示**：安装器从 release tag 下载 compose 文件；若该 tag 的 compose 还没有上述加固（没有 `PINGWAF_SECRET_KEY` 透传、9080/9090 公网绑定、默认管理员口令），安装器会告警——请升级到包含这些改动的版本，而不要假定加固已生效。

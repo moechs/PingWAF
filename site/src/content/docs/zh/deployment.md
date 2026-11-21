@@ -69,7 +69,7 @@ curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh -
 curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh | bash -s -- --mode all-in-one
 ```
 
-Agent 模式下安装器会下载仅数据面的归档（`pingwaf-agent-<os>-<arch>`，不含 PostgreSQL、REST API 与控制台），并以 `/usr/local/bin/pingwaf` 名称安装，单元与命令保持不变。参数：`--mode all-in-one|server|agent`，`--no-systemd` 跳过单元安装，`--admin-email` / `--admin-password` / `--tls-sans`（或对应的 `PINGWAF_*` 环境变量）免提问写入初始设置，`--dry-run` 只预览安装计划不做改动。
+Agent 模式下安装器会下载仅数据面的归档（`pingwaf-agent-<os>-<arch>`，不含 PostgreSQL、REST API 与控制台），并以 `/usr/local/bin/pingwaf` 名称安装，单元与命令保持不变。生成的单元还会根据内存上限固定 mimalloc 的第一个 arena（小于 1 GiB 用 64 MiB，小于 4 GiB 用 256 MiB，不超过 16 GiB 用 512 MiB，否则 1 GiB；仅 4 GiB 及以上开启 eager commit），因为 mimalloc 在运行时设置该选项之前就已创建 arena。参数：`--mode all-in-one|server|agent`，`--no-systemd` 跳过单元安装，`--admin-email` / `--admin-password` / `--tls-sans`（或对应的 `PINGWAF_*` 环境变量）免提问写入初始设置，`--dry-run` 只预览安装计划不做改动。
 
 ## 配置优先级
 

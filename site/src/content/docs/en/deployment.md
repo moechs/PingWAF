@@ -69,7 +69,7 @@ curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh -
 curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh | bash -s -- --mode all-in-one
 ```
 
-In agent mode the installer downloads the agent-only archive (`pingwaf-agent-<os>-<arch>`, the data plane without PostgreSQL, the REST API or the dashboard) and installs it as `/usr/local/bin/pingwaf`, so the unit and commands stay the same. Flags: `--mode all-in-one|server|agent`, `--no-systemd` to skip the unit, `--admin-email` / `--admin-password` / `--tls-sans` (or the matching `PINGWAF_*` environment variables) to seed settings without prompts, and `--dry-run` to preview the plan without installing.
+In agent mode the installer downloads the agent-only archive (`pingwaf-agent-<os>-<arch>`, the data plane without PostgreSQL, the REST API or the dashboard) and installs it as `/usr/local/bin/pingwaf`, so the unit and commands stay the same. The generated unit also pins mimalloc's first arena from the memory ceiling (64 MiB below 1 GiB, 256 MiB below 4 GiB, 512 MiB up to 16 GiB, else 1 GiB; eager commit only at 4 GiB and above), because mimalloc creates that arena before the runtime can set the option. Flags: `--mode all-in-one|server|agent`, `--no-systemd` to skip the unit, `--admin-email` / `--admin-password` / `--tls-sans` (or the matching `PINGWAF_*` environment variables) to seed settings without prompts, and `--dry-run` to preview the plan without installing.
 
 ## Configuration precedence
 

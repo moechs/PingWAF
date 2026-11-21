@@ -61,6 +61,15 @@ use pingwaf_agent::config::AgentConfig;
 use pingwaf_server::ServerConfig;
 use tracing::{error, info, warn};
 
+/// Stable tracing target for the shared startup and data-plane logs.
+///
+/// Without an explicit target, tracing uses the module path: the full binary
+/// reports `pingwaf::pingwaf`, while the agent-only binary (whose crate is
+/// `pingwaf_agent`) would report `pingwaf_agent::pingwaf`. That breaks log
+/// filters, alerts and dashboards keyed on `pingwaf::`, so both builds use the
+/// full binary's target.
+const LOG_TARGET: &str = "pingwaf::pingwaf";
+
 /// The operating mode for PingWAF.
 pub enum RunMode {
     /// Control plane only: REST API + gRPC server + PostgreSQL
@@ -1246,7 +1255,7 @@ fn convert_cached_rules(
                 match default_key.clone().or_else(|| pool_keys.first().cloned())
                 {
                     Some(fallback) => {
-                        warn!(
+                        warn!(target: LOG_TARGET,
                             site = %site.domain,
                             route = %route.id,
                             pool = %route.pool_id,
@@ -1255,7 +1264,7 @@ fn convert_cached_rules(
                         fallback
                     },
                     None => {
-                        warn!(
+                        warn!(target: LOG_TARGET,
                             site = %site.domain,
                             route = %route.id,
                             "route pool has no peers and the site has no usable upstream; route skipped"
@@ -1440,7 +1449,7 @@ fn convert_cached_rules(
     // only once a certificate existed left fresh deployments with the port
     // closed until the whole process restarted.
     if certificates.is_empty() {
-        warn!(
+        warn!(target: LOG_TARGET,
             "data plane: no certificates yet — TLS handshakes on 443 will \
              fail until one is issued or uploaded"
         );
@@ -1561,7 +1570,7 @@ fn acme_certificate_conf(
     };
     if ssl.acme_challenge_type != "AcmeDns01" {
         if wildcard {
-            error!(
+            error!(target: LOG_TARGET,
                 domains = %domains,
                 "wildcard hostnames need the dns-01 ACME challenge; skipping issuance for the http-01 order"
             );
@@ -1574,7 +1583,7 @@ fn acme_certificate_conf(
         // config validation rejects outright.
         Some(provider) => provider,
         None if wildcard => {
-            error!(
+            error!(target: LOG_TARGET,
                 domains = %domains,
                 "wildcard hostnames need a configured DNS provider for dns-01; skipping issuance"
             );
@@ -1586,7 +1595,7 @@ fn acme_certificate_conf(
         // Manual mode renders no dns fields, i.e. the order falls back to
         // HTTP-01, which a wildcard can never pass.
         if wildcard {
-            error!(
+            error!(target: LOG_TARGET,
                 domains = %domains,
                 "the manual dns-01 provider cannot validate a wildcard automatically; skipping issuance"
             );
@@ -1622,7 +1631,7 @@ fn acme_dns_service_url(
             {
                 format!("https://dns.{region}.myhuaweicloud.com")
             } else if provider == "huawei" {
-                warn!(
+                warn!(target: LOG_TARGET,
                     "acme dns-01: huawei needs a region or endpoint, \
                      issuance will need manual DNS"
                 );
@@ -1635,7 +1644,7 @@ fn acme_dns_service_url(
                     "cf" => "api.cloudflare.com",
                     "tencent" => "dnspod.tencentcloudapi.com",
                     _ => {
-                        warn!(
+                        warn!(target: LOG_TARGET,
                             "acme dns-01: no endpoint configured for \
                              {provider}, issuance will need manual DNS"
                         );
@@ -1744,7 +1753,7 @@ pub async fn start_data_plane(
             break;
         }
         if i == 0 {
-            info!("data plane: waiting for control plane configuration...");
+            info!(target: LOG_TARGET, "data plane: waiting for control plane configuration...");
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -1752,7 +1761,7 @@ pub async fn start_data_plane(
     let config = match build_pingap_config(&rule_cache) {
         Some(config) => config,
         None => {
-            warn!("data plane: no sites configured, proxy not started");
+            warn!(target: LOG_TARGET, "data plane: no sites configured, proxy not started");
             // Keep waiting — the agent may receive config later
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1768,7 +1777,7 @@ pub async fn start_data_plane(
         .values()
         .flat_map(|s| s.locations.as_deref().unwrap_or_default())
         .count();
-    info!(
+    info!(target: LOG_TARGET,
         upstreams = config.upstreams.len(),
         locations = config.locations.len(),
         certificates = config.certificates.len(),
@@ -1801,7 +1810,7 @@ pub async fn start_data_plane(
     {
         Ok(merged) => merged,
         Err(e) => {
-            warn!(
+            warn!(target: LOG_TARGET,
                 error = %e,
                 "data plane: merged config failed validation, using freshly converted config"
             );
@@ -1827,13 +1836,13 @@ pub async fn start_data_plane(
     // uninspected and no access/security events are ever emitted.
     let (updated_plugins, plugin_errors) = try_init_plugins(&config.plugins);
     if !updated_plugins.is_empty() {
-        info!(
+        info!(target: LOG_TARGET,
             plugins = updated_plugins.join(","),
             "data plane: plugins initialized"
         );
     }
     if !plugin_errors.is_empty() {
-        error!(error = plugin_errors, "data plane: plugin init errors");
+        error!(target: LOG_TARGET, error = plugin_errors, "data plane: plugin init errors");
     }
 
     // Initialize certificates
@@ -1841,10 +1850,10 @@ pub async fn start_data_plane(
     if !config.certificates.is_empty() {
         let (updated, errors) = try_update_certificates(&config.certificates);
         if !updated.is_empty() {
-            info!(certs = updated.join(","), "data plane: certificates loaded");
+            info!(target: LOG_TARGET, certs = updated.join(","), "data plane: certificates loaded");
         }
         if !errors.is_empty() {
-            error!(error = errors, "data plane: certificate parse errors");
+            error!(target: LOG_TARGET, error = errors, "data plane: certificate parse errors");
         }
     }
 
@@ -1913,7 +1922,7 @@ pub async fn start_data_plane(
     // the issuance task or the port-80 challenge handler.
     let acme_enabled =
         !env_flag_is_true(std::env::var("PINGAP_DISABLE_ACME").ok().as_deref());
-    info!(enabled = acme_enabled, "data plane: ACME task state");
+    info!(target: LOG_TARGET, enabled = acme_enabled, "data plane: ACME task state");
     let mut background_tasks = BackgroundTaskService::new(
         "data_plane_background_tasks",
         Duration::from_secs(60),
@@ -1943,7 +1952,7 @@ pub async fn start_data_plane(
                 None,
             ),
         );
-        info!("data plane: ACME certificate management enabled");
+        info!(target: LOG_TARGET, "data plane: ACME certificate management enabled");
     }
     // Expired cache files have no other reclaimer on this entry point: the
     // periodic `storage_clear` service was registered only by the pingap
@@ -1974,7 +1983,7 @@ pub async fn start_data_plane(
         .map(|conf| conf.addr.as_str())
         .collect();
     if !no_timeouts.is_empty() {
-        warn!(
+        warn!(target: LOG_TARGET,
             listeners = %no_timeouts.join(" | "),
             "downstream read/write timeouts are not configured; a slow client \
              can hold a connection open indefinitely (set downstream_read_timeout \
@@ -2010,7 +2019,7 @@ pub async fn start_data_plane(
             .add_dependency(&bootstrap_handle);
     }
 
-    info!(
+    info!(target: LOG_TARGET,
         addrs = %config
             .servers
             .values()
@@ -2029,7 +2038,7 @@ pub async fn start_data_plane(
         None,
     );
     let hc_name = upstream_health_check_task.name().to_string();
-    info!(
+    info!(target: LOG_TARGET,
         service_name = %hc_name,
         "data plane: registering upstream health check background service"
     );
@@ -2056,7 +2065,7 @@ pub async fn start_data_plane(
                 pingap_plugin::PENDING_ACCESS_SWEEP_TTL,
             );
             if swept > 0 {
-                info!(
+                info!(target: LOG_TARGET,
                     count = swept,
                     "data plane: swept stale pending access entries"
                 );
@@ -2081,7 +2090,7 @@ pub async fn start_data_plane(
             if !tracker.is_due(&hash, Instant::now()) {
                 continue;
             }
-            info!(
+            info!(target: LOG_TARGET,
                 old = %tracker.applied,
                 new = %hash,
                 retry = tracker.failure.is_some(),
@@ -2100,7 +2109,7 @@ pub async fn start_data_plane(
             // with this detail until a retry goes through.
             let retry_in = tracker.failed(hash, Instant::now());
             let detail = errors.join("; ");
-            error!(
+            error!(target: LOG_TARGET,
                 error = %detail,
                 retry_in_secs = retry_in.as_secs(),
                 "data plane: reload did not apply in full, will retry"
@@ -2201,12 +2210,12 @@ async fn apply_reload(
 ) -> Vec<String> {
     let mut errors = Vec::new();
     if converted.locations.is_empty() && converted.certificates.is_empty() {
-        warn!("data plane: nothing left to serve, unloading every site");
+        warn!(target: LOG_TARGET, "data plane: nothing left to serve, unloading every site");
     }
     let new_toml = match toml::to_string_pretty(&converted) {
         Ok(new_toml) => new_toml,
         Err(e) => {
-            error!(
+            error!(target: LOG_TARGET,
                 error = %e,
                 "data plane: reload config serialization failed, keeping current"
             );
@@ -2224,7 +2233,7 @@ async fn apply_reload(
     {
         Ok(config) => config,
         Err(e) => {
-            warn!(
+            warn!(target: LOG_TARGET,
                 error = %e,
                 "data plane: merged reload config failed, using freshly converted config"
             );
@@ -2238,39 +2247,39 @@ async fn apply_reload(
         config.basic.origin_verify_cert,
         None,
     ) {
-        error!(error = %e, "data plane: reload upstreams failed");
+        error!(target: LOG_TARGET, error = %e, "data plane: reload upstreams failed");
         errors.push(format!("upstreams: {e}"));
     }
     if let Err(e) = try_init_locations(&config.locations) {
-        error!(error = %e, "data plane: reload locations failed");
+        error!(target: LOG_TARGET, error = %e, "data plane: reload locations failed");
         errors.push(format!("locations: {e}"));
     }
     if let Err(e) =
         try_init_server_locations(&config.servers, &config.locations)
     {
-        error!(error = %e, "data plane: reload server locations failed");
+        error!(target: LOG_TARGET, error = %e, "data plane: reload server locations failed");
         errors.push(format!("server locations: {e}"));
     }
     let (updated, cert_errors) = try_update_certificates(&config.certificates);
     if !updated.is_empty() {
-        info!(
+        info!(target: LOG_TARGET,
             certs = updated.join(","),
             "data plane: certificates reloaded"
         );
     }
     if !cert_errors.is_empty() {
-        error!(error = cert_errors, "data plane: certificate reload errors");
+        error!(target: LOG_TARGET, error = cert_errors, "data plane: certificate reload errors");
         errors.push(format!("certificates: {cert_errors}"));
     }
     let (updated_plugins, plugin_errors) = try_init_plugins(&config.plugins);
     if !updated_plugins.is_empty() {
-        info!(
+        info!(target: LOG_TARGET,
             plugins = updated_plugins.join(","),
             "data plane: plugins reloaded"
         );
     }
     if !plugin_errors.is_empty() {
-        error!(error = plugin_errors, "data plane: plugin reload errors");
+        error!(target: LOG_TARGET, error = plugin_errors, "data plane: plugin reload errors");
         errors.push(format!("plugins: {plugin_errors}"));
     }
     errors
@@ -2283,7 +2292,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
     match mode {
         #[cfg(not(feature = "edge"))]
         RunMode::Server(config) => {
-            info!(
+            info!(target: LOG_TARGET,
                 http_addr = %config.http_addr,
                 grpc_addr = %config.grpc_addr,
                 "starting PingWAF in Server mode (control plane only)"
@@ -2293,7 +2302,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
         RunMode::Agent(config) => run_agent(*config).await,
         #[cfg(not(feature = "edge"))]
         RunMode::AllInOne(server_config, mut agent_config) => {
-            info!(
+            info!(target: LOG_TARGET,
                 http_addr = %server_config.http_addr,
                 grpc_addr = %server_config.grpc_addr,
                 "starting PingWAF in All-in-One mode (control plane + data plane)"
@@ -2307,7 +2316,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
                         agent_config.api_key = key;
                     },
                     Err(e) => {
-                        error!(error = %e, "failed to create bootstrap API key for embedded agent");
+                        error!(target: LOG_TARGET, error = %e, "failed to create bootstrap API key for embedded agent");
                     },
                 }
             }
@@ -2321,7 +2330,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
                 },
                 Ok(None) => {},
                 Err(e) => {
-                    error!(
+                    error!(target: LOG_TARGET,
                         error = %e,
                         "failed to resolve the gRPC CA for the embedded agent; \
                          it will fall back to its configured CA settings"
@@ -2334,7 +2343,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
             let agent = match pingwaf_agent::start_agent(*agent_config).await {
                 Ok(agent) => Some(agent),
                 Err(e) => {
-                    error!(error = %e, "failed to start agent, continuing with server only");
+                    error!(target: LOG_TARGET, error = %e, "failed to start agent, continuing with server only");
                     None
                 },
             };
@@ -2344,7 +2353,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
                 let rule_cache = Arc::clone(&agent.rule_cache);
                 Some(tokio::spawn(async move {
                     if let Err(e) = start_data_plane(rule_cache).await {
-                        error!(error = %e, "data plane proxy exited with error");
+                        error!(target: LOG_TARGET, error = %e, "data plane proxy exited with error");
                     }
                 }))
             } else {
@@ -2373,7 +2382,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
 /// `pingwaf-agent` binary, so the two builds cannot drift in how they start,
 /// report or shut the data plane down.
 pub(crate) async fn run_agent(config: AgentConfig) -> anyhow::Result<()> {
-    info!(
+    info!(target: LOG_TARGET,
         server_url = %config.server_url,
         cache_dir = %config.cache_dir,
         "starting PingWAF in Agent mode (data plane only)"
@@ -2382,13 +2391,13 @@ pub(crate) async fn run_agent(config: AgentConfig) -> anyhow::Result<()> {
     // Opt-in self-upgrade: follows the control plane's build, then re-execs
     // this process (see `pingwaf_agent::upgrade`).
     let upgrade = pingwaf_agent::upgrade::spawn(Arc::clone(&agent));
-    info!("PingWAF agent is running, starting data plane proxy");
+    info!(target: LOG_TARGET, "PingWAF agent is running, starting data plane proxy");
 
     // Start the data plane proxy in the background
     let rule_cache = Arc::clone(&agent.rule_cache);
     let proxy_handle = tokio::spawn(async move {
         if let Err(e) = start_data_plane(rule_cache).await {
-            error!(error = %e, "data plane proxy exited with error");
+            error!(target: LOG_TARGET, error = %e, "data plane proxy exited with error");
         }
     });
 
@@ -2431,8 +2440,8 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => info!("received SIGINT"),
-        _ = terminate => info!("received SIGTERM"),
+        _ = ctrl_c => info!(target: LOG_TARGET, "received SIGINT"),
+        _ = terminate => info!(target: LOG_TARGET, "received SIGTERM"),
     }
 }
 
@@ -2472,7 +2481,7 @@ pub fn main() {
     };
 
     if let Err(e) = result {
-        error!(error = %e, "PingWAF exited with error");
+        error!(target: LOG_TARGET, error = %e, "PingWAF exited with error");
         eprintln!("PingWAF error: {e}");
         std::process::exit(1);
     }
@@ -2494,7 +2503,7 @@ pub fn edge_main() {
         .expect("failed to create tokio runtime");
 
     if let Err(e) = rt.block_on(run_agent(agent_config_from_opts(&opts))) {
-        error!(error = %e, "PingWAF agent exited with error");
+        error!(target: LOG_TARGET, error = %e, "PingWAF agent exited with error");
         eprintln!("PingWAF agent error: {e}");
         std::process::exit(1);
     }

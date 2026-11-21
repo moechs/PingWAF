@@ -471,6 +471,90 @@ systemd_env() { # $1 variable name, $2 value -> Environment="NAME=value"
     printf 'Environment="%s=%s"' "$1" "$value"
 }
 
+# ─── mimalloc arena sizing ────────────────────────────────────────────────────
+# mimalloc creates its first arena at load time, before `allocator_tune::apply()`
+# can call `mi_option_set`; an arena that already exists cannot be shrunk. On a
+# small host the default 1 GiB reserve is therefore what the process keeps (and
+# what `pmap` shows), even though the startup log prints the adaptive value.
+# The unit must carry the reserve in its **process environment**, which mimalloc
+# parses in `_mi_options_init` before the first arena.
+#
+# The buckets mirror `src/allocator_tune.rs` (`arena_reserve_for` /
+# `eager_commit_for`) and use the same memory ceiling: cgroup v2 limit, then
+# cgroup v1, then host `MemTotal`. Unknown/failed detection takes the small-host
+# bucket (64 MiB, eager commit off), the safe direction.
+detect_memory_ceiling_bytes() {
+    local raw=""
+
+    # cgroup v2: "max" means no limit; fall through to the host total.
+    if [[ -r /sys/fs/cgroup/memory.max ]]; then
+        raw="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+        if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw > 0 )); then
+            printf '%s' "$raw"
+            return 0
+        fi
+    fi
+
+    # cgroup v1: "infinity" is the huge sentinel, not a real limit.
+    if [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+        raw="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true)"
+        if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw > 0 && raw < 1152921504606846976 )); then
+            printf '%s' "$raw"
+            return 0
+        fi
+    fi
+
+    # Host total. `MemAvailable` is deliberately not used here: it fluctuates
+    # with the install-time workload, while the arena is a virtual reserve that
+    # should follow the same ceiling `allocator_tune` reads at runtime.
+    if [[ -r /proc/meminfo ]]; then
+        local kb
+        kb="$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+        if [[ "$kb" =~ ^[0-9]+$ ]] && (( kb > 0 )); then
+            printf '%s' "$((kb * 1024))"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# 64 MiB below 1 GiB, 256 MiB below 4 GiB, 512 MiB up to 16 GiB, else 1 GiB.
+allocator_arena_reserve_for() {
+    local total="${1:-0}" mib
+    mib=$(( total / 1048576 ))
+    if (( mib < 1024 )); then
+        printf '%s' "$((64 * 1024 * 1024))"
+    elif (( mib < 4096 )); then
+        printf '%s' "$((256 * 1024 * 1024))"
+    elif (( mib < 16384 )); then
+        printf '%s' "$((512 * 1024 * 1024))"
+    else
+        printf '%s' "$((1024 * 1024 * 1024))"
+    fi
+}
+
+# Eager commit is only worth it when the ceiling is at least 4 GiB; below that
+# the reservation must not be committed up front.
+allocator_eager_commit_for() {
+    local total="${1:-0}"
+    if (( total / 1048576 >= 4096 )); then
+        printf '1'
+    else
+        printf '0'
+    fi
+}
+
+# Two `Environment=` lines for the unit, computed from the same ceiling.
+allocator_env_lines() {
+    local ceiling reserve eager
+    ceiling="$(detect_memory_ceiling_bytes || true)"
+    reserve="$(allocator_arena_reserve_for "$ceiling")"
+    eager="$(allocator_eager_commit_for "$ceiling")"
+    printf '%s\n' "$(systemd_env MIMALLOC_ARENA_RESERVE "$reserve")"
+    printf '%s\n' "$(systemd_env MIMALLOC_ARENA_EAGER_COMMIT "$eager")"
+}
+
 validate_install_values() {
     reject_control_chars "mode" "$MODE"
     reject_control_chars "--version" "$VERSION"
@@ -555,6 +639,13 @@ print_plan_summary() {
     echo "  binary:      ${INSTALL_DIR}/${BINARY_NAME}"
     if [[ -n "${PLATFORM:-}" ]]; then
         echo "  asset:       $(asset_prefix "${MODE:-all-in-one}")-${OS}-${ARCH}.tar.xz"
+    fi
+    if [[ "${OS:-}" == "linux" ]]; then
+        local mem_ceiling mem_reserve mem_eager
+        mem_ceiling="$(detect_memory_ceiling_bytes || true)"
+        mem_reserve="$(allocator_arena_reserve_for "$mem_ceiling")"
+        mem_eager="$(allocator_eager_commit_for "$mem_ceiling")"
+        echo "  malloc:      arena_reserve=$((mem_reserve / 1048576))MiB eager_commit=${mem_eager} (ceiling=$(( ${mem_ceiling:-0} / 1048576 ))MiB)"
     fi
     echo "  config:      ${CONFIG_DIR}/pingwaf.toml"
     echo "  data:        ${DATA_DIR}"
@@ -1283,6 +1374,13 @@ $(systemd_env PINGWAF_SERVER_TLS_NAME "$SERVER_TLS_NAME")"
 $(systemd_env PINGWAF_TLS_ENABLED "true")"
     fi
 
+    # mimalloc parses these in `_mi_options_init`, before the first arena is
+    # created; setting them from `allocator_tune::apply()` is too late on a
+    # small host (the default 1 GiB arena cannot be shrunk). The values mirror
+    # the Rust buckets, see `allocator_env_lines`.
+    local allocator_env
+    allocator_env="$(allocator_env_lines)"
+
     info "Creating systemd service..."
 
     local cmd=""
@@ -1306,6 +1404,10 @@ Restart=always
 RestartSec=5
 LimitNOFILE=65536
 ${agent_env}
+# mimalloc's first arena is created before allocator_tune::apply(); without
+# these a small host keeps the 1 GiB default even though the startup log
+# prints the adaptive value.
+${allocator_env}
 # Log level; the default keeps sqlx's per-statement log out of the way:
 Environment=RUST_LOG=info,sqlx=warn
 # Instance secrets (PINGWAF_SECRET_KEY) live in a 0600 file; the leading dash
