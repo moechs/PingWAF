@@ -1257,14 +1257,23 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
                     if (!prev) return prev
                     const toChallenge =
                       nextScope === 'challenge' && prev.scope !== 'challenge'
+                    const fromChallenge =
+                      prev.scope === 'challenge' && nextScope !== 'challenge'
+                    const statusCode = defaultStatusCodeForScope(
+                      nextScope,
+                      prev.status_code,
+                    )
+                    const contentType = toChallenge ? 'text/html' : prev.content_type
                     return {
                       ...prev,
                       scope: nextScope,
-                      status_code: defaultStatusCodeForScope(nextScope, prev.status_code),
-                      content_type: toChallenge ? 'text/html' : prev.content_type,
+                      status_code: statusCode,
+                      content_type: contentType,
                       body_template: toChallenge
                         ? defaultChallengePageTemplate()
-                        : prev.body_template,
+                        : fromChallenge
+                          ? defaultErrorPageTemplate(statusCode, contentType)
+                          : prev.body_template,
                     }
                   })
                 }}

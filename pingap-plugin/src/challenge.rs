@@ -56,7 +56,7 @@ use pingwaf_challenge::{
 use std::borrow::Cow;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tera::{Context, Tera};
 use tracing::{debug, warn};
@@ -304,6 +304,27 @@ fn has_dom_id(html: &str, id: &str) -> bool {
         || html.contains(&format!("id='{id}'"))
 }
 
+/// The control-plane template is global and changes rarely; compiling Tera on
+/// every challenge would put a template parse on the hot path. Keep the last
+/// compiled template, keyed by its source, and rebuild only when it changes.
+type ChallengeTeraCache = Mutex<Option<(String, Arc<Tera>)>>;
+static CHALLENGE_TERA: OnceLock<ChallengeTeraCache> = OnceLock::new();
+
+fn challenge_tera(template: &str) -> Option<Arc<Tera>> {
+    let cache = CHALLENGE_TERA.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().ok()?;
+    if let Some((cached, tera)) = guard.as_ref()
+        && cached == template
+    {
+        return Some(Arc::clone(tera));
+    }
+    let mut tera = Tera::default();
+    tera.add_raw_template("challenge.html", template).ok()?;
+    let tera = Arc::new(tera);
+    *guard = Some((template.to_string(), Arc::clone(&tera)));
+    Some(tera)
+}
+
 /// Renders a control-plane challenge template through the same Tera engine the
 /// custom error pages use. The challenge script is injected as
 /// `challenge_scripts`; a template that omits `| safe` (Tera escapes it),
@@ -318,8 +339,7 @@ fn render_challenge_template(
         return None;
     }
     let scripts = challenge_scripts(params);
-    let mut tera = Tera::default();
-    tera.add_raw_template("challenge.html", template).ok()?;
+    let tera = challenge_tera(template)?;
     let mut context = Context::new();
     context.insert("brand_name", &params.brand_name);
     context.insert("request_id", &params.request_id);
@@ -2021,6 +2041,14 @@ cookie_secret = "test-secret"
 {{ challenge_scripts | safe }}
 </body></html>"#
             .to_string()
+    }
+
+    #[test]
+    fn challenge_tera_is_compiled_once_per_template() {
+        let template = challenge_template_fixture();
+        let first = challenge_tera(&template).expect("compiled");
+        let second = challenge_tera(&template).expect("cached");
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
