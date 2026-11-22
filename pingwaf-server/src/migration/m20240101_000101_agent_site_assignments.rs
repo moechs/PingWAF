@@ -33,23 +33,19 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(AgentSites::Table)
                     .if_not_exists()
-                    .col(
-                        ColumnDef::new(AgentSites::AgentId)
-                            .uuid()
-                            .not_null()
-                            .primary_key(),
-                    )
-                    .col(
-                        ColumnDef::new(AgentSites::SiteId)
-                            .uuid()
-                            .not_null()
-                            .primary_key(),
-                    )
+                    .col(ColumnDef::new(AgentSites::AgentId).uuid().not_null())
+                    .col(ColumnDef::new(AgentSites::SiteId).uuid().not_null())
                     .col(
                         ColumnDef::new(AgentSites::CreatedAt)
                             .timestamp_with_time_zone()
                             .not_null()
                             .default(Expr::current_timestamp()),
+                    )
+                    .primary_key(
+                        Index::create()
+                            .name("pk_agent_sites")
+                            .col(AgentSites::AgentId)
+                            .col(AgentSites::SiteId),
                     )
                     .foreign_key(
                         ForeignKey::create()
