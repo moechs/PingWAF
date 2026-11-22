@@ -2283,7 +2283,7 @@ export interface CreateRewriteRuleRequest {
 
 export type UpdateRewriteRuleRequest = Partial<CreateRewriteRuleRequest>
 
-/* ── Custom error pages ───────────────────────────────────────────── */
+/* ── Custom pages ───────────────────────────────────────────── */
 
 export type ErrorPageContentType = 'text/html' | 'application/json' | 'text/plain'
 

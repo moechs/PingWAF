@@ -8,7 +8,7 @@ import type {
 } from './types'
 
 /**
- * Custom error pages — `/api/v1/error-pages` (administrators only).
+ * Custom pages — `/api/v1/error-pages` (administrators only).
  *
  * One global template per status code: the list applies to every site, so the
  * settings page is the only place to edit it. The template is rendered with a

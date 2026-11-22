@@ -56,9 +56,9 @@ Operators can whitelist request paths that skip selected protection layers (`waf
 | `POST /sites/{id}/path-exceptions` | Create: `path` (starts with `/`, ≤512; a pattern for `regex`), `match_type` (`prefix`/`exact`/`wildcard`/`regex` — unanchored, case-sensitive Rust regex), `skip_layers`, `note`, `log_hits`, `enabled` |
 | `GET|PUT|DELETE /sites/{id}/path-exceptions/{id}` | Read / partial update / delete (`204`) |
 
-## Error page scopes
+## Custom page scopes
 
-Custom error pages (`GET|POST /error-pages`, administrators) carry a `scope`:
+Custom pages (`GET|POST /error-pages`, administrators; the API path keeps the historical name) carry a `scope`:
 
 - **`site`** (default) — replaces error responses of matched sites; status
   codes 400–599; templates render the full context (`request_id`,
@@ -71,6 +71,11 @@ Custom error pages (`GET|POST /error-pages`, administrators) carry a `scope`:
   and it never overrides a matched site's own locations. Its template gets
   only `{{ host }}` (HTML-escaped) and `{{ request_id }}`; responses carry
   `Cache-Control: no-store`.
+- **`challenge`** — the JS / managed / interactive challenge page; fixed
+  status 503 and `text/html`. Presentation only: the compiled challenge
+  scripts are injected with `{{ challenge_scripts | safe }}`; the template
+  must keep the `countdown`, `title`, `subtitle`, `status`, `spinnerWrap`,
+  `progressBar` and `progressFill` ids and must not contain `<script>`.
 
 ## Site clones copy everything
 

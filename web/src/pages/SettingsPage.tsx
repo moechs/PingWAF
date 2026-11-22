@@ -892,7 +892,7 @@ function LogRetentionCard({ canWrite }: { canWrite: boolean }) {
   )
 }
 
-/* ── Custom error pages ─────────────────────────────────────────────── */
+/* ── Custom pages (error responses and the challenge page) ───────────── */
 
 interface ErrorPageEditor {
   status_code: number

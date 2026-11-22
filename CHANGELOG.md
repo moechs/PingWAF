@@ -20,6 +20,13 @@ verbatim for reference and attribution, and is not maintained here.
   containing `<script>`, omitting the safe filter or missing one of the
   required DOM ids fall back to the built-in page with a warning.
 
+### Changed
+
+- **The dashboard section is now "Custom Pages"** (自定义页面 / カスタムページ),
+  covering error responses and the challenge page. The API path
+  `/api/v1/error-pages` and the `error_pages` table keep their historical names
+  for compatibility; docs explain the mapping.
+
 ### Fixed
 
 - **Removed stale `cargo-audit` ignores.** `RUSTSEC-2026-0344` (ruzstd) and

@@ -448,7 +448,7 @@ Dimension-based rate limit rules live on the separate Rate Limiting page; this t
 ### Challenge page template
 
 The challenge page is customized from the same global template editor as the
-error pages: **Settings → Custom Error Pages → Challenge page** (`scope =
+error pages: **Settings → Custom Pages → Challenge page** (`scope =
 challenge`, fixed status 503). One template applies to every site, matching the
 existing global error-page model. The template is presentation only: the
 fingerprinting, proof-of-work, verification and redirect JavaScript is compiled
@@ -821,29 +821,40 @@ removed, the response switched to chunked, strong `ETag` weakened to `W/`,
 Multi-value encodings (e.g. `gzip, br`) are still passed through untouched,
 no replacement.
 
-## Custom Error Pages
+## Custom Pages
 
 ```
-Sites → [site] → Error Pages → Add
+Settings → Custom Pages
 ```
+
+The same global editor holds the error-response templates and the challenge
+page. Each page carries a **scope**:
+
+| Scope | Use |
+|-------|-----|
+| `site` | Error responses of matched sites (403, 429, 502, 503, 504, …) |
+| `unmatched_host` | Requests whose `Host` matches no configured site |
+| `challenge` | The JS / managed / interactive challenge page (fixed 503) |
 
 | Field | Description |
 |-------|-------------|
-| Status code | HTTP status to customize (e.g., 403, 429, 502) |
-| Content type | `html`, `json`, or `text` |
-| Body | Custom response content |
+| Status code | HTTP status to customize (challenge is fixed at 503) |
+| Content type | `html`, `json`, or `text` (challenge is always `text/html`) |
+| Body | Tera template rendered by the edge |
 
-### Unmatched Host error pages
+The API and database keep the historical `error-pages` / `error_pages` names
+for compatibility; the console calls the feature **Custom Pages**.
+
+### Unmatched Host pages
 
 ```
-Settings → Error pages → Unmatched Host (unmatched_host)
+Settings → Custom Pages → Unmatched Host (unmatched_host)
 ```
 
-Error pages carry a **scope**. `site` (the default) pages replace error
-responses of sites that matched; `unmatched_host` pages answer requests that
-reached the gateway but whose `Host` header matched **no** configured site —
-someone poking at the bare IP + port, or a hostname that was never configured
-(or has since been removed).
+`site` (the default) pages replace error responses of sites that matched;
+`unmatched_host` pages answer requests that reached the gateway but whose
+`Host` header matched **no** configured site — someone poking at the bare IP +
+port, or a hostname that was never configured (or has since been removed).
 
 When to use one: to give scanners, stale DNS entries and direct-IP probes a
 branded answer instead of the gateway's plain default 404.
@@ -860,6 +871,17 @@ branded answer instead of the gateway's plain default 404.
 - **Matched sites are never affected**: the fallback location sits below
   every site's own locations, so a request for a configured hostname resolves
   to that site as usual.
+
+### Challenge page
+
+```
+Settings → Custom Pages → Challenge page (challenge)
+```
+
+Presentation-only template for the JS / managed / interactive challenge page.
+The compiled challenge scripts are injected at
+`{{ challenge_scripts | safe }}`; the required DOM ids and the no-`<script>`
+rule are described under [Challenges](#challenges-cc-protection).
 
 ## Log Management
 

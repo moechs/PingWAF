@@ -85,7 +85,7 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # 期
 
 ## 5. 关键环境变量
 
-> **挑战页模板**：在 **设置 → 自定义错误页 → 挑战页**（`scope=challenge`，固定 503）编辑。模板是全局
+> **挑战页模板**：在 **设置 → 自定义页面 → 挑战页**（`scope=challenge`，固定 503）编辑。模板是全局
 > Tera 模板，只控制展示；编译进二进制的挑战 JS 通过 `{{ challenge_scripts | safe }}` 注入，必须保留
 > `countdown`、`title`、`subtitle`、`status`、`spinnerWrap`、`progressBar`、`progressFill` 这些 DOM id，
 > 且不能包含 `<script>`。模板渲染失败、缺少 `| safe`、缺少 DOM id 或包含脚本标签时回退内置页面。

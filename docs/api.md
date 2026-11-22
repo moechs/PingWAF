@@ -4391,9 +4391,9 @@ Delete a rewrite rule.
 
 ---
 
-## Error Pages
+## Custom Pages
 
-A custom error page replaces the body of any response with a matching status
+A custom page replaces the body of any response with a matching status
 code — including responses the edge itself produces (a WAF block, a rate limit,
 a paused site), not only ones that came from the origin. At most one page per
 `(scope, status_code)` combination, and the pages are global: every site is
@@ -4402,6 +4402,9 @@ the dashboard.
 
 A write pushes the new templates to every registered agent's next configuration
 update, so no per-site publish is involved.
+
+The API and database keep the historical `error-pages` / `error_pages` names
+for compatibility; the console calls the feature **Custom Pages**.
 
 ### Scopes
 
