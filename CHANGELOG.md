@@ -8,6 +8,15 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [PingWAF 0.32.45] — 2026-11-22
+
+### Fixed
+
+- **Updated `url` to 2.5.9 for RUSTSEC-2026-0592.** The advisory is a stack
+  overflow in `Url::origin()` on nested `blob:` URLs; 2.5.8 was the version in
+  `Cargo.lock` and the Security Audit gate failed on it. The dependency bump
+  also carries `form_urlencoded` 1.2.3.
+
 ## [PingWAF 0.32.44] — 2026-11-22
 
 ### Fixed
