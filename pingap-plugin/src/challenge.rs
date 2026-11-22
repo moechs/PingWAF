@@ -50,9 +50,11 @@ use pingwaf_challenge::js_challenge::page::{
     generate_managed_challenge_html,
 };
 use pingwaf_challenge::{
-    BrowserFingerprint, ChallengeConfig, ChallengeDecision, ChallengeEngine,
-    ChallengeRequest, ChallengeSubmission, ClearanceLevel, VerifyResult,
-    generate_request_id,
+    AdaptiveDifficulty, BrowserFingerprint, ChallengeConfig, ChallengeDecision,
+    ChallengeEngine, ChallengeRequest, ChallengeSubmission, ClearanceLevel,
+    DEFAULT_MAX_TRACKED_KEYS, DIFFICULTY_DECAY_SECS, DifficultyState,
+    FixedWindowLimiter, LIMIT_WINDOW_SECS, LimitDecision, MAX_FAILURE_STEPS,
+    VerifyResult, generate_request_id,
 };
 use std::borrow::Cow;
 use std::path::Path;
@@ -89,6 +91,10 @@ pub(crate) struct PendingChallenge {
     pub nonce: String,
     pub site_id: String,
     pub original_url: String,
+    /// Proof-of-work difficulty this challenge was issued with. Adaptive
+    /// difficulty changes the required work per challenge, so verification
+    /// must use this value and not the site's current (or static) setting.
+    pub difficulty: u32,
     /// Client IP observed when the challenge was issued. Verification must
     /// come from the same address.
     pub client_ip: String,
@@ -217,6 +223,7 @@ pub(crate) fn store_pending(
     original_url: &str,
     client_ip: &str,
     user_agent: &str,
+    difficulty: u32,
 ) -> String {
     let now = now_secs();
     // Opportunistic garbage collection so the map cannot grow without bound.
@@ -245,6 +252,7 @@ pub(crate) fn store_pending(
         nonce: nonce.clone(),
         site_id: site_id.to_string(),
         original_url,
+        difficulty,
         client_ip: client_ip.to_string(),
         user_agent: user_agent.to_string(),
         created_at: now,
@@ -272,7 +280,7 @@ pub(crate) fn store_pending(
 /// The entry is removed only after the submission verifies. Taking it first
 /// made every failed PoW/fingerprint attempt unrecoverable: the browser had
 /// already lost the nonce by the time it tried to correct the answer.
-fn peek_pending(request_id: &str) -> Option<Arc<PendingChallenge>> {
+pub(crate) fn peek_pending(request_id: &str) -> Option<Arc<PendingChallenge>> {
     let pending = PENDING_CHALLENGES
         .get(request_id)
         .map(|entry| entry.clone())?;
@@ -399,8 +407,14 @@ pub(crate) fn build_challenge_response(
     difficulty: u32,
     kind: ChallengeKind,
 ) -> HttpResponse {
-    let nonce =
-        store_pending(request_id, site_id, original_url, client_ip, user_agent);
+    let nonce = store_pending(
+        request_id,
+        site_id,
+        original_url,
+        client_ip,
+        user_agent,
+        difficulty,
+    );
     let params = ChallengePageParams {
         request_id: request_id.to_string(),
         challenge_nonce: nonce,
@@ -727,13 +741,298 @@ struct RateWindow {
 // Per-site decision engines (control-plane mode)
 // ─────────────────────────────────────────────────────────────
 
-/// A cached per-site decision engine plus the agent config fingerprint it was
-/// built from.
+/// Challenge pages issued per host+IP per 60-second window when neither the
+/// site nor the plugin states a limit.
+pub(crate) const DEFAULT_ISSUE_LIMIT_PER_MIN: u32 = 120;
+
+/// Solution submissions accepted per host+IP per 60-second window by default.
+pub(crate) const DEFAULT_VERIFY_LIMIT_PER_MIN: u32 = 300;
+
+/// Hard ceiling on tracked host+IP pressure entries. Reaching it only loses
+/// the adaptive raise for new keys (they stay at the site's base difficulty),
+/// never the challenge itself.
+const PRESSURE_MAX_ENTRIES: usize = 8192;
+
+/// The per-site guards the request path applies on top of the decision engine.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChallengeLimits {
+    /// Base/max proof-of-work difficulty and the pressure signals feeding it.
+    pub(crate) adaptive: AdaptiveDifficulty,
+    /// Challenge pages issued per host+IP per minute.
+    pub(crate) issue_limit: u32,
+    /// Solution submissions accepted per host+IP per minute.
+    pub(crate) verify_limit: u32,
+}
+
+impl ChallengeLimits {
+    /// Guards for a caller that has only its own configuration: standalone
+    /// mode, or a site whose challenge settings row is absent.
+    pub(crate) fn standalone(
+        base: u32,
+        max: u32,
+        issue_limit: u32,
+        verify_limit: u32,
+    ) -> Self {
+        Self {
+            adaptive: AdaptiveDifficulty::new(base, max),
+            issue_limit,
+            verify_limit,
+        }
+    }
+}
+
+/// Request rate the engine and the adaptive difficulty use for a site, with
+/// the control plane's "0 means rate-based challenging is off" mapped onto the
+/// sentinel the engine understands.
+fn effective_rate_threshold(cfg: &CacheChallengeConfig) -> u32 {
+    if cfg.request_threshold == 0 {
+        u32::MAX
+    } else {
+        cfg.request_threshold
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Process-wide guards shared by every challenge minting path
+// ─────────────────────────────────────────────────────────────
+
+/// Issuance budget shared by the CC gate in this module and the WAF plugin's
+/// `Challenge` verdicts, keyed by host+IP. A page minted by either path costs
+/// the same budget, so a rule challenge cannot be used to bypass the per-IP
+/// limit the site configured.
+static ISSUE_LIMITER: LazyLock<FixedWindowLimiter> = LazyLock::new(|| {
+    FixedWindowLimiter::new(LIMIT_WINDOW_SECS, DEFAULT_MAX_TRACKED_KEYS)
+});
+
+/// Verification budget, keyed the same way.
+static VERIFY_LIMITER: LazyLock<FixedWindowLimiter> = LazyLock::new(|| {
+    FixedWindowLimiter::new(LIMIT_WINDOW_SECS, DEFAULT_MAX_TRACKED_KEYS)
+});
+
+/// Verification-failure pressure feeding adaptive difficulty, per host+IP.
+static DIFFICULTY_PRESSURE: LazyLock<DashMap<String, DifficultyState>> =
+    LazyLock::new(DashMap::new);
+
+/// Key for the per-site, per-address guards. Shared by the rate window, the
+/// issuance budget and the difficulty pressure so one request's decision,
+/// budget and difficulty all describe the same client.
+fn guard_key(host: &str, client_ip: &str) -> String {
+    if host.is_empty() {
+        client_ip.to_string()
+    } else {
+        format!("{host}:{client_ip}")
+    }
+}
+
+/// Current verification-failure pressure for `key`.
+fn pressure_state(key: &str) -> DifficultyState {
+    DIFFICULTY_PRESSURE
+        .get(key)
+        .map(|state| *state)
+        .unwrap_or_default()
+}
+
+/// Records the outcome of one verification attempt for `key`.
+///
+/// A success clears the record outright; a failure adds one (decayed) step,
+/// bounded by the table ceiling. Reaching the ceiling only means new keys stay
+/// at the base difficulty — the challenge itself still runs.
+fn note_verification(
+    key: &str,
+    adaptive: AdaptiveDifficulty,
+    success: bool,
+    now: i64,
+) {
+    if success {
+        DIFFICULTY_PRESSURE.remove(key);
+        return;
+    }
+    if !DIFFICULTY_PRESSURE.contains_key(key)
+        && DIFFICULTY_PRESSURE.len() >= PRESSURE_MAX_ENTRIES
+    {
+        return;
+    }
+    let mut entry = DIFFICULTY_PRESSURE.entry(key.to_string()).or_default();
+    *entry = adaptive.record_failure(*entry, now);
+}
+
+/// Drops pressure records whose failure steps have fully decayed, so the map
+/// cannot accumulate one entry per address that ever failed once. Throttled
+/// like the pending-challenge sweep: a full scan per request would be a CPU
+/// amplifier under the flood this exists to survive.
+fn sweep_pressure(now: i64) {
+    if DIFFICULTY_PRESSURE.len() <= 1024
+        || !GC_TICK
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(64)
+    {
+        return;
+    }
+    let ttl =
+        DIFFICULTY_DECAY_SECS.saturating_mul(i64::from(MAX_FAILURE_STEPS));
+    DIFFICULTY_PRESSURE
+        .retain(|_, state| now.saturating_sub(state.updated_at) < ttl);
+}
+
+/// The site's mint configuration from the agent cache: its guards and the rate
+/// threshold request pressure is measured against.
+///
+/// Unlike the challenge plugin's `site_challenge` this does **not** require the
+/// site's CC gate to be enabled: a WAF rule (or an IP/geo/rate-limit rule) may
+/// answer with a challenge on a site whose passive CC gate is off, and that
+/// page must still honour the site's difficulty and per-IP budget. `None` means
+/// "no site configuration" (standalone, or no row), so the caller's own
+/// configuration applies.
+fn site_mint_config(host: &str) -> Option<(ChallengeLimits, u32)> {
+    let agent = PingWafAgent::instance()?;
+    let rules = agent.get_rules_for_domain(host)?;
+    let cfg = rules.challenge_config.as_ref()?;
+    Some((site_limits(cfg), effective_rate_threshold(cfg)))
+}
+
+/// Everything one challenge mint needs from the caller.
+pub(crate) struct MintRequest<'a> {
+    /// Request id the page is built with (and the pending entry is keyed by).
+    pub(crate) request_id: &'a str,
+    /// Path (and query) the visitor is redirected to after solving.
+    pub(crate) original_url: &'a str,
+    /// Host the challenge is bound to; also the site id in the cookie.
+    pub(crate) site_id: &'a str,
+    pub(crate) client_ip: &'a str,
+    pub(crate) user_agent: &'a str,
+    /// Requests from this client in the current window when the caller tracks
+    /// one; `0` means "not measured" and contributes no rate pressure.
+    pub(crate) request_rate: u32,
+    pub(crate) kind: ChallengeKind,
+    /// Guards to use when the site carries no challenge configuration.
+    pub(crate) fallback: ChallengeLimits,
+    /// Rate threshold paired with `fallback` for request pressure.
+    pub(crate) fallback_rate_threshold: u32,
+}
+
+/// What one guarded mint produced.
+pub(crate) enum MintOutcome {
+    /// Send this challenge page (503).
+    Challenge(HttpResponse),
+    /// The client is over its issuance budget: send this 429 page instead.
+    RateLimited(HttpResponse),
+}
+
+impl MintOutcome {
+    /// Whether the response is a challenge page (as opposed to a rate-limit
+    /// refusal), which decides the `x-pingwaf-mitigated` value.
+    pub(crate) fn is_challenge(&self) -> bool {
+        matches!(self, Self::Challenge(_))
+    }
+
+    pub(crate) fn into_response(self) -> HttpResponse {
+        match self {
+            Self::Challenge(response) | Self::RateLimited(response) => response,
+        }
+    }
+}
+
+/// Mints a challenge page through the single guarded path every issuer uses
+/// (this plugin's CC gate and the WAF plugin's rule/access/rate-limit
+/// challenges).
+///
+/// It resolves the site's guards, charges the shared per-host+IP issuance
+/// budget and derives the adaptive difficulty from the shared pressure, then
+/// records the difficulty in the pending entry so verification checks exactly
+/// what the page was told.
+///
+/// Budget semantics follow [`FixedWindowLimiter`]: `Deny` is the only outcome
+/// that refuses the page. `Saturated` — the table is full of *other* clients —
+/// still mints, without a budget entry, because locking every new visitor out
+/// after an attacker fills the table would turn a burst guard into an outage.
+pub(crate) fn mint_challenge(request: MintRequest<'_>) -> MintOutcome {
+    let (limits, rate_threshold) = site_mint_config(request.site_id)
+        .unwrap_or((request.fallback, request.fallback_rate_threshold));
+    let key = guard_key(request.site_id, request.client_ip);
+    let now = now_secs();
+    match ISSUE_LIMITER.allow(&key, limits.issue_limit, now) {
+        LimitDecision::Deny => {
+            warn!(
+                request_id = %request.request_id,
+                site = %request.site_id,
+                "challenge issuance rate limit exceeded"
+            );
+            return MintOutcome::RateLimited(rate_limit_page(
+                request.request_id,
+                "too many challenges issued to this client; retry shortly",
+                LIMIT_WINDOW_SECS as u64,
+            ));
+        },
+        LimitDecision::Saturated => {
+            // Table full of other clients: mint without counting rather than
+            // refuse a legitimate visitor. Logged at debug so a many-source
+            // flood cannot turn this into a log amplifier.
+            debug!(
+                site = %request.site_id,
+                "challenge issuance table saturated; issuing without a budget entry"
+            );
+        },
+        LimitDecision::Allow => {},
+    }
+
+    sweep_pressure(now);
+    let difficulty = limits.adaptive.difficulty(
+        pressure_state(&key),
+        now,
+        request.request_rate,
+        rate_threshold,
+    );
+    MintOutcome::Challenge(build_challenge_response(
+        request.request_id,
+        request.original_url,
+        request.site_id,
+        request.client_ip,
+        request.user_agent,
+        difficulty,
+        request.kind,
+    ))
+}
+
+/// Resolves a site's guards from its cached challenge configuration.
+///
+/// A zero in the cache means "field absent": either the control plane predates
+/// the setting or the snapshot was written before the column existed. Falling
+/// back to the documented defaults keeps such a site on the historical
+/// behaviour (difficulty 20) instead of issuing difficulty-0 challenges.
+fn site_limits(cfg: &CacheChallengeConfig) -> ChallengeLimits {
+    let base = if cfg.base_difficulty == 0 {
+        pingwaf_challenge::DEFAULT_BASE_DIFFICULTY
+    } else {
+        cfg.base_difficulty
+    };
+    let max = if cfg.max_difficulty == 0 {
+        pingwaf_challenge::DEFAULT_MAX_DIFFICULTY
+    } else {
+        cfg.max_difficulty
+    };
+    ChallengeLimits {
+        adaptive: AdaptiveDifficulty::new(base, max),
+        issue_limit: if cfg.issue_limit_per_minute == 0 {
+            DEFAULT_ISSUE_LIMIT_PER_MIN
+        } else {
+            cfg.issue_limit_per_minute
+        },
+        verify_limit: if cfg.verify_limit_per_minute == 0 {
+            DEFAULT_VERIFY_LIMIT_PER_MIN
+        } else {
+            cfg.verify_limit_per_minute
+        },
+    }
+}
+
+/// A cached per-site decision engine plus the guard configuration and the
+/// agent config fingerprint it was built from.
 struct CachedChallengeEngine {
     /// Config fingerprint the engine was built from. An `Arc` so the per
     /// request fingerprint check stays allocation-free.
     fingerprint: Arc<str>,
     engine: Option<Arc<ChallengeEngine>>,
+    limits: ChallengeLimits,
     /// Unix seconds of the last cache hit; feeds the host-cache TTL sweep
     /// (`host_cache`) — wildcard-matched scanner hosts would otherwise cache
     /// a compiled engine forever.
@@ -747,7 +1046,7 @@ fn build_site_engine(
     cfg: &CacheChallengeConfig,
     cookie_secret: &str,
     cookie_name: &str,
-    pow_difficulty: u32,
+    base_difficulty: u32,
 ) -> ChallengeEngine {
     let default_level = match cfg.default_level {
         CacheChallengeLevel::None => ClearanceLevel::None,
@@ -770,16 +1069,15 @@ fn build_site_engine(
         // A zero threshold from the control plane means rate-based
         // challenging is disabled; the engine would otherwise challenge
         // everything above zero requests.
-        rate_threshold: if cfg.request_threshold == 0 {
-            u32::MAX
-        } else {
-            cfg.request_threshold
-        },
+        rate_threshold: effective_rate_threshold(cfg),
         browser_integrity_check: cfg.browser_integrity_check,
         tls_fingerprint_check: cfg.tls_fingerprint_check,
         cookie_secret: cookie_secret.to_string(),
         cookie_name: cookie_name.to_string(),
-        pow_difficulty,
+        // The engine's static difficulty is the site's base; the plugin issues
+        // pages with the adaptive value and records it in the pending entry,
+        // so verification never depends on this field.
+        pow_difficulty: base_difficulty,
         submission_max_age_secs: 300,
     })
 }
@@ -855,13 +1153,15 @@ pub struct ChallengePlugin {
     enabled: bool,
     cookie_name: String,
     cookie_secret: String,
-    pow_difficulty: u32,
     /// Per-site decision engines built from agent rules, keyed by host.
     site_engines: DashMap<String, CachedChallengeEngine>,
     /// Sweep gate for the `site_engines` host cache (TTL + hard cap).
     engine_sweep: HostCacheSweep,
     /// Per host+IP request counter used to feed `request_rate` to the engine.
     rates: DashMap<String, RateWindow>,
+    /// Guards used when no per-site configuration resolves: standalone mode,
+    /// or a request whose site has no challenge settings.
+    standalone_limits: ChallengeLimits,
 }
 
 impl ChallengePlugin {
@@ -902,12 +1202,16 @@ impl ChallengePlugin {
         count
     }
 
-    /// Resolves the decision engine for `host`: the per-site engine built
-    /// from agent rules in control-plane mode, the statically configured
-    /// engine in standalone mode. `None` means pass everything through.
-    fn decision_engine(&self, host: &str) -> Option<Arc<ChallengeEngine>> {
+    /// Resolves the decision engine and guards for `host`: the per-site pair
+    /// built from agent rules in control-plane mode, the statically
+    /// configured pair in standalone mode. `None` means pass everything
+    /// through.
+    fn site_challenge(
+        &self,
+        host: &str,
+    ) -> Option<(Arc<ChallengeEngine>, ChallengeLimits)> {
         if PingWafAgent::instance().is_none() {
-            return Some(Arc::clone(&self.engine));
+            return Some((Arc::clone(&self.engine), self.standalone_limits));
         }
         if host.is_empty() {
             return None;
@@ -934,23 +1238,25 @@ impl ChallengePlugin {
             && cached.fingerprint == fingerprint
         {
             touch(&cached.last_used, now);
-            return cached.engine.clone();
+            return cached.engine.clone().map(|engine| (engine, cached.limits));
         }
+        let limits = site_limits(cfg);
         let engine = Arc::new(build_site_engine(
             cfg,
             &self.cookie_secret,
             &self.cookie_name,
-            self.pow_difficulty,
+            limits.adaptive.base(),
         ));
         self.site_engines.insert(
             host.to_string(),
             CachedChallengeEngine {
                 fingerprint,
                 engine: Some(Arc::clone(&engine)),
+                limits,
                 last_used: AtomicU64::new(now),
             },
         );
-        Some(engine)
+        Some((engine, limits))
     }
 
     /// Bind a submission to the context that requested the challenge.
@@ -1040,7 +1346,15 @@ impl ChallengePlugin {
             .get("timestamp")
             .and_then(|v| v.as_i64())
             .unwrap_or_else(now_secs);
+        // The submission names the challenge it answers; carry it on the
+        // request context so an edge-generated answer (the over-limit 429)
+        // can be written to the access log under the same id the page shows.
+        ctx.state.request_id = Some(request_id.clone());
 
+        // The pending entry identifies the site the challenge was issued for;
+        // resolving the budget from it (rather than from the request's Host
+        // header) keeps a forged Host from steering which site's limits apply
+        // and from making the edge compile an engine for every random name.
         let Some(pending) = peek_pending(&request_id) else {
             return Ok(RequestPluginResult::Respond(block_page(
                 &request_id,
@@ -1059,6 +1373,48 @@ impl ChallengePlugin {
         let actual_user_agent =
             get_req_header_value(session.req_header(), "user-agent")
                 .unwrap_or_default();
+        let guard_key = guard_key(&pending.site_id, &actual_ip);
+        let now = now_secs();
+
+        // Per-address verification budget, checked before any verification
+        // work: an over-limit attempt must fail closed and must not spend the
+        // pending nonce, or a flood of guesses could burn a legitimate
+        // visitor's challenge. The nonce is only consumed once a submission
+        // has actually been accepted.
+        let (engine, limits) = self
+            .site_challenge(&pending.site_id)
+            .unwrap_or((Arc::clone(&self.engine), self.standalone_limits));
+        // Unlike issuance, verification fails closed when the table is full:
+        // a full table must not become an unmetered guessing channel. The
+        // visitor's challenge survives either way, so they can retry once the
+        // window rolls over.
+        if VERIFY_LIMITER.allow(&guard_key, limits.verify_limit, now)
+            != LimitDecision::Allow
+        {
+            warn!(
+                request_id = %request_id,
+                site = %pending.site_id,
+                "challenge verification rate limit exceeded"
+            );
+            let response = rate_limit_page(
+                &request_id,
+                "too many challenge verification attempts from this client",
+                LIMIT_WINDOW_SECS as u64,
+            );
+            // This branch answers the request itself, so the access-log
+            // response phase never runs: emit the entry here, like the other
+            // edge-generated responses, or the refusal is invisible in
+            // analytics.
+            super::waf::emit_challenge_access(
+                session,
+                ctx,
+                &pending.site_id,
+                &actual_ip,
+                &response,
+            );
+            return Ok(RequestPluginResult::Respond(response));
+        }
+
         if let Err(reason) = Self::pending_matches_request(
             &pending,
             &actual_ip,
@@ -1070,6 +1426,7 @@ impl ChallengePlugin {
                 reason,
                 "challenge submission context does not match the issued challenge"
             );
+            note_verification(&guard_key, limits.adaptive, false, now);
             return Ok(RequestPluginResult::Respond(block_page(
                 &request_id,
                 reason,
@@ -1090,12 +1447,19 @@ impl ChallengePlugin {
         // `browser_integrity_check`, clearance duration and TLS-fingerprint
         // settings: a site that disabled the integrity check still rejected
         // every headless/automated browser during verification.
-        let engine = self
-            .decision_engine(&pending.site_id)
-            .unwrap_or_else(|| Arc::clone(&self.engine));
         let result = engine.verify_solution_for_pending(
             &submission,
             ctx.conn.tls_version.is_some(),
+            // The difficulty recorded when this challenge was issued — not
+            // the site's current setting, which adaptive pressure may have
+            // changed since.
+            pending.difficulty,
+        );
+        note_verification(
+            &guard_key,
+            limits.adaptive,
+            matches!(result, VerifyResult::Success { .. }),
+            now,
         );
 
         match result {
@@ -1176,8 +1540,34 @@ impl TryFrom<&PluginConf> for ChallengePlugin {
             get_int_conf_or_default(value, "clearance_duration_secs", 1800);
         let rate_threshold =
             get_int_conf_or_default(value, "rate_threshold", 100) as u32;
+        // Standalone guards. `pow_difficulty` is the base a quiet visitor
+        // solves; `pow_max_difficulty` is the adaptive ceiling (clamped up to
+        // the base, so a site that raises the base keeps a coherent pair).
         let pow_difficulty =
             get_int_conf_or_default(value, "pow_difficulty", 20) as u32;
+        let pow_max_difficulty = get_int_conf_or_default(
+            value,
+            "pow_max_difficulty",
+            i64::from(pingwaf_challenge::DEFAULT_MAX_DIFFICULTY),
+        ) as u32;
+        let standalone_limits = ChallengeLimits {
+            adaptive: AdaptiveDifficulty::new(
+                pow_difficulty,
+                pow_max_difficulty,
+            ),
+            issue_limit: get_int_conf_or_default(
+                value,
+                "pow_issue_limit_per_min",
+                i64::from(DEFAULT_ISSUE_LIMIT_PER_MIN),
+            )
+            .clamp(0, i64::from(u32::MAX)) as u32,
+            verify_limit: get_int_conf_or_default(
+                value,
+                "pow_verify_limit_per_min",
+                i64::from(DEFAULT_VERIFY_LIMIT_PER_MIN),
+            )
+            .clamp(0, i64::from(u32::MAX)) as u32,
+        };
 
         let mut cookie_secret =
             resolve_cookie_secret(&get_str_conf(value, "cookie_secret"));
@@ -1239,7 +1629,7 @@ impl TryFrom<&PluginConf> for ChallengePlugin {
             enabled,
             cookie_name,
             cookie_secret,
-            pow_difficulty,
+            standalone_limits,
             site_engines: DashMap::new(),
             engine_sweep: HostCacheSweep::default(),
             rates: DashMap::new(),
@@ -1331,7 +1721,7 @@ impl Plugin for ChallengePlugin {
                 .unwrap_or_default()
                 .to_string();
 
-        let Some(engine) = self.decision_engine(&host) else {
+        let Some((engine, limits)) = self.site_challenge(&host) else {
             return Ok(RequestPluginResult::Continue);
         };
 
@@ -1354,11 +1744,7 @@ impl Plugin for ChallengePlugin {
 
         // Rate windows are per site so one domain's burst never charges
         // another's budget.
-        let rate_key = if host.is_empty() {
-            client_ip.clone()
-        } else {
-            format!("{host}:{client_ip}")
-        };
+        let rate_key = guard_key(&host, &client_ip);
         let request_rate = self.record_rate(&rate_key);
         let challenge_request = ChallengeRequest {
             path,
@@ -1422,15 +1808,23 @@ impl Plugin for ChallengePlugin {
             _ => ChallengeKind::Js,
         };
 
-        let response = build_challenge_response(
-            &request_id,
-            &original_url,
-            &site_id,
-            &client_ip,
-            &user_agent,
-            self.pow_difficulty,
+        // One guarded mint for every issuer: the shared per-host+IP budget
+        // decides between a challenge page and an explicit 429, and the
+        // shared pressure decides the adaptive difficulty. The issued
+        // difficulty is recorded in the pending entry, so verification checks
+        // exactly what the page was told.
+        let outcome = mint_challenge(MintRequest {
+            request_id: &request_id,
+            original_url: &original_url,
+            site_id: &site_id,
+            client_ip: &client_ip,
+            user_agent: &user_agent,
+            request_rate,
             kind,
-        );
+            fallback: limits,
+            fallback_rate_threshold: engine.config().rate_threshold,
+        });
+        let response = outcome.into_response();
         // L3-005: the challenge 503 never reached the access-log response
         // phase, so analytics showed none of the challenged traffic. Emit
         // the entry here, keyed by the host the challenge was issued for.
@@ -1444,7 +1838,7 @@ impl Plugin for ChallengePlugin {
 register_plugin!("challenge", ChallengePlugin);
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use pingap_core::PluginStep;
     use pingora::proxy::Session;
@@ -1464,6 +1858,7 @@ mod tests {
             nonce: "nonce".to_string(),
             site_id: "example.com".to_string(),
             original_url: "/".to_string(),
+            difficulty: 20,
             client_ip: "203.0.113.10".to_string(),
             user_agent: "TestBrowser/1.0".to_string(),
             created_at: now_secs(),
@@ -1545,6 +1940,7 @@ mod tests {
             &long_url,
             "203.0.113.10",
             "test-agent",
+            20,
         );
         let pending = peek_pending(&request_id).expect("pending entry");
         assert_eq!("/", pending.original_url);
@@ -1753,7 +2149,15 @@ exempt_paths = ["/health"]
         .unwrap();
         assert!(plugin.enabled);
         assert_eq!("__test_clearance", plugin.cookie_name);
-        assert_eq!(0, plugin.pow_difficulty);
+        assert_eq!(0, plugin.standalone_limits.adaptive.base());
+        assert_eq!(
+            DEFAULT_ISSUE_LIMIT_PER_MIN,
+            plugin.standalone_limits.issue_limit
+        );
+        assert_eq!(
+            DEFAULT_VERIFY_LIMIT_PER_MIN,
+            plugin.standalone_limits.verify_limit
+        );
         assert_eq!(PluginStep::EarlyRequest, plugin.plugin_step);
     }
 
@@ -1876,7 +2280,7 @@ cookie_secret = "test-secret"
 
     /// Installs an agent whose site carries the given challenge config, plus
     /// a second site with none, to exercise per-site resolution.
-    async fn install_challenge_agent(
+    pub(crate) async fn install_challenge_agent(
         challenge: Option<proto::ChallengeConfig>,
     ) -> (
         tokio::sync::MutexGuard<'static, ()>,
@@ -1981,8 +2385,36 @@ cookie_secret = "test-secret"
         path: &str,
         cookie: &str,
     ) -> RequestPluginResult {
+        run_challenge_request_with_headers(plugin, host, path, cookie, "").await
+    }
+
+    /// Requests a page as `client_ip`, so the process-wide guards see a client
+    /// no other test uses. (A mock session has no peer address, so the
+    /// forwarded header is what resolves.)
+    async fn run_challenge_request_as(
+        plugin: &ChallengePlugin,
+        host: &str,
+        path: &str,
+        client_ip: &str,
+    ) -> RequestPluginResult {
+        run_challenge_request_with_headers(plugin, host, path, "", client_ip)
+            .await
+    }
+
+    async fn run_challenge_request_with_headers(
+        plugin: &ChallengePlugin,
+        host: &str,
+        path: &str,
+        cookie: &str,
+        client_ip: &str,
+    ) -> RequestPluginResult {
+        let forwarded = if client_ip.is_empty() {
+            String::new()
+        } else {
+            format!("X-Forwarded-For: {client_ip}\r\n")
+        };
         let input_header = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\n\r\n"
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\n{forwarded}\r\n"
         );
         let mock_io = Builder::new().read(input_header.as_bytes()).build();
         let mut session = TestSession::new_h1(Box::new(mock_io));
@@ -2014,6 +2446,10 @@ cookie_secret = "test-secret"
                 request_threshold: 0,
                 browser_integrity_check: true,
                 tls_fingerprint_check: false,
+                base_difficulty: 20,
+                max_difficulty: 24,
+                issue_limit_per_minute: 120,
+                verify_limit_per_minute: 300,
             }),
             vec![proto::PathException {
                 id: "rate-api".to_string(),
@@ -2061,6 +2497,10 @@ cookie_secret = "test-secret"
                 request_threshold: 0,
                 browser_integrity_check: true,
                 tls_fingerprint_check: false,
+                base_difficulty: 20,
+                max_difficulty: 24,
+                issue_limit_per_minute: 120,
+                verify_limit_per_minute: 300,
             }))
             .await;
         let plugin = ChallengePlugin::new(
@@ -2109,6 +2549,10 @@ cookie_secret = "test-secret"
                 request_threshold: 0,
                 browser_integrity_check: false,
                 tls_fingerprint_check: false,
+                base_difficulty: 20,
+                max_difficulty: 24,
+                issue_limit_per_minute: 120,
+                verify_limit_per_minute: 300,
             }))
             .await;
         let plugin = ChallengePlugin::new(
@@ -2197,6 +2641,491 @@ cookie_secret = "test-secret"
         };
         assert_eq!(StatusCode::FORBIDDEN, resp.status);
     }
+    /// A cache snapshot (or an older control plane) that predates the new
+    /// settings deserialises them as 0; the guards must fall back to the
+    /// documented defaults instead of issuing difficulty-0 challenges, so an
+    /// existing site keeps behaving exactly as before.
+    #[test]
+    fn a_site_without_the_new_settings_keeps_difficulty_20() {
+        let cfg: CacheChallengeConfig =
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "under_attack_mode": false,
+                "default_level": "non_interactive",
+                "clearance_duration_seconds": 1800,
+                "exempt_paths": [],
+                "request_threshold": 100,
+                "browser_integrity_check": true,
+                "tls_fingerprint_check": false,
+            }))
+            .expect("a snapshot written before the settings existed");
+        let limits = site_limits(&cfg);
+        assert_eq!(20, limits.adaptive.base());
+        assert_eq!(24, limits.adaptive.max());
+        assert_eq!(DEFAULT_ISSUE_LIMIT_PER_MIN, limits.issue_limit);
+        assert_eq!(DEFAULT_VERIFY_LIMIT_PER_MIN, limits.verify_limit);
+        // A quiet visitor is issued the historical difficulty.
+        assert_eq!(
+            20,
+            limits
+                .adaptive
+                .difficulty(DifficultyState::default(), 0, 0, 100)
+        );
+    }
+
+    /// Runs one solution submission against the verify endpoint.
+    async fn run_verify_submission_as(
+        plugin: &ChallengePlugin,
+        host: &str,
+        client_ip: &str,
+        payload: &serde_json::Value,
+    ) -> RequestPluginResult {
+        let body = payload.to_string();
+        let forwarded = if client_ip.is_empty() {
+            String::new()
+        } else {
+            format!("X-Forwarded-For: {client_ip}\r\n")
+        };
+        let input_header = format!(
+            "POST {VERIFY_ENDPOINT} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n{forwarded}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mock_io = Builder::new().read(input_header.as_bytes()).build();
+        let mut session = TestSession::new_h1(Box::new(mock_io));
+        session.read_request().await.unwrap();
+        plugin
+            .handle_request(
+                TestPluginStep::EarlyRequest,
+                &mut session,
+                &mut Ctx::default(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Reads a `field: value` entry out of the challenge page's JS config.
+    fn page_config(body: &str, field: &str) -> String {
+        let marker = format!("{field}: ");
+        let start = body
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{field} missing from page"))
+            + marker.len();
+        let rest = &body[start..];
+        let end = rest.find(",\n").unwrap_or(rest.len());
+        rest[..end].trim().trim_matches('"').to_string()
+    }
+
+    /// The submission the page would send for `request_id`/`nonce` at
+    /// `difficulty`, with an empty User-Agent matching the mock request.
+    fn verify_payload(
+        request_id: &str,
+        solution: &str,
+        timestamp: i64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "request_id": request_id,
+            "solution": solution,
+            "fingerprint_json": serde_json::json!({
+                "user_agent": "",
+                "screen_width": 1920,
+                "screen_height": 1080,
+                "timezone_offset": 0,
+                "language": "en",
+                "platform": "MacIntel",
+                "canvas_hash": "abc",
+                "webgl_vendor": "",
+                "webgl_renderer": "",
+                "plugins_count": 0,
+                "touch_support": false,
+                "hardware_concurrency": 8,
+                "device_memory": 8.0
+            })
+            .to_string(),
+            "timestamp": timestamp,
+        })
+    }
+
+    /// Brute-forces a solution that satisfies `difficulty` for `nonce`.
+    fn solve(nonce: &str, difficulty: u32) -> String {
+        (0u32..)
+            .map(|candidate| candidate.to_string())
+            .find(|candidate| {
+                pingwaf_challenge::js_challenge::verify::verify_proof_of_work(
+                    nonce, candidate, difficulty,
+                )
+            })
+            .expect("a solution")
+    }
+
+    /// A solution that does *not* satisfy `difficulty` for `nonce`.
+    fn unsolved(nonce: &str, difficulty: u32) -> String {
+        (0u32..)
+            .map(|candidate| candidate.to_string())
+            .find(|candidate| {
+                !pingwaf_challenge::js_challenge::verify::verify_proof_of_work(
+                    nonce, candidate, difficulty,
+                )
+            })
+            .expect("an unsolved candidate")
+    }
+
+    /// Requests one challenge page as `client_ip` and returns
+    /// (status, body, request id). The address is explicit because the guards
+    /// are process-wide: a test that asserts a budget must describe a client
+    /// of its own.
+    async fn challenge_page_as(
+        plugin: &ChallengePlugin,
+        host: &str,
+        client_ip: &str,
+    ) -> (StatusCode, String, String) {
+        let RequestPluginResult::Respond(resp) =
+            run_challenge_request_as(plugin, host, "/dashboard", client_ip)
+                .await
+        else {
+            panic!("expected a challenge response");
+        };
+        let body = String::from_utf8_lossy(&resp.body).to_string();
+        let request_id = page_config(&body, "requestId");
+        (resp.status, body, request_id)
+    }
+
+    /// Clears the process-wide guard tables when the test ends, so a test that
+    /// deliberately saturates them cannot leak into the next one. Every test
+    /// that touches a budget holds the agent lock, so the tables are its own
+    /// while it runs.
+    struct GuardTablesReset;
+
+    impl Drop for GuardTablesReset {
+        fn drop(&mut self) {
+            ISSUE_LIMITER.clear();
+            VERIFY_LIMITER.clear();
+            DIFFICULTY_PRESSURE.clear();
+        }
+    }
+
+    pub(crate) fn site_challenge_config(
+        issue_limit: u32,
+        verify_limit: u32,
+        base: u32,
+        max: u32,
+    ) -> proto::ChallengeConfig {
+        proto::ChallengeConfig {
+            enabled: true,
+            under_attack_mode: true,
+            default_level: proto::ChallengeLevel::ChallengeNonInteractive
+                as i32,
+            clearance_duration_seconds: 1800,
+            exempt_paths: Vec::new(),
+            request_threshold: 0,
+            browser_integrity_check: false,
+            tls_fingerprint_check: false,
+            base_difficulty: base,
+            max_difficulty: max,
+            issue_limit_per_minute: issue_limit,
+            verify_limit_per_minute: verify_limit,
+        }
+    }
+
+    /// A client above the site's issuance limit gets an explicit 429 (a
+    /// challenge it cannot complete would just loop), stamped as mitigated.
+    #[tokio::test]
+    async fn test_issuance_over_the_limit_returns_429() {
+        let (_guard, _agent, _dir) =
+            install_challenge_agent(Some(site_challenge_config(2, 300, 4, 4)))
+                .await;
+        let _reset = GuardTablesReset;
+        let plugin = ChallengePlugin::new(
+            &toml::from_str::<PluginConf>(
+                r###"cookie_secret = "test-secret""###,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // The guards are process-wide, so this test uses a client address no
+        // other test issues for.
+        let client = "198.51.100.11";
+
+        for _ in 0..2 {
+            let (status, _, _) =
+                challenge_page_as(&plugin, "example.com", client).await;
+            assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
+        }
+        let RequestPluginResult::Respond(resp) = run_challenge_request_as(
+            &plugin,
+            "example.com",
+            "/dashboard",
+            client,
+        )
+        .await
+        else {
+            panic!("over the issuance limit the plugin must answer");
+        };
+        assert_eq!(StatusCode::TOO_MANY_REQUESTS, resp.status);
+        let body = String::from_utf8_lossy(&resp.body).to_string();
+        assert!(body.contains("Rate Limit Exceeded"), "body: {body}");
+        assert_eq!(
+            Some("block"),
+            header_value(&resp, "x-pingwaf-mitigated").as_deref()
+        );
+        assert_eq!(Some("pingwaf"), header_value(&resp, "server").as_deref());
+    }
+
+    /// Regression (R1): a full issuance table must not lock new visitors out.
+    ///
+    /// `Saturated` means "the table is full of *other* clients", not "this
+    /// client is over budget" — only `Deny` may refuse a page. Treating
+    /// saturation as a refusal turned an attacker's address space into a
+    /// site-wide outage, because every visitor the table had no room for got
+    /// a 429.
+    #[tokio::test]
+    async fn test_saturated_issuance_table_still_issues_a_challenge() {
+        let (_guard, _agent, _dir) = install_challenge_agent(Some(
+            site_challenge_config(300, 300, 4, 4),
+        ))
+        .await;
+        let _reset = GuardTablesReset;
+        let plugin = ChallengePlugin::new(
+            &toml::from_str::<PluginConf>(
+                r###"cookie_secret = "test-secret""###,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Fill the shared budget exactly as a many-source flood would: one
+        // key per address, none of them over its own limit.
+        let now = now_secs();
+        for index in 0..DEFAULT_MAX_TRACKED_KEYS {
+            ISSUE_LIMITER.allow(&format!("filler.example:{index}"), 5, now);
+        }
+        assert_eq!(
+            LimitDecision::Saturated,
+            ISSUE_LIMITER.allow("new.example:203.0.113.99", 5, now),
+            "the table must actually be saturated for this test to mean anything"
+        );
+
+        // A visitor the table has never seen still gets a challenge page, and
+        // the page is solvable: the difficulty it states is the one recorded
+        // with the pending entry, so verification accepts the same work.
+        let (status, body, request_id) =
+            challenge_page_as(&plugin, "example.com", "198.51.100.14").await;
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
+        assert_eq!("4", page_config(&body, "difficulty"));
+        let pending = peek_pending(&request_id).expect("pending challenge");
+        assert_eq!(4, pending.difficulty);
+    }
+
+    /// Over the verification limit an attempt fails closed *before* the
+    /// pending lookup, so a flood of guesses cannot spend a legitimate
+    /// visitor's nonce.
+    #[tokio::test]
+    async fn test_verify_over_the_limit_does_not_consume_the_nonce() {
+        let (_guard, _agent, _dir) =
+            install_challenge_agent(Some(site_challenge_config(300, 2, 4, 4)))
+                .await;
+        let _reset = GuardTablesReset;
+        let plugin = ChallengePlugin::new(
+            &toml::from_str::<PluginConf>(
+                r###"cookie_secret = "test-secret""###,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let client = "198.51.100.12";
+
+        let (_, _, request_id) =
+            challenge_page_as(&plugin, "example.com", client).await;
+        let pending = peek_pending(&request_id).expect("pending challenge");
+        let timestamp = chrono::Utc::now().timestamp();
+        let wrong = verify_payload(
+            &request_id,
+            &unsolved(&pending.nonce, 4),
+            timestamp,
+        );
+
+        // Two wrong answers are allowed through to the verifier and rejected
+        // there; the pending entry survives (a failed proof is retryable).
+        for _ in 0..2 {
+            let RequestPluginResult::Respond(resp) = run_verify_submission_as(
+                &plugin,
+                "example.com",
+                client,
+                &wrong,
+            )
+            .await
+            else {
+                panic!("a wrong solution must be rejected");
+            };
+            assert_eq!(StatusCode::FORBIDDEN, resp.status);
+            assert!(peek_pending(&request_id).is_some());
+        }
+
+        // The third attempt is over the limit: a 429, and the nonce is still
+        // there — the visitor can retry once the window rolls over.
+        let RequestPluginResult::Respond(resp) = run_verify_submission_as(
+            &plugin,
+            "example.com",
+            client,
+            &verify_payload(
+                &request_id,
+                &solve(&pending.nonce, 4),
+                chrono::Utc::now().timestamp(),
+            ),
+        )
+        .await
+        else {
+            panic!("over the verify limit the plugin must answer");
+        };
+        assert_eq!(StatusCode::TOO_MANY_REQUESTS, resp.status);
+        assert!(peek_pending(&request_id).is_some());
+    }
+
+    /// Regression (R4): the over-limit verification refusal answers the
+    /// request itself, so the access-log response phase never runs. It must be
+    /// written explicitly, like every other edge-generated response — an
+    /// invisible 429 would make the limiter look like a silent outage.
+    #[tokio::test]
+    async fn verify_rate_limit_is_written_to_the_access_log() {
+        let (_guard, agent, _dir) =
+            install_challenge_agent(Some(site_challenge_config(300, 1, 4, 4)))
+                .await;
+        let _reset = GuardTablesReset;
+        let plugin = ChallengePlugin::new(
+            &toml::from_str::<PluginConf>(
+                r###"cookie_secret = "test-secret""###,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let client = "198.51.100.15";
+        let (_, _, request_id) =
+            challenge_page_as(&plugin, "example.com", client).await;
+        let pending = peek_pending(&request_id).expect("pending challenge");
+        // The issuance page itself is logged; this test is about the refusal.
+        while agent.client.pop_log().await.is_some() {}
+
+        let wrong = verify_payload(
+            &request_id,
+            &unsolved(&pending.nonce, 4),
+            chrono::Utc::now().timestamp(),
+        );
+        // The one allowed attempt reaches the verifier and is rejected there;
+        // that answer is a plain 403, not a generated edge response.
+        let RequestPluginResult::Respond(resp) =
+            run_verify_submission_as(&plugin, "example.com", client, &wrong)
+                .await
+        else {
+            panic!("a wrong solution must be rejected");
+        };
+        assert_eq!(StatusCode::FORBIDDEN, resp.status);
+        assert!(agent.client.pop_log().await.is_none());
+
+        // The next attempt is over the budget: a 429 that must be logged.
+        let RequestPluginResult::Respond(resp) =
+            run_verify_submission_as(&plugin, "example.com", client, &wrong)
+                .await
+        else {
+            panic!("over the verify limit the plugin must answer");
+        };
+        assert_eq!(StatusCode::TOO_MANY_REQUESTS, resp.status);
+        let entry = agent
+            .client
+            .pop_log()
+            .await
+            .expect("the verify 429 must reach the access log");
+        assert_eq!(429, entry.response_status);
+        assert_eq!(request_id, entry.request_id);
+        assert_eq!(client, entry.client_ip);
+        assert_eq!("example.com", entry.site_id);
+    }
+
+    /// Adaptive difficulty: repeated verification failures raise the work the
+    /// next page states, up to the site's ceiling, and the same page's
+    /// solution verifies — the value is per challenge, not a static setting.
+    #[tokio::test]
+    async fn test_adaptive_difficulty_raises_then_resets() {
+        let (_guard, _agent, _dir) = install_challenge_agent(Some(
+            site_challenge_config(300, 300, 4, 6),
+        ))
+        .await;
+        let _reset = GuardTablesReset;
+        let plugin = ChallengePlugin::new(
+            &toml::from_str::<PluginConf>(
+                r###"cookie_secret = "test-secret""###,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let client = "198.51.100.13";
+
+        let (_, body, request_id) =
+            challenge_page_as(&plugin, "example.com", client).await;
+        assert_eq!("4", page_config(&body, "difficulty"));
+
+        // Three failures are three steps, capped at the site's max.
+        let pending = peek_pending(&request_id).expect("pending challenge");
+        let wrong = verify_payload(
+            &request_id,
+            &unsolved(&pending.nonce, 4),
+            chrono::Utc::now().timestamp(),
+        );
+        for _ in 0..3 {
+            let RequestPluginResult::Respond(resp) = run_verify_submission_as(
+                &plugin,
+                "example.com",
+                client,
+                &wrong,
+            )
+            .await
+            else {
+                panic!("a wrong solution must be rejected");
+            };
+            assert_eq!(StatusCode::FORBIDDEN, resp.status);
+        }
+
+        let (_, raised_body, raised_id) =
+            challenge_page_as(&plugin, "example.com", client).await;
+        assert_eq!(
+            "6",
+            page_config(&raised_body, "difficulty"),
+            "failures must raise the issued difficulty up to the ceiling"
+        );
+
+        // The page and the verifier agree on that difficulty: solving it
+        // mints a clearance.
+        let raised = peek_pending(&raised_id).expect("pending challenge");
+        let RequestPluginResult::Respond(resp) = run_verify_submission_as(
+            &plugin,
+            "example.com",
+            client,
+            &verify_payload(
+                &raised_id,
+                &solve(&raised.nonce, 6),
+                chrono::Utc::now().timestamp(),
+            ),
+        )
+        .await
+        else {
+            panic!("the page's own solution must verify");
+        };
+        assert_eq!(StatusCode::OK, resp.status);
+        assert!(
+            header_value(&resp, "set-cookie")
+                .unwrap_or_default()
+                .contains(&plugin.cookie_name)
+        );
+
+        // A success resets the pressure: the next visitor state is the base.
+        assert!(
+            !DIFFICULTY_PRESSURE
+                .contains_key(&guard_key("example.com", client)),
+            "success must clear the pressure"
+        );
+        let (_, reset_body, _) =
+            challenge_page_as(&plugin, "example.com", client).await;
+        assert_eq!("4", page_config(&reset_body, "difficulty"));
+    }
+
     fn challenge_template_fixture() -> String {
         r#"<!DOCTYPE html>
 <html><head><title>{{ brand_name }}</title></head><body>

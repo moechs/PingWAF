@@ -1287,6 +1287,10 @@ fn challenge_to_proto(
             request_threshold: c.rate_threshold.max(0) as u32,
             browser_integrity_check: c.browser_integrity_check,
             tls_fingerprint_check: c.tls_fingerprint_check,
+            base_difficulty: c.base_difficulty.max(0) as u32,
+            max_difficulty: c.max_difficulty.max(0) as u32,
+            issue_limit_per_minute: c.issue_limit_per_min.max(0) as u32,
+            verify_limit_per_minute: c.verify_limit_per_min.max(0) as u32,
         },
         None => ChallengeConfig {
             enabled: false,
@@ -1297,6 +1301,13 @@ fn challenge_to_proto(
             request_threshold: 0,
             browser_integrity_check: false,
             tls_fingerprint_check: false,
+            // A site that never saved challenge settings keeps the defaults
+            // every other site runs with; the agent treats 0 as "unset", but
+            // stating them keeps the bundle readable.
+            base_difficulty: 0,
+            max_difficulty: 0,
+            issue_limit_per_minute: 0,
+            verify_limit_per_minute: 0,
         },
     }
 }

@@ -1054,6 +1054,20 @@ export interface TopIp {
   top_site_id?: string | null
 }
 
+/**
+ * `api::analytics::TopAsn` — one network in the ASN traffic ranking.
+ *
+ * `asn` is a real AS number (never 0: unresolved addresses are stored as NULL
+ * and excluded from the ranking). `asn_name` is resolved by the control plane
+ * from its bundled/operator ASN table and reads `Unknown (AS<number>)` when the
+ * network has no entry — the UI still localises that fallback.
+ */
+export interface TopAsn {
+  asn: number
+  asn_name: string
+  requests: number
+}
+
 /** `api::analytics::TopPath` */
 export interface TopPath {
   path: string
@@ -2090,6 +2104,17 @@ export interface ChallengeConfig {
   exempt_paths: string[]
   browser_integrity_check: boolean
   tls_fingerprint_check: boolean
+  /**
+   * Proof-of-work difficulty (leading zero bits) a normal visitor solves.
+   * Default 20; the adaptive step starts here.
+   */
+  base_difficulty: number
+  /** Ceiling the difficulty may rise to under request/failure pressure. */
+  max_difficulty: number
+  /** Challenge pages issued per IP per 60-second window (over it: 429). */
+  issue_limit_per_min: number
+  /** Solution submissions accepted per IP per 60-second window. */
+  verify_limit_per_min: number
 }
 
 /** Patch semantics: omitted fields keep their current value (mirrors the server). */
@@ -2490,6 +2515,7 @@ export interface TrafficOverview {
   topPaths: TopPath[]
   topIps: TopIp[]
   topRules: TopRule[]
+  topAsns: TopAsn[]
   statusCodes: StatusCodeCount[]
 }
 

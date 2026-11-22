@@ -19,7 +19,7 @@
 ### Dashboard Overview
 
 The dashboard provides:
-- **Analytics**: Request trends, per-site traffic over time, top rules triggered, status codes, client-type mix (desktop / mobile / AI bots / other)
+- **Analytics**: Request trends with outbound bandwidth on one shared time axis, per-site traffic over time, geographic distribution (an interactive globe plus a country ranking that drills into the access logs), the top networks by ASN (name, `ASxxxxx`, requests and share of the window), top rules triggered, status codes, client-type mix (desktop / mobile / AI bots / other)
 - **Sites**: Manage protected websites
 - **Agents**: Monitor connected data-plane agents
 - **Logs**: Security events and access logs
@@ -441,9 +441,45 @@ Dimension-based rate limit rules live on the separate Rate Limiting page; this t
 | Mode | `off`, `passive`, `active` |
 | Type | `js_challenge`, `captcha`, `managed` |
 | Expiry | How long a passed challenge remains valid |
+| Base difficulty | Proof-of-work leading zero bits a normal visitor solves (default 20) |
+| Max difficulty | Ceiling the difficulty rises to under pressure (default 24) |
+| Challenge limit / min | Challenge pages issued per IP per minute (default 120) |
+| Verify limit / min | Solution submissions accepted per IP per minute (default 300) |
 
 - **Passive**: Challenge only when suspicious behavior is detected
 - **Active**: Challenge all requests matching configured criteria
+
+#### Adaptive difficulty
+
+Every challenge is issued with its own difficulty, stored server-side and
+checked on submission — the client never supplies it and a settings change does
+not invalidate pages already in flight. The difficulty starts at the base and
+rises per host+IP when that client keeps failing verification (one step per
+failure, forgotten after a quiet minute) or sends more requests than the rate
+threshold (one step per threshold-worth above it). It stops at the max, and a
+successful verification drops it back to the base.
+
+Set **Max difficulty** equal to **Base difficulty** to pin the work at a fixed
+value. Both must be 4–28; max may not be below base.
+
+#### Per-IP challenge limits
+
+Both limits are per host+IP over a 60-second window, and both apply to every
+challenge the site can mint — the CC gate and a WAF rule / IP-geo rule / bot /
+rate-limit challenge alike, which all use the site's difficulty and the same
+budget. Above the issuance limit the visitor gets a `429` rate-limit page
+instead of a challenge page (it carries `x-pingwaf-mitigated: block`), so the
+challenge endpoint cannot be used as an amplifier. Above the verification limit
+the submission is refused with `429` before any work is done, and the pending
+challenge is left intact — a legitimate visitor can still complete it once the
+window rolls over. Both refusals appear in the access log.
+
+The bounded counter table holds 8192 host+IP keys per window. When it is full of
+*other* clients, issuance keeps working (the page is minted without a budget
+entry) so an attacker cannot lock every new visitor out, while verification
+fails closed so a full table never becomes an unmetered guessing channel. Raise
+the limits for sites whose visitors share one NAT address; the counters are per
+edge process, so N instances allow N × the configured value.
 
 ### Challenge page template
 

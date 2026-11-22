@@ -110,6 +110,13 @@ services:
       # belong here: mi_option_set cannot shrink an arena that already exists.
       - MIMALLOC_ARENA_RESERVE=${MIMALLOC_ARENA_RESERVE:-67108864}
       - MIMALLOC_ARENA_EAGER_COMMIT=${MIMALLOC_ARENA_EAGER_COMMIT:-0}
+      # MaxMind ASN database (optional). The traffic pages rank client
+      # networks from `access_logs.asn`; the edge's GeoIP snapshot has no ASN
+      # data, so install GeoLite2-ASN once — either upload it with
+      # `POST /api/v1/asn/database` (which writes /var/lib/pingwaf/asn.mmdb
+      # inside the `pingwaf-data` volume), or mount a file and point this
+      # variable at it. PingWAF never downloads it.
+      # - PINGWAF_ASN_MMDB=/var/lib/pingwaf/asn.mmdb
       # Elasticsearch (optional — uncomment to enable log shipping)
       # - PINGWAF_ES_ENABLED=true
       # - PINGWAF_ES_URLS=http://elasticsearch:9200

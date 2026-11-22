@@ -5,6 +5,7 @@
 //! and every other RPC verifies that token before touching the database.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -2857,6 +2858,26 @@ async fn flush_cert_events(
     Ok(())
 }
 
+/// AS number for a shipped entry: the agent's own resolution when it sent
+/// one, otherwise the control plane's local MaxMind ASN database.
+///
+/// The `lookup` parameter is the seam that makes the fallback testable — the
+/// production callers pass [`crate::asn::lookup_ip`], tests pass a fake. The
+/// lookup is in-process in both cases: the database is a local file read once,
+/// so no request ever performs a network call.
+fn effective_asn(
+    entry: &LogEntry,
+    lookup: impl FnOnce(IpAddr) -> Option<u32>,
+) -> Option<u32> {
+    // The edge resolves the ASN itself when its GeoIP data carries one; a
+    // control-plane lookup is only the fallback, never an override.
+    if entry.asn != 0 {
+        return Some(entry.asn);
+    }
+    let ip: IpAddr = entry.client_ip.trim().parse().ok()?;
+    lookup(ip).filter(|asn| *asn != 0)
+}
+
 /// Maps a shipped log entry onto the `access_logs` row.
 fn access_log_row(
     entry: &LogEntry,
@@ -2899,6 +2920,11 @@ fn access_log_row(
         user_agent: Set(optional(&entry.user_agent)),
         referer: Set(optional(&entry.referer)),
         country_code: Set(truncate(&entry.country_code, MAX_COUNTRY)),
+        // Autonomous system of the client address: the agent's own value, or
+        // the control plane's ASN database when the agent could not resolve
+        // it. `None` (no database, a miss, or a private/reserved address) is
+        // stored as NULL, so the ASN ranking never counts a bogus AS0.
+        asn: Set(effective_asn(entry, crate::asn::lookup_ip).map(i64::from)),
         tls_version: Set(truncate(&entry.tls_version, MAX_TLS_VERSION)),
         // Who made the request, when the site authenticated them. `optional`
         // maps an empty string to NULL: the column means "no identity", and a
@@ -3228,7 +3254,9 @@ fn access_log_document(
         ja3_hash: optional(&entry.ja3_hash),
         country_code: optional(&entry.country_code),
         city: optional(&entry.city),
-        asn: positive_u32(entry.asn),
+        // Same value the PostgreSQL row stores, so the two stores never
+        // disagree about the network a request came from.
+        asn: effective_asn(entry, crate::asn::lookup_ip),
 
         user_agent: optional(&entry.user_agent),
         referer: optional(&entry.referer),
@@ -3281,7 +3309,7 @@ fn security_event_document(
         user_agent: optional(&entry.user_agent),
         user_identity: optional(&entry.user_identity),
         country_code: optional(&entry.country_code),
-        asn: positive_u32(entry.asn),
+        asn: effective_asn(entry, crate::asn::lookup_ip),
 
         request_headers: headers_json(&entry.request_headers),
         request_body,
@@ -3846,6 +3874,73 @@ mod tests {
             .expect("event");
         assert!(event.action.is_set());
         assert_eq!(event.score.unwrap(), Some(42));
+    }
+
+    /// The AS number stored for a row: the agent's own value wins, and the
+    /// control plane's ASN database is consulted only when the agent sent 0.
+    /// A miss, an unparsable address and a database that answers 0 all end as
+    /// NULL rather than a guessed network.
+    #[test]
+    fn the_asn_falls_back_to_the_control_plane_database() {
+        let mut entry = LogEntry {
+            client_ip: "8.8.8.8".into(),
+            ..Default::default()
+        };
+
+        // Agent could not resolve it: the database answers.
+        assert_eq!(
+            Some(64_500),
+            effective_asn(&entry, |ip| {
+                assert_eq!("8.8.8.8", ip.to_string());
+                Some(64_500)
+            })
+        );
+
+        // No database / a miss: NULL, never AS0.
+        assert_eq!(None, effective_asn(&entry, |_| None));
+        assert_eq!(None, effective_asn(&entry, |_| Some(0)));
+
+        // The agent's own resolution wins and the database is not consulted.
+        entry.asn = 15_169;
+        assert_eq!(
+            Some(15_169),
+            effective_asn(&entry, |_| panic!("must not consult the database"))
+        );
+
+        // An address that cannot be parsed is not looked up at all.
+        entry.asn = 0;
+        entry.client_ip = "not-an-ip".into();
+        assert_eq!(
+            None,
+            effective_asn(&entry, |_| panic!("must not look up garbage"))
+        );
+        entry.client_ip = "  ".into();
+        assert_eq!(
+            None,
+            effective_asn(&entry, |_| panic!(
+                "must not look up an empty address"
+            ))
+        );
+    }
+
+    /// The row and the Elasticsearch documents all carry the enriched value,
+    /// so the two stores cannot disagree about the network.
+    #[test]
+    fn the_enriched_asn_reaches_the_stored_row() {
+        // 1.2.3.4 is outside the ASN test fixture's prefix, so this holds
+        // whether or not another test has the fixture installed.
+        let entry = LogEntry {
+            client_ip: "1.2.3.4".into(),
+            ..Default::default()
+        };
+        // No database in the test process: the column stays NULL.
+        let row = access_log_row(&entry, None, None, Utc::now());
+        assert_eq!(None, row.asn.unwrap());
+
+        let mut resolved = entry.clone();
+        resolved.asn = 13_335;
+        let row = access_log_row(&resolved, None, None, Utc::now());
+        assert_eq!(Some(13_335), row.asn.unwrap());
     }
 
     /// The identity is stored on both tables, an absent one stays NULL, and an

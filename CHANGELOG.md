@@ -8,6 +8,92 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [Unreleased]
+
+### Added
+
+- **Adaptive proof-of-work difficulty.** A challenge's difficulty now starts at
+  the site's `base_difficulty` (20 by default — the value every deployment
+  already used) and rises per host+IP with failed verifications and with
+  request volume above `rate_threshold`, capped at `max_difficulty` (24 by
+  default) and reset by a successful verification. The difficulty issued with
+  a challenge is stored with the pending entry and is what the submission is
+  verified against, so a page is always solvable exactly as issued and a
+  settings change never invalidates pages in flight. The client never supplies
+  the value. Wired through a new `challenge_settings` migration
+  (`000103_challenge_adaptive_pow`), the site API (`GET`/`PUT
+  /sites/{site_id}/challenge`), the proto `ChallengeConfig` (`base_difficulty`,
+  `max_difficulty`), the agent cache and the challenge plugin; configurable in
+  the console under **Web Protection → Rate limiting & challenge**.
+- **Per-IP challenge issuance and verification limits.** One guarded mint path
+  serves every challenge the edge can issue — the CC gate and a WAF rule /
+  IP-geo / bot / rate-limit challenge alike — and keeps bounded, TTL-pruned per
+  host+IP counters for the two new settings `issue_limit_per_min` (default 120)
+  and `verify_limit_per_min` (default 300). Above the issuance limit the visitor
+  gets a `429` rate-limit page stamped `x-pingwaf-mitigated: block` instead of a
+  challenge page; above the verification limit the submission is refused with
+  `429` **before** any verification work, so a flood of guesses cannot spend a
+  legitimate visitor's nonce. Both refusals are written to the access log. A
+  full counter table never refuses issuance (the page is minted without a
+  budget entry) so an attacker cannot lock new visitors out, while verification
+  fails closed. WAF-minted pages use the site's difficulty and the same budget
+  rather than the WAF plugin's static value. All counters are per edge process.
+- **ASN data source for the traffic ranking.** The edge's GeoIP snapshot
+  carries country ranges only, so agents report ASN `0` and `access_logs.asn`
+  would stay NULL. The control plane now enriches the column at ingestion from
+  a locally read MaxMind ASN database (`GeoLite2-ASN` / `GeoIP2-ISP` /
+  `GeoIP2-Enterprise`), installed either by uploading it through the new
+  administrator endpoints (`GET`/`POST`/`DELETE /api/v1/asn/database`, written
+  to the `pingwaf-data` volume) or by pointing `PINGWAF_ASN_MMDB` at a file.
+  The agent's own value still wins; a database miss stays NULL. The database is
+  read once into memory, so no request performs a network call, and a country
+  database is rejected instead of producing an empty ranking. Without a
+  database the ranking stays empty, which is documented. See
+  [docs/api.md](docs/api.md#asn-data-source).
+- **ASN analytics: `GET /api/v1/analytics/top-asns`.** `access_logs` gains a
+  nullable `asn` column (migration 000102) filled from the AS number the agent
+  already ships in `LogEntry.asn`; the endpoint ranks networks by request
+  count over the same window and tenant scope as the other analytics
+  endpoints, returning `{asn, asn_name, requests}` ordered by requests
+  descending. ASN → organization names come from a bundled snapshot
+  (`pingwaf-server/assets/asn_names.tsv`) that an operator can extend or correct
+  through the new `PINGWAF_ASN_NAMES_FILE` import — no per-request network
+  call — and an unlisted number is labelled `Unknown (AS<number>)` instead of
+  a bare number. The edge now resolves the client's ASN once per request and
+  carries it onto the access log (the protocol field existed, but the agent
+  hardcoded 0, so the column could never be populated). Rows without a
+  resolved ASN stay NULL and are excluded from the ranking, so the endpoint
+  answers `[]` on a deployment whose GeoIP data has no ASN ranges. See
+  [docs/api.md](docs/api.md#get-analyticstop-asns).
+
+### Fixed
+
+- **The ASN ranking's `limit` now counts only real networks.** The endpoint
+  filtered AS0 and out-of-range values in Rust *after* the SQL `LIMIT`, so a
+  window dominated by such rows (written by an older writer or a manual
+  insert) could answer fewer rows than requested — even an empty list. The
+  validity range is now part of the statement, so the cap applies to networks
+  that actually have a resolved ASN. `GET`/`POST`/`DELETE /asn/database` also
+  moved their MaxMind file reads and writes onto the blocking thread pool,
+  where an 8–10 MB read can no longer stall an async worker serving other
+  requests.
+
+### Changed
+
+- **Reworked traffic dashboard (traffic + site-detail traffic pages).** The
+  oversized world map is replaced by an interactive 3D globe (d3-geo
+  orthographic projection over the bundled world-atlas topology, rendered as
+  SVG — no WebGL and no new dependency) with request-sized country bubbles,
+  drag/arrow-key rotation, a pause control and `prefers-reduced-motion`
+  support, beside a separate scrollable country ranking that drills into the
+  matching access logs. Bandwidth and requests now share one composed chart
+  with a request axis and a bit-rate axis; egress is summed into the request
+  buckets (bucket width derived from the returned timestamps), so the two
+  series cannot drift and no bucket is dropped. A new sortable **ASN Top**
+  table (network name, `ASxxxxx`, requests, share of the window) renders
+  `GET /analytics/top-asns`, and the unknown-network fallback is localised in
+  all three console languages.
+
 ## [PingWAF 0.32.48] — 2026-11-22
 
 ### Security

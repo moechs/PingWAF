@@ -10,6 +10,7 @@
 
 pub mod ai;
 pub mod api;
+pub mod asn;
 pub mod auth;
 pub mod boot_history;
 pub mod config;
@@ -93,6 +94,21 @@ pub async fn start_server(mut config: ServerConfig) -> anyhow::Result<()> {
         .await
         .map_err(|err| anyhow::anyhow!("migration failed: {err}"))?;
     tracing::info!("schema migrations applied");
+
+    // Load the MaxMind ASN database (when one is configured) before the first
+    // log batch arrives: the read is file I/O, so it runs on a blocking thread
+    // rather than inside the ingestion path. A missing database is not an
+    // error — `access_logs.asn` then stays NULL and the ASN ranking is empty.
+    if let Err(error) = tokio::task::spawn_blocking(|| {
+        crate::asn::warm();
+        // The name mapping is also a lazy file read; warm it here so the first
+        // analytics request never touches the filesystem.
+        crate::asn::warm_names();
+    })
+    .await
+    {
+        tracing::warn!(%error, "ASN warm-up task failed");
+    }
 
     // Apply retention at startup as well as in the daily monitor: a scope that
     // has not produced a new version recently must not keep expired rows.

@@ -914,6 +914,17 @@ impl CacheTypePolicy {
 
 // ─── Challenge ──────────────────────────────────────────────
 
+/// Difficulty a site runs with when the control plane states none: the value
+/// every deployment used before difficulty became configurable.
+pub const DEFAULT_CHALLENGE_BASE_DIFFICULTY: u32 = 20;
+/// Ceiling adaptive difficulty may reach when none is configured.
+pub const DEFAULT_CHALLENGE_MAX_DIFFICULTY: u32 = 24;
+/// Challenge pages issued per host+IP per minute when none is configured.
+pub const DEFAULT_CHALLENGE_ISSUE_LIMIT_PER_MINUTE: u32 = 120;
+/// Solution submissions accepted per host+IP per minute when none is
+/// configured.
+pub const DEFAULT_CHALLENGE_VERIFY_LIMIT_PER_MINUTE: u32 = 300;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChallengeConfig {
     pub enabled: bool,
@@ -924,6 +935,30 @@ pub struct ChallengeConfig {
     pub request_threshold: u32,
     pub browser_integrity_check: bool,
     pub tls_fingerprint_check: bool,
+    /// Proof-of-work difficulty a normal visitor solves (leading zero bits).
+    /// Zero in the stored JSON means "unset" — an older snapshot written
+    /// before the field existed — and is read as
+    /// [`DEFAULT_CHALLENGE_BASE_DIFFICULTY`].
+    #[serde(default)]
+    pub base_difficulty: u32,
+    /// Ceiling adaptive difficulty may raise the work to.
+    #[serde(default)]
+    pub max_difficulty: u32,
+    /// Challenge pages issued per host+IP per 60-second window.
+    #[serde(default)]
+    pub issue_limit_per_minute: u32,
+    /// Solution submissions accepted per host+IP per 60-second window.
+    #[serde(default)]
+    pub verify_limit_per_minute: u32,
+}
+
+/// A proto3 scalar of `0` means "unset"; fall back to the documented default.
+fn or_default(value: u32, default: u32) -> u32 {
+    if value == 0 {
+        default
+    } else {
+        value
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3343,6 +3378,31 @@ impl RuleCache {
             request_threshold: c.request_threshold,
             browser_integrity_check: c.browser_integrity_check,
             tls_fingerprint_check: c.tls_fingerprint_check,
+            // Proto3 scalars default to 0, which is also how an older control
+            // plane that predates these fields encodes them. Treat 0 as
+            // "unset" so such a control plane keeps the historical behaviour
+            // (difficulty 20, no adaptive headroom below the default) instead
+            // of shipping a site that issues difficulty-0 challenges.
+            base_difficulty: or_default(
+                c.base_difficulty,
+                DEFAULT_CHALLENGE_BASE_DIFFICULTY,
+            ),
+            max_difficulty: or_default(
+                c.max_difficulty,
+                DEFAULT_CHALLENGE_MAX_DIFFICULTY,
+            )
+            .max(or_default(
+                c.base_difficulty,
+                DEFAULT_CHALLENGE_BASE_DIFFICULTY,
+            )),
+            issue_limit_per_minute: or_default(
+                c.issue_limit_per_minute,
+                DEFAULT_CHALLENGE_ISSUE_LIMIT_PER_MINUTE,
+            ),
+            verify_limit_per_minute: or_default(
+                c.verify_limit_per_minute,
+                DEFAULT_CHALLENGE_VERIFY_LIMIT_PER_MINUTE,
+            ),
         }
     }
 

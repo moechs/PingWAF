@@ -98,6 +98,11 @@ pub struct AccessLogEntry {
     pub referer: String,
     pub tls_version: String,
     pub country_code: String,
+    /// Autonomous system number of `client_ip`, as resolved by the data
+    /// plane's GeoIP data. 0 means "not resolved" (a private/reserved address,
+    /// a GeoIP miss, or a caller that did not look it up) and the control
+    /// plane stores it as NULL, so the traffic pages never rank a bogus AS0.
+    pub asn: u32,
     /// Who the request was made by, when the site authenticated them (the
     /// OIDC session's `sub`). Empty for an anonymous request, which is the
     /// ordinary case. An identifier the provider issued, never a secret.
@@ -386,7 +391,7 @@ impl PingWafAgent {
             ja3_hash: String::new(),
             country_code: entry.country_code,
             city: String::new(),
-            asn: 0,
+            asn: entry.asn,
             user_agent: entry.user_agent,
             referer: entry.referer,
         };
