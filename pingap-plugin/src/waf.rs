@@ -2229,6 +2229,16 @@ fn parse_cookies(
         .collect()
 }
 
+/// The request's User-Agent, used to bind a challenge to the client that
+/// requested it.
+fn request_user_agent(headers: &[(String, String)]) -> &str {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default()
+}
+
 /// Extracts the clearance cookie value, if the client carries one.
 fn clearance_cookie(headers: &[(String, String)]) -> Option<String> {
     headers
@@ -4299,6 +4309,8 @@ impl WafPlugin {
                 request_id,
                 original_url,
                 host,
+                &request_data.client_ip,
+                request_user_agent(&request_data.headers),
                 pow_difficulty,
                 ChallengeKind::Js,
             )
@@ -4591,6 +4603,8 @@ impl WafPlugin {
                 request_id,
                 &original_url,
                 host,
+                &request_data.client_ip,
+                request_user_agent(&request_data.headers),
                 self.pow_difficulty,
                 ChallengeKind::Js,
             )
@@ -5518,6 +5532,8 @@ impl Plugin for WafPlugin {
                             &request_id,
                             &original_url,
                             &host,
+                            &request_data.client_ip,
+                            request_user_agent(&request_data.headers),
                             self.pow_difficulty,
                             ChallengeKind::Js,
                         )

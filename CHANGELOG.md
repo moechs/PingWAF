@@ -8,6 +8,19 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [PingWAF Unreleased]
+
+### Security
+
+- **Challenge submissions are bound to the issuing client context.** The
+  pending challenge now records the client IP and request User-Agent observed
+  when the page was issued; verification rejects a submission from another
+  address, another UA, or a fingerprint whose `user_agent` disagrees with the
+  live request. This closes the trivial "fetch the page on one machine, solve
+  it elsewhere, submit a fabricated fingerprint" path. The nonce comment was
+  also corrected: the nonce is necessarily embedded in the page for PoW, while
+  the site id and request context stay server-side.
+
 ## [PingWAF 0.32.47] — 2026-11-22
 
 ### Fixed

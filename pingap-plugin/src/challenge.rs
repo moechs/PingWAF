@@ -50,8 +50,9 @@ use pingwaf_challenge::js_challenge::page::{
     generate_managed_challenge_html,
 };
 use pingwaf_challenge::{
-    ChallengeConfig, ChallengeDecision, ChallengeEngine, ChallengeRequest,
-    ChallengeSubmission, ClearanceLevel, VerifyResult, generate_request_id,
+    BrowserFingerprint, ChallengeConfig, ChallengeDecision, ChallengeEngine,
+    ChallengeRequest, ChallengeSubmission, ClearanceLevel, VerifyResult,
+    generate_request_id,
 };
 use std::borrow::Cow;
 use std::path::Path;
@@ -79,14 +80,21 @@ const RATE_WINDOW_SECS: i64 = 60;
 // ─────────────────────────────────────────────────────────────
 
 /// State kept server-side between issuing a challenge and verifying the
-/// solution. The browser only echoes back `{request_id, solution,
-/// fingerprint_json, timestamp}` — the nonce and site id never leave the edge,
-/// so they are looked up here by request id.
+/// solution. The browser echoes back `{request_id, solution, fingerprint_json,
+/// timestamp}`; the nonce is necessarily embedded in the page so the browser
+/// can compute the proof-of-work, while the site id and the request context
+/// (client IP / User-Agent) stay server-side.
 #[derive(Clone)]
 pub(crate) struct PendingChallenge {
     pub nonce: String,
     pub site_id: String,
     pub original_url: String,
+    /// Client IP observed when the challenge was issued. Verification must
+    /// come from the same address.
+    pub client_ip: String,
+    /// Request User-Agent observed when the challenge was issued. The
+    /// submitted fingerprint UA must match this and the live request.
+    pub user_agent: String,
     pub created_at: i64,
     /// Approximate heap size, used by the process-wide byte budget.
     bytes: usize,
@@ -179,6 +187,8 @@ fn pending_bytes(entry: &PendingChallenge) -> usize {
     entry.nonce.len()
         + entry.site_id.len()
         + entry.original_url.len()
+        + entry.client_ip.len()
+        + entry.user_agent.len()
         + std::mem::size_of::<PendingChallenge>()
 }
 
@@ -205,6 +215,8 @@ pub(crate) fn store_pending(
     request_id: &str,
     site_id: &str,
     original_url: &str,
+    client_ip: &str,
+    user_agent: &str,
 ) -> String {
     let now = now_secs();
     // Opportunistic garbage collection so the map cannot grow without bound.
@@ -233,6 +245,8 @@ pub(crate) fn store_pending(
         nonce: nonce.clone(),
         site_id: site_id.to_string(),
         original_url,
+        client_ip: client_ip.to_string(),
+        user_agent: user_agent.to_string(),
         created_at: now,
         bytes: 0,
     };
@@ -380,10 +394,13 @@ pub(crate) fn build_challenge_response(
     request_id: &str,
     original_url: &str,
     site_id: &str,
+    client_ip: &str,
+    user_agent: &str,
     difficulty: u32,
     kind: ChallengeKind,
 ) -> HttpResponse {
-    let nonce = store_pending(request_id, site_id, original_url);
+    let nonce =
+        store_pending(request_id, site_id, original_url, client_ip, user_agent);
     let params = ChallengePageParams {
         request_id: request_id.to_string(),
         challenge_nonce: nonce,
@@ -936,6 +953,38 @@ impl ChallengePlugin {
         Some(engine)
     }
 
+    /// Bind a submission to the context that requested the challenge.
+    ///
+    /// The nonce/PoW alone only proves that *someone* spent the work. Without
+    /// this check, a page fetched from one address could be solved on another
+    /// machine and submitted with a fabricated `fingerprint_json`. The live
+    /// request IP/User-Agent and the fingerprint UA must all agree with what
+    /// the edge observed when it issued the challenge.
+    fn pending_matches_request(
+        pending: &PendingChallenge,
+        client_ip: &str,
+        user_agent: &str,
+        fingerprint_json: &str,
+    ) -> Result<(), &'static str> {
+        if !pending.client_ip.is_empty() && pending.client_ip != client_ip {
+            return Err("challenge was issued to a different client address");
+        }
+        if !pending.user_agent.is_empty() && pending.user_agent != user_agent {
+            return Err("challenge was issued to a different User-Agent");
+        }
+        let fingerprint = BrowserFingerprint::from_json(fingerprint_json)
+            .map_err(|_| "invalid fingerprint data")?;
+        if fingerprint.user_agent != user_agent {
+            return Err("fingerprint User-Agent does not match the request");
+        }
+        if !pending.user_agent.is_empty()
+            && fingerprint.user_agent != pending.user_agent
+        {
+            return Err("fingerprint User-Agent does not match the challenge");
+        }
+        Ok(())
+    }
+
     /// Handle a POST to the verify endpoint: validate the proof-of-work and,
     /// on success, hand back a clearance cookie plus a redirect to the
     /// originally requested URL. The cookie's `Secure` attribute follows the
@@ -944,7 +993,7 @@ impl ChallengePlugin {
     async fn handle_verify(
         &self,
         session: &mut Session,
-        ctx: &Ctx,
+        ctx: &mut Ctx,
     ) -> pingora::Result<RequestPluginResult> {
         let mut buf = BytesMut::with_capacity(4096);
         while let Some(chunk) = session.read_request_body().await? {
@@ -998,6 +1047,34 @@ impl ChallengePlugin {
                 "challenge expired or unknown, please retry",
             )));
         };
+
+        // Resolve the same trusted client address the challenge issuance
+        // used, then bind the submission to it and to the live User-Agent.
+        if let Some(trust) = site_proxy_trust(&pending.site_id)
+            && let Some(ip) = resolve_client_ip_with_trust(session, &trust)
+        {
+            ctx.conn.client_ip = Some(ip);
+        }
+        let actual_ip = ensure_client_ip(session, ctx).to_string();
+        let actual_user_agent =
+            get_req_header_value(session.req_header(), "user-agent")
+                .unwrap_or_default();
+        if let Err(reason) = Self::pending_matches_request(
+            &pending,
+            &actual_ip,
+            actual_user_agent,
+            &fingerprint_json,
+        ) {
+            warn!(
+                request_id = %request_id,
+                reason,
+                "challenge submission context does not match the issued challenge"
+            );
+            return Ok(RequestPluginResult::Respond(block_page(
+                &request_id,
+                reason,
+            )));
+        }
 
         let submission = ChallengeSubmission {
             request_id: request_id.clone(),
@@ -1287,7 +1364,7 @@ impl Plugin for ChallengePlugin {
             path,
             method,
             client_ip: client_ip.clone(),
-            user_agent,
+            user_agent: user_agent.clone(),
             cookies: Vec::new(),
             has_js_support: None,
             request_rate,
@@ -1349,6 +1426,8 @@ impl Plugin for ChallengePlugin {
             &request_id,
             &original_url,
             &site_id,
+            &client_ip,
+            &user_agent,
             self.pow_difficulty,
             kind,
         );
@@ -1380,13 +1459,93 @@ mod tests {
             .map(|(_, v)| v.to_str().unwrap_or_default().to_string())
     }
 
+    fn pending_for_context() -> PendingChallenge {
+        PendingChallenge {
+            nonce: "nonce".to_string(),
+            site_id: "example.com".to_string(),
+            original_url: "/".to_string(),
+            client_ip: "203.0.113.10".to_string(),
+            user_agent: "TestBrowser/1.0".to_string(),
+            created_at: now_secs(),
+            bytes: 0,
+        }
+    }
+
+    fn fingerprint_json(user_agent: &str) -> String {
+        serde_json::json!({
+            "user_agent": user_agent,
+            "screen_width": 1920,
+            "screen_height": 1080,
+            "timezone_offset": 0,
+            "language": "en",
+            "platform": "MacIntel",
+            "canvas_hash": "abc",
+            "webgl_vendor": "",
+            "webgl_renderer": "",
+            "plugins_count": 0,
+            "touch_support": false,
+            "hardware_concurrency": 8,
+            "device_memory": 8.0
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn challenge_submission_is_bound_to_request_context() {
+        let pending = pending_for_context();
+        let ok = fingerprint_json("TestBrowser/1.0");
+        assert!(
+            ChallengePlugin::pending_matches_request(
+                &pending,
+                "203.0.113.10",
+                "TestBrowser/1.0",
+                &ok
+            )
+            .is_ok()
+        );
+
+        assert!(
+            ChallengePlugin::pending_matches_request(
+                &pending,
+                "198.51.100.7",
+                "TestBrowser/1.0",
+                &ok
+            )
+            .is_err()
+        );
+        assert!(
+            ChallengePlugin::pending_matches_request(
+                &pending,
+                "203.0.113.10",
+                "OtherBrowser/1.0",
+                &ok
+            )
+            .is_err()
+        );
+        assert!(
+            ChallengePlugin::pending_matches_request(
+                &pending,
+                "203.0.113.10",
+                "TestBrowser/1.0",
+                &fingerprint_json("OtherBrowser/1.0")
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn pending_challenge_rejects_oversized_original_urls() {
         let request_id =
             format!("pending-url-{}", uuid::Uuid::new_v4().simple());
         let long_url =
             format!("/{}", "a".repeat(PENDING_CHALLENGE_MAX_URL_BYTES + 16));
-        store_pending(&request_id, "site-test", &long_url);
+        store_pending(
+            &request_id,
+            "site-test",
+            &long_url,
+            "203.0.113.10",
+            "test-agent",
+        );
         let pending = peek_pending(&request_id).expect("pending entry");
         assert_eq!("/", pending.original_url);
         assert!(pending.bytes > 0);
@@ -1466,6 +1625,8 @@ mod tests {
             "req-ch",
             "/original",
             "site-1",
+            "203.0.113.10",
+            "test-agent",
             0,
             ChallengeKind::Js,
         );
