@@ -248,8 +248,11 @@ fn validate_template(template: &str) -> Result<(), String> {
     if template.len() > MAX_TEMPLATE_BYTES {
         return Err("template is larger than 1 MiB".to_string());
     }
-    if !template.contains("{{PINGWAF_SCRIPTS}}") {
-        return Err("missing {{PINGWAF_SCRIPTS}} placeholder".to_string());
+    let placeholders = template.matches("{{PINGWAF_SCRIPTS}}").count();
+    if placeholders != 1 {
+        return Err(format!(
+            "expected exactly one {{PINGWAF_SCRIPTS}} placeholder, found {placeholders}"
+        ));
     }
     if template.to_ascii_lowercase().contains("<script") {
         return Err(
@@ -734,6 +737,15 @@ mod tests {
         assert!(out.contains("r&quot;1"));
         assert!(!out.contains("{{PINGWAF_SCRIPTS}}"));
         assert!(!out.contains("{{BRAND_NAME}}"));
+    }
+
+    #[test]
+    fn duplicate_scripts_placeholder_is_rejected() {
+        let template = custom_template_fixture().replace(
+            "{{PINGWAF_SCRIPTS}}",
+            "{{PINGWAF_SCRIPTS}}{{PINGWAF_SCRIPTS}}",
+        );
+        assert!(validate_template(&template).is_err());
     }
 
     #[test]
