@@ -8,6 +8,24 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [PingWAF Unreleased]
+
+### Changed
+
+- **Agent full-config sync peak reduced.** The full `SiteConfig` sync now
+  converts every proto bundle into the local `SiteRules` mirror and builds the
+  domain index **before** the RCU closure. Previously each RCU retry repeated
+  the conversion and the old/new snapshots overlapped with a second full set
+  of converted rules. The closure now only clones the prepared maps and swaps
+  them in; the full config still replaces both maps authoritatively.
+- **`SiteRules` identifiers are interned.** `site_id`, `domain` and alternate
+  domains are `Arc<str>`; `CachedRules::sites` keys and `domain_index` values
+  share the site-id `Arc`, and domain-index keys share the normalized domain
+  `Arc` where possible. This removes the duplicate site/domain strings that
+  were stored per site and per domain entry. Site status is now a
+  `SiteStatus` enum (`active`/`paused`/`pending`) instead of a `String`, with
+  the same lowercase snapshot representation.
+
 ## [PingWAF 0.32.45] — 2026-11-22
 
 ### Fixed

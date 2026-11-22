@@ -1178,10 +1178,14 @@ fn convert_cached_rules(
         });
 
         let host = if site.alternate_domains.is_empty() {
-            site.domain.clone()
+            site.domain.to_string()
         } else {
-            let mut hosts = vec![site.domain.clone()];
-            hosts.extend(site.alternate_domains.clone());
+            let mut hosts = vec![site.domain.to_string()];
+            hosts.extend(
+                site.alternate_domains
+                    .iter()
+                    .map(|domain| domain.to_string()),
+            );
             hosts.join(",")
         };
 
@@ -1344,10 +1348,14 @@ fn convert_cached_rules(
             && ssl.enabled
         {
             let domains = if site.alternate_domains.is_empty() {
-                site.domain.clone()
+                site.domain.to_string()
             } else {
-                let mut d = vec![site.domain.clone()];
-                d.extend(site.alternate_domains.clone());
+                let mut d = vec![site.domain.to_string()];
+                d.extend(
+                    site.alternate_domains
+                        .iter()
+                        .map(|domain| domain.to_string()),
+                );
                 d.join(",")
             };
             let cert = if !ssl.cert_pem.is_empty() {
@@ -2797,10 +2805,10 @@ mod tests {
 
     fn site_rules(site_id: &str, domain: &str) -> SiteRules {
         SiteRules {
-            site_id: site_id.to_string(),
-            domain: domain.to_string(),
+            site_id: site_id.into(),
+            domain: domain.into(),
             alternate_domains: vec![],
-            status: "active".to_string(),
+            status: pingwaf_agent::cache::SiteStatus::Active,
             downstream_timeout_secs: 60,
             waf_config: None,
             rate_limit_rules: vec![],
@@ -3008,7 +3016,7 @@ mod tests {
         site2.upstreams = vec![pool("", vec![peer("10.0.0.1:8080")])];
         site2.error_pages = vec![error_page("u1", 404, "unmatched_host", true)];
         let mut cached2 = CachedRules::default();
-        cached2.sites.insert("site1".to_string(), Arc::new(site2));
+        cached2.sites.insert("site1".into(), Arc::new(site2));
         let with = cached_rules_to_pingap_config(&cached2, dir.path()).unwrap();
 
         // The only differences are the fallback location and its plugin.
@@ -3512,7 +3520,7 @@ mod tests {
     #[test]
     fn site_hosts_are_injected_only_for_own_origin_locations() {
         let mut site = site_rules("site1", "mirror.example.com");
-        site.alternate_domains = vec!["  www.Mirror.Example.COM  ".to_string()];
+        site.alternate_domains = vec!["  www.Mirror.Example.COM  ".into()];
         let mut default_pool = pool("pool-a", vec![peer("172.17.53.244:5000")]);
         default_pool.is_default = true;
         site.upstreams = vec![default_pool];
@@ -4404,7 +4412,7 @@ mod tests {
     #[test]
     fn an_injected_certificate_pem_is_served_for_the_site_hostnames() {
         let mut site = site_rules("site1", "a.example.com");
-        site.alternate_domains = vec!["b.example.com".to_string()];
+        site.alternate_domains = vec!["b.example.com".into()];
         let mut default_pool = pool("pool1", vec![peer("10.0.0.1:8080")]);
         default_pool.is_default = true;
         site.upstreams = vec![default_pool];
@@ -4467,8 +4475,8 @@ mod tests {
         plain.ssl_config = Some(acme_ssl());
 
         let mut cache = one_site_cache(site);
-        cache.sites.insert("site2".to_string(), Arc::new(second));
-        cache.sites.insert("site3".to_string(), Arc::new(plain));
+        cache.sites.insert("site2".into(), Arc::new(second));
+        cache.sites.insert("site3".into(), Arc::new(plain));
         let config = cached_rules_to_pingap_config(
             &cache,
             Path::new("/tmp/pingwaf-test-cache"),

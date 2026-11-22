@@ -1178,7 +1178,7 @@ impl ControlPlaneClient {
                     );
                     CertAttribution {
                         domains,
-                        site_id: site.site_id.clone(),
+                        site_id: site.site_id.to_string(),
                         certificate_id: site
                             .ssl_config
                             .as_ref()

@@ -1399,7 +1399,7 @@ impl Oidc {
         // host this agent does not serve.
         let site_id = agent
             .get_rules_for_domain(&host)
-            .map(|rules| rules.site_id.clone())
+            .map(|rules| rules.site_id.to_string())
             .unwrap_or_default();
         // The scheme the browser used, not the last hop's: an event recorded
         // for a site behind a TLS-terminating proxy should not claim http.

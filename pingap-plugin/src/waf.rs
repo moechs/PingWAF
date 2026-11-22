@@ -3827,7 +3827,10 @@ impl WafPlugin {
         site_rules: &Arc<CacheSiteRules>,
     ) -> Arc<SiteContext> {
         let now = crate::host_cache::unix_now();
-        match self.site_contexts_by_id.entry(site_rules.site_id.clone()) {
+        match self
+            .site_contexts_by_id
+            .entry(site_rules.site_id.to_string())
+        {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 if Arc::ptr_eq(&entry.get().rules, site_rules) {
                     touch(&entry.get().last_used, now);
@@ -3944,7 +3947,7 @@ impl WafPlugin {
         let choice = context.choice(&site_rules);
         ResolvedSite {
             choice,
-            site_id: site_rules.site_id.clone(),
+            site_id: site_rules.site_id.to_string(),
             context: Some(context),
         }
     }
@@ -6547,7 +6550,7 @@ ml_threshold = 0.75
             site_id: "site-1".into(),
             domain: "example.com".into(),
             alternate_domains: Vec::new(),
-            status: pingwaf_agent::cache::site_status::ACTIVE.into(),
+            status: pingwaf_agent::cache::SiteStatus::Active,
             downstream_timeout_secs: 60,
             waf_config: waf,
             rate_limit_rules: Vec::new(),
