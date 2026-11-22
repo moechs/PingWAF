@@ -8,10 +8,15 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
-## [PingWAF 0.32.43] — 2026-11-22
+## [PingWAF 0.32.44] — 2026-11-22
 
 ### Fixed
 
+- **Fixed the `agent_sites` migration on PostgreSQL.** SeaORM emitted two
+  primary-key constraints for the composite key, so `0.32.43` failed to boot
+  with `multiple primary keys for table "agent_sites" are not allowed`. The
+  migration now declares one composite primary key. `0.32.43` was withdrawn;
+  use `0.32.44`.
 - **The challenge page is no longer labelled "503 Service Unavailable".**
   Custom Pages → Challenge page now uses an explicit challenge label and a
   "Challenge template" subtitle. The challenge page is a separate
