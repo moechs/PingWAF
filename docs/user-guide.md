@@ -449,7 +449,9 @@ Dimension-based rate limit rules live on the separate Rate Limiting page; this t
 
 The challenge page is customized from the same global template editor as the
 error pages: **Settings → Custom Pages → Challenge page** (`scope =
-challenge`, fixed status 503). One template applies to every site, matching the
+challenge`, fixed status 503). It is a **separate scope**: editing it does not
+change the site or unmatched-host 503 error pages, and those pages cannot
+replace a challenge response. One template applies to every site, matching the
 existing global error-page model. The template is presentation only: the
 fingerprinting, proof-of-work, verification and redirect JavaScript is compiled
 into the binary and injected at `{{ challenge_scripts | safe }}`; the template

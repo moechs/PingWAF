@@ -62,7 +62,7 @@ curl -s https://localhost:9080/api/v1/sites -H "Authorization: Bearer $TOKEN"
 
 - **`site`**（默认）—— 替换已匹配站点的错误响应；状态码 400–599；模板可用完整上下文（`request_id`、`error_code`、`site_name`、`client_ip` 等）。
 - **`unmatched_host`** —— 边缘对 `Host` 不匹配任何已配置站点请求的兜底（裸 IP + 端口、未知主机名）。仅接受 404、421、503；同 `(scope, status_code)` 重复返回 `409`。只有存在至少一条启用的该作用域页面时边缘才会生成兜底 Location——否则网关保持默认 404——且它永远不会覆盖已匹配站点自身的 Location。模板只能使用 `{{ host }}`（已 HTML 转义）与 `{{ request_id }}`；响应带 `Cache-Control: no-store`。
-- **`challenge`** —— JS / managed / interactive 挑战页；固定 503、`text/html`。仅展示层：编译好的挑战 JS 通过 `{{ challenge_scripts | safe }}` 注入；模板必须保留 `countdown`、`title`、`subtitle`、`status`、`spinnerWrap`、`progressBar`、`progressFill` 这些 id，且不能包含 `<script>`。
+- **`challenge`** —— JS / managed / interactive 挑战页；固定 503、`text/html`。仅展示层：编译好的挑战 JS 通过 `{{ challenge_scripts | safe }}` 注入；模板必须保留 `countdown`、`title`、`subtitle`、`status`、`spinnerWrap`、`progressBar`、`progressFill` 这些 id，且不能包含 `<script>`。该作用域与站点、未匹配 Host 的 503 错误页相互独立，修改它不会影响那些页面。
 
 ## 站点克隆完整复制
 

@@ -1528,11 +1528,13 @@
       "scopeSite": "站点错误页（site）",
       "scopeUnmatched": "未匹配 Host（unmatched_host）",
       "scopeChallenge": "挑战页（challenge）",
-      "scopeChallengeHint": "JS / managed / interactive 挑战页的展示模板。挑战 JS 已编译进二进制：用 {{ challenge_scripts | safe }} 注入，保留必需的 DOM id，不要添加 <script> 标签。",
+      "scopeChallengeHint": "JS / managed / interactive 挑战页的展示模板。挑战 JS 已编译进二进制：用 {{ challenge_scripts | safe }} 注入，保留必需的 DOM id，不要添加 <script> 标签。此页面与站点、未匹配 Host 的 503 错误页相互独立，修改它不会影响那些 503 页面。",
       "scopeUnmatchedHint": "未匹配 Host 指直接以 IP+端口访问网关，或请求的 Host 不对应任何已配置站点。",
       "scopeUnmatchedFallback": "此处未配置页面时，网关保持默认 404 响应。",
       "scopeUnmatchedVars": "此类页面可使用下方变量（host 已做 HTML 转义）。",
-      "statusCode": "状态码"
+      "statusCode": "状态码",
+      "challengePageName": "挑战页",
+      "challengeTemplate": "挑战模板"
     },
     "siteSettings": {
       "title": "站点设置",

@@ -981,11 +981,32 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
     },
   })
 
+  const challengePageName = t('pages.errorPages.challengePageName')
+  // `503` is the transport status for a challenge, but its page is not the
+  // site/unmatched-host 503 error page. Never label it "Service Unavailable":
+  // that name made operators think editing it would change normal 503s.
+  const genericChallengeNames = new Set([
+    'Service Unavailable',
+    '503 Service Unavailable',
+    '503 · Service Unavailable',
+  ])
+  const pageNameFor = (
+    page: { name?: string } | undefined,
+    pageScope: ErrorPageScope,
+    statusCode: number,
+  ) => {
+    if (pageScope === 'challenge') {
+      const name = page?.name?.trim()
+      return name && !genericChallengeNames.has(name) ? name : challengePageName
+    }
+    return page?.name || ERROR_PAGE_MESSAGES[statusCode] || String(statusCode)
+  }
+
   const openEditor = (statusCode: number, editorScope: ErrorPageScope = scope) => {
     const existing = byStatus.get(statusCode)
     setEditor({
       status_code: statusCode,
-      name: existing?.name ?? ERROR_PAGE_MESSAGES[statusCode] ?? String(statusCode),
+      name: pageNameFor(existing, editorScope, statusCode),
       content_type:
         editorScope === 'challenge'
           ? 'text/html'
@@ -1117,10 +1138,12 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
                         </span>
                         <div className="min-w-0">
                           <p className="truncate text-sm font-medium text-fg-strong">
-                            {page?.name || ERROR_PAGE_MESSAGES[code]}
+                            {pageNameFor(page, scope, code)}
                           </p>
                           <p className="mt-0.5 text-xs uppercase tracking-wide text-fg-subtle">
-                            {page?.content_type ?? 'text/html'}
+                            {scope === 'challenge'
+                              ? t('pages.errorPages.challengeTemplate')
+                              : (page?.content_type ?? 'text/html')}
                           </p>
                         </div>
                       </div>
@@ -1172,7 +1195,13 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
         open={editor !== null}
         onClose={save.isPending ? () => undefined : () => setEditor(null)}
         size="lg"
-        title={editor ? `${editor.status_code} · ${t('pages.errorPages.editTitle')}` : ''}
+        title={
+          editor
+            ? editor.scope === 'challenge'
+              ? `${editor.status_code} · ${challengePageName}`
+              : `${editor.status_code} · ${t('pages.errorPages.editTitle')}`
+            : ''
+        }
         description={t('pages.errorPages.editDescription')}
         className="max-w-4xl"
         footer={

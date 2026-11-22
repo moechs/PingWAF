@@ -75,7 +75,9 @@ Custom pages (`GET|POST /error-pages`, administrators; the API path keeps the hi
   status 503 and `text/html`. Presentation only: the compiled challenge
   scripts are injected with `{{ challenge_scripts | safe }}`; the template
   must keep the `countdown`, `title`, `subtitle`, `status`, `spinnerWrap`,
-  `progressBar` and `progressFill` ids and must not contain `<script>`.
+  `progressBar` and `progressFill` ids and must not contain `<script>`. This
+  scope is separate from the site and unmatched-host 503 error pages; editing
+  it does not change them.
 
 ## Site clones copy everything
 

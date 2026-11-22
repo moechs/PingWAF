@@ -1528,11 +1528,13 @@
       "scopeSite": "Site error pages (site)",
       "scopeUnmatched": "Unmatched Host (unmatched_host)",
       "scopeChallenge": "Challenge page (challenge)",
-      "scopeChallengeHint": "Presentation template for the JS / managed / interactive challenge page. The challenge JavaScript is compiled in: inject it with {{ challenge_scripts | safe }}, keep the required DOM ids, and do not add <script> tags.",
+      "scopeChallengeHint": "Presentation template for the JS / managed / interactive challenge page. The challenge JavaScript is compiled in: inject it with {{ challenge_scripts | safe }}, keep the required DOM ids, and do not add <script> tags. This page is separate from the site and unmatched-host 503 error pages; editing it does not change them.",
       "scopeUnmatchedHint": "Unmatched Host means the request reached the gateway by bare IP + port, or its Host header matches no configured site.",
       "scopeUnmatchedFallback": "If no page is configured here, the gateway keeps its default 404 response.",
       "scopeUnmatchedVars": "These pages can use the variables below (host is HTML-escaped).",
-      "statusCode": "Status code"
+      "statusCode": "Status code",
+      "challengePageName": "Challenge page",
+      "challengeTemplate": "Challenge template"
     },
     "siteSettings": {
       "title": "Site Settings",

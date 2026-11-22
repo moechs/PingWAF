@@ -4453,7 +4453,7 @@ Every error page carries a `scope`:
 |-------|--------|--------------|
 | `site` (default) | Error responses of **matched** sites — WAF blocks, rate limits, paused sites, origin errors | 400–599 |
 | `unmatched_host` | Requests whose `Host` header matches **no** configured site, e.g. someone reaching the gateway by bare IP + port, or an unknown/expired hostname | 404, 421, 503 only (the dashboard defaults to 404) |
-| `challenge` | The JS / managed / interactive challenge page. Presentation only: the compiled challenge scripts are injected by the edge | 503 only |
+| `challenge` | The JS / managed / interactive challenge page. Presentation only: the compiled challenge scripts are injected by the edge. This is a separate scope from the site/unmatched-host 503 error pages; editing it does not change them | 503 only |
 
 The scopes serve disjoint request paths, so a `site` 404 page, an
 `unmatched_host` 404 page and the `challenge` 503 page can coexist; creating a

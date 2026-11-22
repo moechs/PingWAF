@@ -10,6 +10,15 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [PingWAF Unreleased]
 
+### Fixed
+
+- **The challenge page is no longer labelled "503 Service Unavailable".**
+  Custom Pages → Challenge page now uses an explicit challenge label and a
+  "Challenge template" subtitle. The challenge page is a separate
+  `error_pages` scope: editing it never changes the site or unmatched-host 503
+  error pages. Legacy challenge rows named "Service Unavailable" are displayed
+  and normalised to the challenge label.
+
 ### Added
 
 - **Per-agent site scope.** A new `agent_sites` table and `agents.site_scope`
