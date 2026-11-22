@@ -445,6 +445,30 @@ Dimension-based rate limit rules live on the separate Rate Limiting page; this t
 - **Passive**: Challenge only when suspicious behavior is detected
 - **Active**: Challenge all requests matching configured criteria
 
+### Challenge page template
+
+Set `PINGWAF_CHALLENGE_TEMPLATE=/etc/pingwaf/challenge.html` (environment of
+the data-plane process; restart after changing it) to replace the built-in
+challenge page's presentation. This is **presentation only**: the
+fingerprinting, proof-of-work, verification and redirect JavaScript is
+compiled into the binary and injected at `{{PINGWAF_SCRIPTS}}`; the template
+cannot replace it.
+
+The template must:
+
+- contain the `{{PINGWAF_SCRIPTS}}` placeholder exactly once;
+- contain the elements `countdown`, `title`, `subtitle`, `status`,
+  `spinnerWrap`, `progressBar` and `progressFill` (the compiled script looks
+  them up by id; single- or double-quoted `id` works);
+- not contain `<script>` (only the compiled scripts may run);
+- optionally use `{{BRAND_NAME}}` and `{{REQUEST_ID}}`, which are HTML-escaped.
+
+A missing file, a missing placeholder, a missing required id, a `<script>` tag
+or a file larger than 1 MiB is rejected with a warning and the built-in page is
+served. The file is read once at the first challenge; use a root-owned 0640 file
+(the process only needs read access). The template affects the JS, managed and
+interactive challenge types because they share the same page renderer.
+
 ## Cache Configuration
 
 ### Cache Rules

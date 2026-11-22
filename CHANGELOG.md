@@ -8,6 +8,27 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [PingWAF Unreleased]
+
+### Added
+
+- **Challenge page presentation templates.** `PINGWAF_CHALLENGE_TEMPLATE`
+  points at a presentation-only HTML page used by the JS, managed and
+  interactive challenge types. The fingerprint, proof-of-work, verification
+  and redirect JavaScript remains compiled in and is injected at
+  `{{PINGWAF_SCRIPTS}}`; templates containing `<script>` are rejected, as are
+  templates missing the placeholder or one of the required DOM ids. The file
+  is read once at the first challenge (restart to apply) and the built-in page
+  is used with a warning when the override is invalid.
+
+### Fixed
+
+- **Removed stale `cargo-audit` ignores.** `RUSTSEC-2026-0344` (ruzstd) and
+  `RUSTSEC-2026-0194`/`0195` (quick-xml) no longer match anything in
+  `Cargo.lock`: ruzstd is already 0.9.1 and quick-xml is no longer in the tree.
+  Leaving the ids in `.cargo/audit.toml` would silently mute a later
+  regression.
+
 ## [PingWAF 0.32.41] — 2026-11-22
 
 ### Fixed

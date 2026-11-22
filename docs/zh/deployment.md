@@ -91,6 +91,7 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # 期
 | `ADMIN_PASSWORD` | **无默认值（新库必填）** | 初始管理员口令；为空会让首次启动失败，而不是播种已知口令。安装器会生成随机口令并只打印一次；首次登录强制改密 |
 | `POSTGRES_PASSWORD` | `pingwaf`（开发回退） | PostgreSQL 口令；正式部署务必在 `.env` 设置随机值（compose 仍会回退到 `pingwaf`，安装器不生成该项） |
 | `PINGWAF_SECRET_KEY` | 未设置（密封功能必需） | 静态加密主密钥：加密通知渠道口令、AI Provider Key、备份目标凭据。**必须设为 32 字节随机值**；不设置则这些字段明文入库。安装器会生成（compose → `.env`；二进制 → `/etc/pingwaf/pingwaf.env` 0600）。无在线轮换，备份与轮换步骤见 [SECURITY.md](../../SECURITY.md#credentials-and-secrets) |
+| `PINGWAF_CHALLENGE_TEMPLATE` | 未设置 | JS / managed / interactive 挑战页的**仅展示层** HTML 模板路径。模板必须包含 `{{PINGWAF_SCRIPTS}}` 和规定的 DOM id；编译进二进制的挑战 JS 始终注入，模板中不能出现 `<script>`。首次挑战时读取一次，修改后需重启。 |
 | `PINGWAF_JWT_SECRET` | `change-me-in-production` | JWT 签名密钥，至少 16 字符（建议 `openssl rand -hex 32`）；占位符会在首启时替换为随机持久化值 |
 | `PINGWAF_ALLOW_REGISTRATION` | 代码默认 `true`（Compose 设为 `false`） | 是否允许自助注册；生产务必设为 `false` |
 | `PINGWAF_CORS_ORIGINS` | 空（仅同源） | 允许的跨域来源；为空时**不下发 CORS 头**，只有同源调用可用 |
