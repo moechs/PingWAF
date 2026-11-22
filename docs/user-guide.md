@@ -1059,6 +1059,24 @@ key. An explicitly configured secret always wins.
    ```
 3. The agent appears automatically in **Agents**
 
+### Assigning sites to an agent
+
+By default an agent receives every site owned by its API key — the legacy
+behaviour, and the highest-memory mode. On a multi-site fleet, narrow it:
+
+```
+Agents → [agent] → Manage sites
+```
+
+- **All sites** — the default; the agent carries every site its key owner has.
+- **Selected sites** — only the checked sites are pushed. The rule bundle,
+  certificate set and per-site caches then scale with the selection instead of
+  the whole account; an empty selection leaves the agent idle until assigned.
+
+The assignment is validated against the API key's owner and takes effect
+immediately for a connected agent; an offline node receives it on reconnect.
+The same setting is available as `PUT /api/v1/agents/{id}/sites`.
+
 ### Monitoring Agents
 
 The Agents page shows:

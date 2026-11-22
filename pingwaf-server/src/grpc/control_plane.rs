@@ -55,10 +55,10 @@ use crate::grpc::registry::{
     AgentRegistry, ConfigDrift, HeartbeatMetrics, COMMAND_CHANNEL_CAPACITY,
 };
 use crate::models::{
-    access_log, action, agent, agent_blocked_ip, agent_metric, agent_status,
-    api_key, certificate_events, certificate_links, geo_rules, host_sample,
-    ip_access_rules, path_exceptions, security_event, site, site_basic_auth,
-    site_certificates, site_oidc,
+    access_log, action, agent, agent_blocked_ip, agent_metric, agent_sites,
+    agent_status, api_key, certificate_events, certificate_links, geo_rules,
+    host_sample, ip_access_rules, path_exceptions, security_event, site,
+    site_basic_auth, site_certificates, site_oidc,
 };
 
 /// Stream type returned by the server-streaming RPCs.
@@ -231,6 +231,35 @@ impl ControlPlaneService {
         &self,
         row: &agent::Model,
     ) -> Result<Vec<site::Model>, Status> {
+        if row.site_scope == "selected" {
+            let Some(key_id) = row.api_key_id else {
+                return Ok(Vec::new());
+            };
+            let key = api_key::Entity::find_by_id(key_id)
+                .one(&self.db)
+                .await
+                .map_err(db_status)?
+                .ok_or_else(|| {
+                    Status::unauthenticated("API key was revoked")
+                })?;
+            let assigned: Vec<Uuid> = agent_sites::Entity::find()
+                .filter(agent_sites::Column::AgentId.eq(row.id))
+                .all(&self.db)
+                .await
+                .map_err(db_status)?
+                .into_iter()
+                .map(|assignment| assignment.site_id)
+                .collect();
+            if assigned.is_empty() {
+                return Ok(Vec::new());
+            }
+            return site::Entity::find()
+                .filter(site::Column::Id.is_in(assigned))
+                .filter(site::Column::UserId.eq(key.user_id))
+                .all(&self.db)
+                .await
+                .map_err(db_status);
+        }
         if let Some(site_id) = row.site_id {
             let owned = site::Entity::find_by_id(site_id)
                 .one(&self.db)
@@ -468,7 +497,9 @@ impl ControlPlaneTrait for ControlPlaneService {
             Some(row) => {
                 let agent_id = row.id;
                 let mut active: agent::ActiveModel = row.into();
-                active.site_id = Set(site_id);
+                // A re-registration must not clear an operator's site scope
+                // or legacy single-site binding; only a brand-new row starts
+                // with `all` / no binding.
                 active.version = Set(optional(&payload.version));
                 active.os_info = Set(optional(&payload.os_info));
                 active.cpu_cores = Set(positive_i32(payload.cpu_cores as i64));
@@ -498,6 +529,7 @@ impl ControlPlaneTrait for ControlPlaneService {
                 let created = agent::ActiveModel {
                     id: Set(agent_id),
                     site_id: Set(site_id),
+                    site_scope: Set("all".to_string()),
                     hostname: Set(payload.hostname.clone()),
                     // The label is the operator's: a registering agent never
                     // supplies or clears it.

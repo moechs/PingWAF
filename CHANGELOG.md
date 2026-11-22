@@ -8,6 +8,20 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [PingWAF Unreleased]
+
+### Added
+
+- **Per-agent site scope.** A new `agent_sites` table and `agents.site_scope`
+  let an agent serve only its assigned sites (`selected`) instead of every
+  site owned by its API key (`all`, the legacy default). The console's Agents
+  page has a **Manage sites** dialog; `PUT /api/v1/agents/{id}/sites` changes
+  the scope and re-pushes the agent immediately. This is the P0 memory
+  optimisation for multi-site, multi-node fleets: rule bundles, certificates
+  and per-site caches scale with the assignment rather than the whole account.
+  Existing single-site bindings are migrated to a selected assignment; an
+  empty selection is valid and leaves the node idle.
+
 ## [PingWAF 0.32.42] — 2026-11-22
 
 ### Added

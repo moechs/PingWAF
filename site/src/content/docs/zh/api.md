@@ -27,7 +27,7 @@ curl -s https://localhost:9080/api/v1/sites -H "Authorization: Bearer $TOKEN"
 | 规则 | `GET|POST /sites/{id}/rules`、`GET|PUT|DELETE /sites/{id}/rules/{rule_id}`、`POST /sites/{id}/waf/defaults` |
 | WAF | `GET|PUT /sites/{id}/waf/settings`、`GET /sites/{id}/waf/posture`、`GET /managed-rules` |
 | 日志 | `GET /logs/security`、`GET /logs/access`、`GET /logs/access/{id}`、`DELETE /logs/purge` |
-| Agent | `GET /agents`、`POST /agents/enroll`、`POST /agents/{id}/commands` |
+| Agent | `GET /agents`、`POST /agents/enroll`、`PUT /agents/{id}/sites`、`POST /agents/{id}/commands` |
 | 配置版本 | `GET /config-versions`、`GET /config-versions/{id}`、`POST /config-versions/{id}/rollback`、`POST /config-versions/prune` |
 | 系统 | `GET /system/metrics`、`/system/profile`、`/system/nodes`、`/system/status` |
 

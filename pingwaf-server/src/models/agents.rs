@@ -36,6 +36,9 @@ pub mod agents {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: Uuid,
         pub site_id: Option<Uuid>,
+        /// `all` (legacy: every site owned by the API key) or `selected`
+        /// (only the rows in `agent_sites`; may be empty).
+        pub site_scope: String,
         pub hostname: String,
         /// Operator-editable label shown instead of `hostname` when set.
         ///

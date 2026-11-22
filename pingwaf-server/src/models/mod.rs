@@ -12,6 +12,7 @@
 
 pub mod agent_blocked_ips;
 pub mod agent_metrics;
+pub mod agent_sites;
 pub mod agents;
 pub mod ai;
 pub mod ai_crawl;

@@ -1815,8 +1815,11 @@ List registered agents.
   "items": [
     {
       "id": "uuid",
-      "site_id": "uuid",
-      "site_domain": "example.com",
+      "site_id": null,
+      "site_domain": null,
+      "site_scope": "selected",
+      "site_ids": ["uuid-a", "uuid-b"],
+      "site_domains": ["a.example.com", "b.example.com"],
       "hostname": "edge-01",
       "display_name": "edge-01 (backup)",
       "name": "edge-01",
@@ -1876,6 +1879,20 @@ node, and the node view (`GET /system/nodes`) names it `name`; carrying both
 keeps one shape for the console without breaking callers that read
 `hostname`. `last_seen` is likewise an alias of `last_heartbeat`
 (`null` = the agent has never heartbeated).
+
+`site_scope` controls which site configurations the agent receives:
+
+- **`all`** (legacy default) — every site owned by the agent's API key. This is
+  the highest-memory mode and the behaviour before per-agent assignment.
+- **`selected`** — only the sites in `site_ids` / `site_domains`. An empty
+  list is valid and leaves the agent with no site configuration (an idle
+  node); it still heartbeats and can be assigned later.
+
+`site_id` / `site_domain` are the legacy single-binding fields and are `null`
+for a selected agent; use `site_ids` / `site_domains`. Assignments are
+validated against the API key's owner, so one tenant's agent can never receive
+another tenant's site. `PUT /agents/{agent_id}/sites` changes the scope and
+immediately re-pushes the agent's configuration.
 
 Three address fields describe a node from different vantage points, and they
 answer different questions:
@@ -1997,6 +2014,28 @@ Rules:
   registration still matches on `hostname` + API key, and renaming never
   produces a duplicate node.
 - `404` when the agent does not exist.
+
+### PUT /agents/{agent_id}/sites
+
+Set the agent's site scope and replace its assignments. Requires write access.
+
+**Request:**
+```json
+{
+  "scope": "selected",
+  "site_ids": ["uuid-a", "uuid-b"]
+}
+```
+
+- `scope` is `all` or `selected`; anything else answers `400`.
+- `all` clears the assignment rows and the legacy single binding, restoring
+  "every site owned by the API key".
+- `selected` replaces the assignment set; duplicate ids are ignored, an empty
+  list is allowed, and every site must belong to the agent API key's owner
+  (otherwise `400`). Non-admin callers also need read access to each site.
+- The response is the updated agent object (same shape as the list item). The
+  control plane pushes the new configuration to a connected agent immediately;
+  an offline agent receives it on reconnect.
 
 ### GET /agents/{agent_id}/samples
 

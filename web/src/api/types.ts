@@ -1105,6 +1105,12 @@ export interface Agent {
   id: string
   site_id: string | null
   site_domain: string | null
+  /** `all` = every site owned by the API key; `selected` = `site_ids`. */
+  site_scope: 'all' | 'selected'
+  /** Sites assigned to a selected agent; empty for `all`. */
+  site_ids: string[]
+  /** Domains matching `site_ids`, in order. */
+  site_domains: string[]
   hostname: string
   /** Operator-assigned label; null = show the hostname instead. */
   display_name: string | null
@@ -1156,6 +1162,11 @@ export interface Agent {
   pending_commands: number
   /** Whether the gRPC control plane serves TLS; false = plaintext (degraded). */
   grpc_tls: boolean
+}
+
+export interface UpdateAgentSitesRequest {
+  scope: 'all' | 'selected'
+  site_ids?: string[]
 }
 
 export interface AgentListQuery extends PaginationQuery {

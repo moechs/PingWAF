@@ -27,7 +27,7 @@ A login returns `access_token`, `refresh_token`, `token_type: Bearer`, `expires_
 | Rules | `GET|POST /sites/{id}/rules`, `GET|PUT|DELETE /sites/{id}/rules/{rule_id}`, `POST /sites/{id}/waf/defaults` |
 | WAF | `GET|PUT /sites/{id}/waf/settings`, `GET /sites/{id}/waf/posture`, `GET /managed-rules` |
 | Logs | `GET /logs/security`, `GET /logs/access`, `GET /logs/access/{id}`, `DELETE /logs/purge` |
-| Agents | `GET /agents`, `POST /agents/enroll`, `POST /agents/{id}/commands` |
+| Agents | `GET /agents`, `POST /agents/enroll`, `PUT /agents/{id}/sites`, `POST /agents/{id}/commands` |
 | Config versions | `GET /config-versions`, `GET /config-versions/{id}`, `POST /config-versions/{id}/rollback`, `POST /config-versions/prune` |
 | System | `GET /system/metrics`, `/system/profile`, `/system/nodes`, `/system/status` |
 

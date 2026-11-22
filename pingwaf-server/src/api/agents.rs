@@ -14,7 +14,7 @@ use pingwaf_proto::control_plane::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, Set,
+    QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -29,7 +29,7 @@ use crate::api::state::AppState;
 use crate::auth::AuthUser;
 use crate::grpc::config::now_timestamp;
 use crate::models::{
-    agent, agent_status, api_key, host_sample, permission, site,
+    agent, agent_sites, agent_status, api_key, host_sample, permission, site,
 };
 
 /// `pingwaf.CommandType` values, spelled out so the control plane does not depend
@@ -71,6 +71,12 @@ pub struct AgentResponse {
     pub id: Uuid,
     pub site_id: Option<Uuid>,
     pub site_domain: Option<String>,
+    /// `all` (legacy: every site owned by the API key) or `selected`.
+    pub site_scope: String,
+    /// Sites assigned to a `selected` agent (empty for `all`).
+    pub site_ids: Vec<Uuid>,
+    /// Domains matching `site_ids`, in the same order.
+    pub site_domains: Vec<String>,
     pub hostname: String,
     /// Operator-editable label; `null` means "use the hostname".
     ///
@@ -140,6 +146,15 @@ pub struct AgentResponse {
     /// Whether the gRPC control plane the agents connect to serves TLS.
     /// `false` means plaintext traffic (degraded mode).
     pub grpc_tls: bool,
+}
+
+/// `PUT /agents/{agent_id}/sites` — narrow or widen an agent's site scope.
+#[derive(Debug, Deserialize)]
+pub struct UpdateSitesRequest {
+    /// `all` (legacy behaviour) or `selected`.
+    pub scope: String,
+    #[serde(default)]
+    pub site_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +274,7 @@ pub fn routes() -> Router<AppState> {
         .route("/agents", get(list))
         .route("/agents/enroll", post(enroll))
         .route("/agents/{agent_id}", get(show).patch(update).delete(remove))
+        .route("/agents/{agent_id}/sites", axum::routing::put(update_sites))
         .route("/agents/{agent_id}/samples", get(samples))
         .route("/agents/{agent_id}/commands", post(send_command))
         .route("/agents/flush-logs", post(flush_logs))
@@ -472,7 +488,20 @@ async fn list(
         );
     }
     if let Some(id) = site_filter {
-        condition = condition.add(agent::Column::SiteId.eq(id));
+        let assigned: Vec<Uuid> = agent_sites::Entity::find()
+            .filter(agent_sites::Column::SiteId.eq(id))
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|row| row.agent_id)
+            .collect();
+        let mut site_condition =
+            Condition::any().add(agent::Column::SiteId.eq(id));
+        if !assigned.is_empty() {
+            site_condition =
+                site_condition.add(agent::Column::Id.is_in(assigned));
+        }
+        condition = condition.add(site_condition);
     }
     if let Some(status) = non_empty(&query.status) {
         if !agent_status::is_valid(&status) {
@@ -540,6 +569,118 @@ async fn update(
         agent_id = %id,
         renamed = display_name.is_some(),
         "agent display name updated"
+    );
+
+    let row = load_agent(&state, id, &current).await?;
+    let mut items = enrich(&state, vec![row]).await?;
+    Ok(Json(items.remove(0)))
+}
+
+fn validate_site_scope(scope: &str) -> Result<(), ApiError> {
+    if scope == "all" || scope == "selected" {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "scope must be 'all' or 'selected'".to_string(),
+        ))
+    }
+}
+
+/// `PUT /api/v1/agents/{agent_id}/sites` — set the agent's site scope.
+///
+/// `all` keeps the historical behaviour (every site owned by the agent's API
+/// key); `selected` limits the config bundle to the listed sites, which is the
+/// memory win for a multi-site edge. Assignments are validated against the
+/// API key owner, so an admin cannot make one tenant's agent serve another
+/// tenant's site.
+async fn update_sites(
+    State(state): State<AppState>,
+    current: AuthUser,
+    Path(agent_id): Path<String>,
+    Json(payload): Json<UpdateSitesRequest>,
+) -> Result<Json<AgentResponse>, ApiError> {
+    require_write(&current)?;
+    let id = parse_uuid(&agent_id, "agent id")?;
+    let row = load_agent(&state, id, &current).await?;
+
+    let scope = payload.scope.trim();
+    validate_site_scope(scope)?;
+
+    let mut site_ids: Vec<Uuid> = Vec::new();
+    if scope == "selected" {
+        let mut seen = std::collections::HashSet::new();
+        for site_id in payload.site_ids {
+            if !seen.insert(site_id) {
+                continue;
+            }
+            let site = site::Entity::find_by_id(site_id)
+                .one(&state.db)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::NotFound(format!("site {site_id} not found"))
+                })?;
+            // The agent's key owner is the security boundary; the caller's
+            // read permission is checked separately for non-admin accounts.
+            let key_id = row.api_key_id.ok_or_else(|| {
+                ApiError::BadRequest(
+                    "agent has no API key; cannot assign sites".to_string(),
+                )
+            })?;
+            let key = api_key::Entity::find_by_id(key_id)
+                .one(&state.db)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "agent API key no longer exists".to_string(),
+                    )
+                })?;
+            if site.user_id != key.user_id {
+                return Err(ApiError::BadRequest(format!(
+                    "agent API key does not own site {}",
+                    site.domain
+                )));
+            }
+            if !current.is_admin() {
+                load_site_read(&state.db, site_id, &current).await?;
+            }
+            site_ids.push(site_id);
+        }
+    }
+
+    let txn = state.db.begin().await?;
+    let mut active: agent::ActiveModel = row.into();
+    active.site_scope = Set(scope.to_string());
+    // The legacy single binding is superseded by the explicit scope.
+    active.site_id = Set(None);
+    active.update(&txn).await?;
+    agent_sites::Entity::delete_many()
+        .filter(agent_sites::Column::AgentId.eq(id))
+        .exec(&txn)
+        .await?;
+    if scope == "selected" {
+        for site_id in &site_ids {
+            agent_sites::ActiveModel {
+                agent_id: Set(id),
+                site_id: Set(*site_id),
+                created_at: Set(chrono::Utc::now()),
+            }
+            .insert(&txn)
+            .await?;
+        }
+    }
+    txn.commit().await?;
+
+    if let Err(err) =
+        crate::grpc::repush_agent_config(&state.db, &state.agents, id).await
+    {
+        tracing::warn!(%id, error = %err, "could not push the new site scope to the agent");
+    }
+    tracing::info!(
+        agent_id = %id,
+        scope,
+        sites = site_ids.len(),
+        requested_by = %current.id,
+        "agent site scope updated"
     );
 
     let row = load_agent(&state, id, &current).await?;
@@ -735,9 +876,31 @@ async fn enrich(
     state: &AppState,
     rows: Vec<agent::Model>,
 ) -> Result<Vec<AgentResponse>, ApiError> {
+    let agent_ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+    let assignments: std::collections::HashMap<Uuid, Vec<Uuid>> =
+        if agent_ids.is_empty() {
+            Default::default()
+        } else {
+            let mut map: std::collections::HashMap<Uuid, Vec<Uuid>> =
+                Default::default();
+            for row in agent_sites::Entity::find()
+                .filter(agent_sites::Column::AgentId.is_in(agent_ids))
+                .all(&state.db)
+                .await?
+            {
+                map.entry(row.agent_id).or_default().push(row.site_id);
+            }
+            map
+        };
+
     let domains: std::collections::HashMap<Uuid, String> = {
-        let ids: Vec<Uuid> =
+        let mut ids: Vec<Uuid> =
             rows.iter().filter_map(|row| row.site_id).collect();
+        for assigned in assignments.values() {
+            ids.extend(assigned.iter().copied());
+        }
+        ids.sort_unstable();
+        ids.dedup();
         if ids.is_empty() {
             Default::default()
         } else {
@@ -754,10 +917,22 @@ async fn enrich(
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let connected = state.agents.is_connected(&row.id).await;
+        let site_ids = if row.site_scope == "selected" {
+            assignments.get(&row.id).cloned().unwrap_or_default()
+        } else {
+            row.site_id.into_iter().collect()
+        };
+        let site_domains: Vec<String> = site_ids
+            .iter()
+            .filter_map(|id| domains.get(id).cloned())
+            .collect();
         out.push(AgentResponse {
             id: row.id,
             site_domain: row.site_id.and_then(|id| domains.get(&id).cloned()),
             site_id: row.site_id,
+            site_scope: row.site_scope.clone(),
+            site_ids,
+            site_domains,
             name: row
                 .display_name
                 .clone()
@@ -1015,6 +1190,14 @@ mod tests {
         // Not empty either: `key_allows_agent` treats an empty permission set
         // as an agent key, but an explicit `agent` is what the mint writes.
         assert!(!enroll_key_permissions().is_empty());
+    }
+
+    #[test]
+    fn site_scope_accepts_only_all_or_selected() {
+        assert!(validate_site_scope("all").is_ok());
+        assert!(validate_site_scope("selected").is_ok());
+        assert!(validate_site_scope("some").is_err());
+        assert!(validate_site_scope("").is_err());
     }
 
     #[test]
