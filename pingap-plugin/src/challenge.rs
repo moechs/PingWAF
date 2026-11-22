@@ -45,8 +45,9 @@ use pingwaf_agent::cache::{
     ChallengeLevel as CacheChallengeLevel,
 };
 use pingwaf_challenge::js_challenge::page::{
-    ChallengePageParams, generate_interactive_challenge_html,
-    generate_js_challenge_html, generate_managed_challenge_html,
+    ChallengePageParams, REQUIRED_DOM_IDS, challenge_scripts,
+    generate_interactive_challenge_html, generate_js_challenge_html,
+    generate_managed_challenge_html,
 };
 use pingwaf_challenge::{
     ChallengeConfig, ChallengeDecision, ChallengeEngine, ChallengeRequest,
@@ -57,6 +58,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tera::{Context, Tera};
 use tracing::{debug, warn};
 
 use crate::host_cache::{HostCacheSweep, touch};
@@ -277,6 +279,81 @@ pub(crate) enum ChallengeKind {
     Interactive,
 }
 
+/// The control plane's challenge page template, when the site carries one.
+///
+/// The template is global (`error_pages` scope `challenge`, status 503), but
+/// it is delivered in every site bundle; the challenge page is rendered only
+/// when the request's site has it enabled.
+fn challenge_page_template(site_id: &str) -> Option<String> {
+    let agent = PingWafAgent::instance()?;
+    let rules = agent.get_rules_for_domain(site_id)?;
+    rules
+        .error_pages
+        .iter()
+        .find(|page| {
+            page.enabled
+                && page.scope == "challenge"
+                && page.status_code == 503
+                && page.content_type == "text/html"
+        })
+        .map(|page| page.body_template.clone())
+}
+
+fn has_dom_id(html: &str, id: &str) -> bool {
+    html.contains(&format!("id=\"{id}\""))
+        || html.contains(&format!("id='{id}'"))
+}
+
+/// Renders a control-plane challenge template through the same Tera engine the
+/// custom error pages use. The challenge script is injected as
+/// `challenge_scripts`; a template that omits `| safe` (Tera escapes it),
+/// contains its own `<script>`, or loses a required DOM id is rejected and the
+/// built-in page is used instead.
+fn render_challenge_template(
+    template: &str,
+    params: &ChallengePageParams,
+) -> Option<String> {
+    if template.to_ascii_lowercase().contains("<script") {
+        warn!("challenge template contains <script>; using the built-in page");
+        return None;
+    }
+    let scripts = challenge_scripts(params);
+    let mut tera = Tera::default();
+    tera.add_raw_template("challenge.html", template).ok()?;
+    let mut context = Context::new();
+    context.insert("brand_name", &params.brand_name);
+    context.insert("request_id", &params.request_id);
+    context.insert("difficulty", &params.difficulty);
+    context.insert("verify_endpoint", &params.verify_endpoint);
+    context.insert("original_url", &params.original_url);
+    context.insert("challenge_scripts", &scripts);
+    let html = match tera.render("challenge.html", &context) {
+        Ok(html) => html,
+        Err(err) => {
+            warn!(error = %err, "challenge template render failed; using the built-in page");
+            return None;
+        },
+    };
+    // `challenge_scripts` is HTML; Tera escapes it unless the template uses
+    // `| safe`. A page without the compiled script can never pass the check.
+    if !html.contains("<script") || !html.contains("computeProofOfWork") {
+        warn!(
+            "challenge template did not inject the compiled script; use the documented challenge_scripts | safe filter; using the built-in page"
+        );
+        return None;
+    }
+    for id in REQUIRED_DOM_IDS {
+        if !has_dom_id(&html, id) {
+            warn!(
+                id,
+                "challenge template is missing a required DOM id; using the built-in page"
+            );
+            return None;
+        }
+    }
+    Some(html)
+}
+
 /// Build a 503 challenge response, registering the pending challenge so the
 /// verify endpoint can later resolve the nonce.
 pub(crate) fn build_challenge_response(
@@ -295,13 +372,15 @@ pub(crate) fn build_challenge_response(
         original_url: original_url.to_string(),
         brand_name: "PingWAF".to_string(),
     };
-    let body = match kind {
-        ChallengeKind::Js => generate_js_challenge_html(&params),
-        ChallengeKind::Managed => generate_managed_challenge_html(&params),
-        ChallengeKind::Interactive => {
-            generate_interactive_challenge_html(&params)
-        },
-    };
+    let body = challenge_page_template(site_id)
+        .and_then(|template| render_challenge_template(&template, &params))
+        .unwrap_or_else(|| match kind {
+            ChallengeKind::Js => generate_js_challenge_html(&params),
+            ChallengeKind::Managed => generate_managed_challenge_html(&params),
+            ChallengeKind::Interactive => {
+                generate_interactive_challenge_html(&params)
+            },
+        });
     HttpResponse::builder(StatusCode::SERVICE_UNAVAILABLE)
         .body(body)
         .header(HTTP_HEADER_CONTENT_HTML.clone())
@@ -1928,5 +2007,63 @@ cookie_secret = "test-secret"
             panic!("expected the verify endpoint to answer");
         };
         assert_eq!(StatusCode::FORBIDDEN, resp.status);
+    }
+    fn challenge_template_fixture() -> String {
+        r#"<!DOCTYPE html>
+<html><head><title>{{ brand_name }}</title></head><body>
+<div id="countdown"></div>
+<h1 id="title"></h1>
+<p id="subtitle"></p>
+<div id="status"></div>
+<div id="spinnerWrap"></div>
+<div id="progressBar"><div id="progressFill"></div></div>
+<p>{{ brand_name }} / {{ request_id }}</p>
+{{ challenge_scripts | safe }}
+</body></html>"#
+            .to_string()
+    }
+
+    #[test]
+    fn challenge_template_injects_the_compiled_scripts() {
+        let params = ChallengePageParams {
+            brand_name: "Brand".to_string(),
+            request_id: "ray-1".to_string(),
+            ..Default::default()
+        };
+        let html =
+            render_challenge_template(&challenge_template_fixture(), &params)
+                .expect("valid template");
+        assert!(html.contains("Brand"));
+        assert!(html.contains("ray-1"));
+        assert!(html.contains("<script"));
+        assert!(html.contains("computeProofOfWork"));
+    }
+
+    #[test]
+    fn challenge_template_without_safe_filter_falls_back() {
+        let params = ChallengePageParams::default();
+        let template = challenge_template_fixture().replace(
+            "{{ challenge_scripts | safe }}",
+            "{{ challenge_scripts }}",
+        );
+        assert!(render_challenge_template(&template, &params).is_none());
+    }
+
+    #[test]
+    fn challenge_template_missing_dom_id_falls_back() {
+        let params = ChallengePageParams::default();
+        let template = challenge_template_fixture()
+            .replace("id=\"status\"", "id=\"not-status\"");
+        assert!(render_challenge_template(&template, &params).is_none());
+    }
+
+    #[test]
+    fn challenge_template_with_script_tag_falls_back() {
+        let params = ChallengePageParams::default();
+        let template = challenge_template_fixture().replace(
+            "{{ challenge_scripts | safe }}",
+            "<script>alert(1)</script>{{ challenge_scripts | safe }}",
+        );
+        assert!(render_challenge_template(&template, &params).is_none());
     }
 }

@@ -1527,6 +1527,8 @@
       "scopeLabel": "スコープ",
       "scopeSite": "サイトエラーページ（site）",
       "scopeUnmatched": "未一致 Host（unmatched_host）",
+      "scopeChallenge": "チャレンジページ（challenge）",
+      "scopeChallengeHint": "JS / managed / interactive チャレンジページの表示テンプレート。チャレンジ JS はバイナリに組み込まれています。{{ challenge_scripts | safe }} で注入し、必須の DOM id を残し、<script> タグを追加しないでください。",
       "scopeUnmatchedHint": "未一致 Host とは、IP+ポートで直接ゲートウェイへアクセスしたか、Host ヘッダーがどのサイトにも一致しないリクエストのことです。",
       "scopeUnmatchedFallback": "ここでページを設定しない場合、ゲートウェイはデフォルトの 404 応答を返します。",
       "scopeUnmatchedVars": "このページでは下記の変数を利用できます（host は HTML エスケープ済み）。",

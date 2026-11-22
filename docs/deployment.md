@@ -387,7 +387,6 @@ and therefore no file key:
 | `PINGWAF_METRIC_RETENTION_DAYS` | `7` | Days of edge-metric samples kept in `agent_metrics` |
 | `PINGWAF_CORS_ORIGINS` | `[]` (same-origin only) | Allowed CORS origins, comma-separated. With no value the API sends **no** CORS headers, so only same-origin callers work |
 | `PINGWAF_SECRET_KEY` | unset | Instance key for sealed secrets (notification channels, AI provider key, backup-target credentials). Set 32 random bytes; unset = clear text. No online rotation — see [`SECURITY.md`](../SECURITY.md#credentials-and-secrets) |
-| `PINGWAF_CHALLENGE_TEMPLATE` | unset | Path to a presentation-only HTML template for the JS / managed / interactive challenge pages. It must contain `{{PINGWAF_SCRIPTS}}` and the DOM ids listed in [Challenges](user-guide.md#challenges-cc-protection); the compiled challenge JavaScript is always injected and the template must not contain `<script>`. Read once at first challenge, so a change needs a restart. |
 | `PINGWAF_PASSKEY_ENABLED` | `true` | Offer passkey (WebAuthn) registration and login. Passkeys need a secure context: HTTPS under a hostname, or `localhost` |
 | `PINGWAF_PASSKEY_RP_NAME` | `PingWAF` | Relying party name shown by the authenticator |
 | `PINGWAF_PASSKEY_RP_ID` | derived from the request | Relying party ID, i.e. the effective domain |

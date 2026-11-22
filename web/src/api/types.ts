@@ -2309,7 +2309,7 @@ export const ERROR_PAGE_STATUS_CODES = [403, 429, 502, 503, 504] as const
  * site or a client reaches the gateway by bare IP. Upsert is keyed on
  * `(scope, status_code)`.
  */
-export type ErrorPageScope = 'site' | 'unmatched_host'
+export type ErrorPageScope = 'site' | 'unmatched_host' | 'challenge'
 
 export interface ErrorPage {
   id: string

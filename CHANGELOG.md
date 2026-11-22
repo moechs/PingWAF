@@ -12,14 +12,13 @@ verbatim for reference and attribution, and is not maintained here.
 
 ### Added
 
-- **Challenge page presentation templates.** `PINGWAF_CHALLENGE_TEMPLATE`
-  points at a presentation-only HTML page used by the JS, managed and
-  interactive challenge types. The fingerprint, proof-of-work, verification
-  and redirect JavaScript remains compiled in and is injected at
-  `{{PINGWAF_SCRIPTS}}`; templates containing `<script>` are rejected, as are
-  templates missing the placeholder or one of the required DOM ids. The file
-  is read once at the first challenge (restart to apply) and the built-in page
-  is used with a warning when the override is invalid.
+- **Challenge page presentation templates reuse Custom Error Pages.** The
+  error-page editor now has a `challenge` scope (fixed 503); the template is
+  global, Tera-rendered and delivered through the existing agent bundle. The
+  fingerprint, proof-of-work, verification and redirect JavaScript remains
+  compiled in and is injected at `{{ challenge_scripts | safe }}`. Templates
+  containing `<script>`, omitting the safe filter or missing one of the
+  required DOM ids fall back to the built-in page with a warning.
 
 ### Fixed
 

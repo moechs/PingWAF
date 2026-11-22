@@ -447,27 +447,31 @@ Dimension-based rate limit rules live on the separate Rate Limiting page; this t
 
 ### Challenge page template
 
-Set `PINGWAF_CHALLENGE_TEMPLATE=/etc/pingwaf/challenge.html` (environment of
-the data-plane process; restart after changing it) to replace the built-in
-challenge page's presentation. This is **presentation only**: the
-fingerprinting, proof-of-work, verification and redirect JavaScript is
-compiled into the binary and injected at `{{PINGWAF_SCRIPTS}}`; the template
+The challenge page is customized from the same global template editor as the
+error pages: **Settings → Custom Error Pages → Challenge page** (`scope =
+challenge`, fixed status 503). One template applies to every site, matching the
+existing global error-page model. The template is presentation only: the
+fingerprinting, proof-of-work, verification and redirect JavaScript is compiled
+into the binary and injected at `{{ challenge_scripts | safe }}`; the template
 cannot replace it.
 
 The template must:
 
-- contain the `{{PINGWAF_SCRIPTS}}` placeholder exactly once;
+- inject the compiled scripts with `{{ challenge_scripts | safe }}` (without
+  `| safe`, Tera HTML-escapes them and the page is rejected);
 - contain the elements `countdown`, `title`, `subtitle`, `status`,
   `spinnerWrap`, `progressBar` and `progressFill` (the compiled script looks
   them up by id; single- or double-quoted `id` works);
-- not contain `<script>` (only the compiled scripts may run);
-- optionally use `{{BRAND_NAME}}` and `{{REQUEST_ID}}`, which are HTML-escaped.
+- not contain its own `<script>` tags (only the compiled scripts may run).
 
-A missing file, a missing placeholder, a missing required id, a `<script>` tag
-or a file larger than 1 MiB is rejected with a warning and the built-in page is
-served. The file is read once at the first challenge; use a root-owned 0640 file
-(the process only needs read access). The template affects the JS, managed and
-interactive challenge types because they share the same page renderer.
+Available variables: `challenge_scripts`, `brand_name`, `request_id`,
+`difficulty`, `verify_endpoint`, `original_url`. `brand_name` and `request_id`
+are HTML-escaped by Tera.
+
+A template that fails to render, omits the `| safe` filter, loses a required
+DOM id or contains `<script>` falls back to the built-in page with a warning.
+The challenge page applies to the JS, managed and interactive challenge types
+because they share the same renderer.
 
 ## Cache Configuration
 

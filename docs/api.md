@@ -4411,10 +4411,11 @@ Every error page carries a `scope`:
 |-------|--------|--------------|
 | `site` (default) | Error responses of **matched** sites — WAF blocks, rate limits, paused sites, origin errors | 400–599 |
 | `unmatched_host` | Requests whose `Host` header matches **no** configured site, e.g. someone reaching the gateway by bare IP + port, or an unknown/expired hostname | 404, 421, 503 only (the dashboard defaults to 404) |
+| `challenge` | The JS / managed / interactive challenge page. Presentation only: the compiled challenge scripts are injected by the edge | 503 only |
 
-The two scopes serve disjoint request paths, so a `site` 404 page and an
-`unmatched_host` 404 page can coexist; creating a second page with the same
-`(scope, status_code)` answers `409 conflict`.
+The scopes serve disjoint request paths, so a `site` 404 page, an
+`unmatched_host` 404 page and the `challenge` 503 page can coexist; creating a
+second page with the same `(scope, status_code)` answers `409 conflict`.
 
 `site` pages render with `request_id`, `error_code`, `error_message`,
 `site_name`, `client_ip`, `timestamp`, `method`, `path` (aliased as
@@ -4422,6 +4423,15 @@ The two scopes serve disjoint request paths, so a `site` 404 page and an
 `unmatched_host` pages render with only `{{ host }}` (HTML-escaped before it
 enters the template, so it is always safe to interpolate) and
 `{{ request_id }}` — no request header is ever reflected into the template.
+`challenge` pages render with `challenge_scripts` (the compiled fingerprint,
+proof-of-work, verification and redirect scripts; use
+`{{ challenge_scripts | safe }}`), `brand_name`, `request_id`, `difficulty`,
+`verify_endpoint` and `original_url`. The page must keep the DOM ids
+`countdown`, `title`, `subtitle`, `status`, `spinnerWrap`, `progressBar` and
+`progressFill`, and must not contain its own `<script>` tags. A template that
+omits the safe filter, loses an id or contains a script tag falls back to the
+built-in challenge page.
+
 A template that fails to render (or renders past 256 KiB) falls back to a
 plain-text body, so a typo cannot turn an error page into a `500`. Fallback
 responses carry `Cache-Control: no-store`.
@@ -4435,7 +4445,7 @@ With no `unmatched_host` page configured the edge keeps its plain default 404.
 ### GET /error-pages
 
 List custom error pages (paginated), ordered by scope, then status code.
-Optional `?scope=site|unmatched_host` filters by scope.
+Optional `?scope=site|unmatched_host|challenge` filters by scope.
 
 ### POST /error-pages
 
@@ -4455,8 +4465,8 @@ Create a custom error page.
 
 | Field | Description |
 |-------|-------------|
-| `status_code` | 400-599; for `unmatched_host` only 404, 421, 503 (otherwise `400 bad_request`) |
-| `scope` | `site` (default) or `unmatched_host`; anything else answers `400` |
+| `status_code` | 400-599; `unmatched_host` only 404/421/503; `challenge` only 503 (otherwise `400 bad_request`) |
+| `scope` | `site` (default), `unmatched_host` or `challenge`; anything else answers `400` |
 | `name` | 1-200 characters |
 | `content_type` | Defaults to `text/html` |
 | `body_template` | Tera template, must not be empty |

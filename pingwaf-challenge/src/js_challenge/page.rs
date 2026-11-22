@@ -1,6 +1,4 @@
 use crate::fingerprint::fingerprint_collection_js;
-use std::sync::OnceLock;
-use tracing::warn;
 
 /// The proof-of-work primitives, as JavaScript.
 ///
@@ -167,14 +165,13 @@ fn js_string(value: &str) -> String {
         .replace("</", "<\\/")
 }
 
-const TEMPLATE_ENV: &str = "PINGWAF_CHALLENGE_TEMPLATE";
 const SCRIPTS_START: &str = "<!-- PINGWAF_SCRIPTS_START -->";
 const SCRIPTS_END: &str = "<!-- PINGWAF_SCRIPTS_END -->";
-const MAX_TEMPLATE_BYTES: usize = 1024 * 1024;
 
-/// DOM ids the compiled challenge script dereferences directly. A custom page
-/// must keep all of them; the challenge logic itself is never templated.
-const REQUIRED_IDS: [&str; 7] = [
+/// DOM ids the compiled challenge script dereferences directly. A custom
+/// template (rendered by the control plane's error-page editor) must keep all
+/// of them; the challenge logic itself is never templated.
+pub const REQUIRED_DOM_IDS: [&str; 7] = [
     "countdown",
     "title",
     "subtitle",
@@ -184,95 +181,6 @@ const REQUIRED_IDS: [&str; 7] = [
     "progressFill",
 ];
 
-/// Reads the optional presentation-only page template once. The compiled
-/// challenge script is injected into it; the template cannot replace the
-/// proof-of-work, verification, fingerprint or redirect logic.
-fn challenge_template() -> Option<&'static str> {
-    static TEMPLATE: OnceLock<Option<String>> = OnceLock::new();
-    TEMPLATE
-        .get_or_init(|| {
-            let path = std::env::var(TEMPLATE_ENV).ok()?;
-            let path = path.trim();
-            if path.is_empty() {
-                return None;
-            }
-            let metadata = match std::fs::metadata(path) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    warn!(
-                        target: "pingwaf::challenge",
-                        path,
-                        error = %err,
-                        "cannot read challenge template; using the built-in page"
-                    );
-                    return None;
-                },
-            };
-            if metadata.len() > MAX_TEMPLATE_BYTES as u64 {
-                warn!(
-                    target: "pingwaf::challenge",
-                    path,
-                    size = metadata.len(),
-                    limit = MAX_TEMPLATE_BYTES,
-                    "challenge template is too large; using the built-in page"
-                );
-                return None;
-            }
-            let content = match std::fs::read_to_string(path) {
-                Ok(content) => content,
-                Err(err) => {
-                    warn!(
-                        target: "pingwaf::challenge",
-                        path,
-                        error = %err,
-                        "cannot read challenge template; using the built-in page"
-                    );
-                    return None;
-                },
-            };
-            if let Err(reason) = validate_template(&content) {
-                warn!(
-                    target: "pingwaf::challenge",
-                    path,
-                    reason,
-                    "challenge template rejected; using the built-in page"
-                );
-                return None;
-            }
-            Some(content)
-        })
-        .as_deref()
-}
-
-fn validate_template(template: &str) -> Result<(), String> {
-    if template.len() > MAX_TEMPLATE_BYTES {
-        return Err("template is larger than 1 MiB".to_string());
-    }
-    let placeholders = template.matches("{{PINGWAF_SCRIPTS}}").count();
-    if placeholders != 1 {
-        return Err(format!(
-            "expected exactly one {{PINGWAF_SCRIPTS}} placeholder, found {placeholders}"
-        ));
-    }
-    if template.to_ascii_lowercase().contains("<script") {
-        return Err(
-            "the template must not contain <script>; challenge JavaScript is compiled in"
-                .to_string(),
-        );
-    }
-    for id in REQUIRED_IDS {
-        if !has_id(template, id) {
-            return Err(format!("missing required element id=\"{id}\""));
-        }
-    }
-    Ok(())
-}
-
-fn has_id(template: &str, id: &str) -> bool {
-    template.contains(&format!("id=\"{id}\""))
-        || template.contains(&format!("id='{id}'"))
-}
-
 fn extract_scripts(default_html: &str) -> Option<&str> {
     let start = default_html.find(SCRIPTS_START)? + SCRIPTS_START.len();
     let rest = &default_html[start..];
@@ -280,42 +188,15 @@ fn extract_scripts(default_html: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
-fn escape_html(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-fn apply_challenge_template(
-    default_html: String,
-    params: &ChallengePageParams,
-    template: Option<&str>,
-) -> String {
-    let Some(template) = template else {
-        return default_html;
-    };
-    let Some(scripts) = extract_scripts(&default_html) else {
-        warn!(
-            target: "pingwaf::challenge",
-            "built-in challenge page has no script markers; using it unchanged"
-        );
-        return default_html;
-    };
-    if let Err(reason) = validate_template(template) {
-        warn!(
-            target: "pingwaf::challenge",
-            reason,
-            "challenge template rejected; using the built-in page"
-        );
-        return default_html;
-    }
-    template
-        .replace("{{BRAND_NAME}}", &escape_html(&params.brand_name))
-        .replace("{{REQUEST_ID}}", &escape_html(&params.request_id))
-        .replace("{{PINGWAF_SCRIPTS}}", scripts)
+/// The compiled challenge script blocks, for injection into a custom page.
+///
+/// The custom page is presentation only: this exact block carries the
+/// fingerprint, proof-of-work, verification and redirect logic. It is
+/// generated from the built-in page so there is one source of truth.
+pub fn challenge_scripts(params: &ChallengePageParams) -> String {
+    extract_scripts(&generate_js_challenge_html(params))
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Generate the JS challenge HTML page (5-second shield).
@@ -584,7 +465,7 @@ h1{{font-size:20px;font-weight:600;margin-bottom:12px;color:var(--text)}}
 </body>
 </html>"##
     );
-    apply_challenge_template(default_html, params, challenge_template())
+    default_html
 }
 
 /// Generate the managed challenge HTML page.
@@ -697,108 +578,6 @@ mod tests {
         assert!(html.contains("computeProofOfWork"));
     }
 
-    fn custom_template_fixture() -> String {
-        r#"<!DOCTYPE html>
-<html><head><title>{{BRAND_NAME}}</title></head><body>
-<div id="countdown"></div>
-<h1 id="title"></h1>
-<p id="subtitle"></p>
-<div id="status"></div>
-<div id="spinnerWrap"></div>
-<div id="progressBar"><div id="progressFill"></div></div>
-<p>{{BRAND_NAME}} / {{REQUEST_ID}}</p>
-{{PINGWAF_SCRIPTS}}
-</body></html>"#
-            .to_string()
-    }
-
-    fn compiled_scripts_fixture() -> String {
-        format!(
-            "{SCRIPTS_START}<script>COMPILED</script>{SCRIPTS_END}<noscript></noscript>"
-        )
-    }
-
-    #[test]
-    fn custom_template_keeps_compiled_scripts_and_escapes_values() {
-        let params = ChallengePageParams {
-            brand_name: "A&B".to_string(),
-            request_id: "r\"1".to_string(),
-            ..Default::default()
-        };
-        let default_html = compiled_scripts_fixture();
-        let template = custom_template_fixture();
-        let out = apply_challenge_template(
-            default_html,
-            &params,
-            Some(template.as_str()),
-        );
-        assert!(out.contains("<script>COMPILED</script>"));
-        assert!(out.contains("A&amp;B"));
-        assert!(out.contains("r&quot;1"));
-        assert!(!out.contains("{{PINGWAF_SCRIPTS}}"));
-        assert!(!out.contains("{{BRAND_NAME}}"));
-    }
-
-    #[test]
-    fn duplicate_scripts_placeholder_is_rejected() {
-        let template = custom_template_fixture().replace(
-            "{{PINGWAF_SCRIPTS}}",
-            "{{PINGWAF_SCRIPTS}}{{PINGWAF_SCRIPTS}}",
-        );
-        assert!(validate_template(&template).is_err());
-    }
-
-    #[test]
-    fn template_without_scripts_placeholder_falls_back() {
-        let params = ChallengePageParams::default();
-        let default_html = compiled_scripts_fixture();
-        let template =
-            custom_template_fixture().replace("{{PINGWAF_SCRIPTS}}", "");
-        let out = apply_challenge_template(
-            default_html.clone(),
-            &params,
-            Some(template.as_str()),
-        );
-        assert_eq!(out, default_html);
-    }
-
-    #[test]
-    fn template_missing_a_required_id_falls_back() {
-        let params = ChallengePageParams::default();
-        let default_html = compiled_scripts_fixture();
-        let template = custom_template_fixture()
-            .replace("id=\"status\"", "id=\"not-status\"");
-        let out = apply_challenge_template(
-            default_html.clone(),
-            &params,
-            Some(template.as_str()),
-        );
-        assert_eq!(out, default_html);
-    }
-
-    #[test]
-    fn template_with_a_script_tag_is_rejected() {
-        let params = ChallengePageParams::default();
-        let default_html = compiled_scripts_fixture();
-        let template = custom_template_fixture().replace(
-            "{{PINGWAF_SCRIPTS}}",
-            "<script>alert(1)</script>{{PINGWAF_SCRIPTS}}",
-        );
-        let out = apply_challenge_template(
-            default_html.clone(),
-            &params,
-            Some(template.as_str()),
-        );
-        assert_eq!(out, default_html);
-    }
-
-    #[test]
-    fn template_ids_accept_single_quotes() {
-        let template = custom_template_fixture()
-            .replace("id=\"countdown\"", "id='countdown'");
-        assert!(validate_template(&template).is_ok());
-    }
-
     #[test]
     fn default_page_exposes_the_script_markers() {
         let html = generate_js_challenge_html(&ChallengePageParams::default());
@@ -809,10 +588,21 @@ mod tests {
     }
 
     #[test]
+    fn challenge_scripts_contains_the_compiled_proof_of_work() {
+        let scripts = challenge_scripts(&ChallengePageParams::default());
+        assert!(scripts.contains("<script>"));
+        assert!(scripts.contains("computeProofOfWork"));
+        assert!(scripts.contains("__pingwaf_fingerprint"));
+    }
+
+    #[test]
     fn default_page_has_every_required_id() {
         let html = generate_js_challenge_html(&ChallengePageParams::default());
-        for id in REQUIRED_IDS {
-            assert!(has_id(&html, id), "default page is missing id={id}");
+        for id in REQUIRED_DOM_IDS {
+            assert!(
+                html.contains(&format!("id=\"{id}\"")),
+                "default page is missing id={id}"
+            );
         }
     }
 
