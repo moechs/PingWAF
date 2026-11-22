@@ -1249,15 +1249,22 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
                 options={[
                   { value: 'site', label: t('pages.errorPages.scopeSite') },
                   { value: 'unmatched_host', label: t('pages.errorPages.scopeUnmatched') },
+                  { value: 'challenge', label: t('pages.errorPages.scopeChallenge') },
                 ]}
                 onChange={(e) => {
                   const nextScope = e.target.value as ErrorPageScope
                   setEditor((prev) => {
                     if (!prev) return prev
+                    const toChallenge =
+                      nextScope === 'challenge' && prev.scope !== 'challenge'
                     return {
                       ...prev,
                       scope: nextScope,
                       status_code: defaultStatusCodeForScope(nextScope, prev.status_code),
+                      content_type: toChallenge ? 'text/html' : prev.content_type,
+                      body_template: toChallenge
+                        ? defaultChallengePageTemplate()
+                        : prev.body_template,
                     }
                   })
                 }}
