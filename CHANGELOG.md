@@ -8,6 +8,18 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [PingWAF Unreleased]
+
+### Fixed
+
+- **Challenge verification now uses the per-site engine.** `handle_verify`
+  called the static plugin engine, so a site's `browser_integrity_check`,
+  clearance duration and TLS-fingerprint settings were ignored when the
+  browser submitted its solution. A site that disabled the integrity check
+  still rejected automated/headless browsers as `headlesschrome`. The verify
+  endpoint now resolves the same per-site engine that issued the challenge,
+  falling back to the static engine only when the site no longer resolves.
+
 ## [PingWAF 0.32.46] — 2026-11-22
 
 ### Changed

@@ -1008,7 +1008,15 @@ impl ChallengePlugin {
             site_id: pending.site_id.clone(),
         };
 
-        let result = self.engine.verify_solution_for_pending(
+        // Verify with the same per-site engine that issued the challenge.
+        // Using the static plugin engine here silently ignored site-level
+        // `browser_integrity_check`, clearance duration and TLS-fingerprint
+        // settings: a site that disabled the integrity check still rejected
+        // every headless/automated browser during verification.
+        let engine = self
+            .decision_engine(&pending.site_id)
+            .unwrap_or_else(|| Arc::clone(&self.engine));
+        let result = engine.verify_solution_for_pending(
             &submission,
             ctx.conn.tls_version.is_some(),
         );
