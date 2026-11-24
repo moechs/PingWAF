@@ -1249,9 +1249,12 @@ mod tests {
             .unwrap();
         File::create(&old_file_path).unwrap();
         let old_time = SystemTime::now() - Duration::from_secs(3600);
-        filetime::set_file_atime(
+        // `filetime::set_file_atime` is deprecated as of filetime 0.2.x in
+        // favour of the std API, and CI's `-D warnings` turns that into a hard
+        // error.
+        std::fs::set_times(
             &old_file_path,
-            filetime::FileTime::from_system_time(old_time),
+            std::fs::FileTimes::new().set_accessed(old_time),
         )
         .unwrap();
 
@@ -1474,11 +1477,10 @@ mod tests {
         cache.put("b", b"", obj(2)).await.unwrap();
         assert_eq!(2068, cache.current_size.load(Ordering::Relaxed));
         // `a` is the one nobody touched for an hour.
-        filetime::set_file_atime(
+        std::fs::set_times(
             cache.get_file_path("a", ""),
-            filetime::FileTime::from_system_time(
-                SystemTime::now() - Duration::from_secs(3600),
-            ),
+            std::fs::FileTimes::new()
+                .set_accessed(SystemTime::now() - Duration::from_secs(3600)),
         )
         .unwrap();
 
