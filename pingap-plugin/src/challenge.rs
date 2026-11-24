@@ -1735,7 +1735,7 @@ impl Plugin for ChallengePlugin {
         // a JS clearance cannot stand in for an interactive one.
         if let Some(cookie) =
             get_cookie_value(session.req_header(), &self.cookie_name)
-            && let Some(payload) = self.engine.validate_clearance(cookie)
+            && let Some(payload) = self.engine.validate_clearance(&cookie)
             && payload.site_id == host
             && engine.clearance_level_sufficient(&payload)
         {
