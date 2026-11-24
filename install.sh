@@ -18,7 +18,9 @@
 #   --admin-email     Seed administrator e-mail (server / all-in-one)
 #   --admin-password  Seed administrator password (omit to generate a random one)
 #   --tls-sans        Comma separated names of the dashboard certificate
-#   --listen-public   Bind the admin API and gRPC on 0.0.0.0 instead of 127.0.0.1
+#   --listen-public   Also bind the agent gRPC endpoint on 0.0.0.0 (the admin
+#                     API already listens on every interface; gRPC defaults to
+#                     127.0.0.1 and only remote agents need it opened)
 #   --no-systemd      Skip systemd service creation
 #   --interactive     Prompt even when the flags would normally skip the questions
 #   --non-interactive Run with the given values and defaults, never prompt
@@ -254,10 +256,11 @@ Options:
                            PINGWAF_ADMIN_PASSWORD) a random password is
                            generated and printed exactly once at the end.
   --tls-sans NAMES         Comma separated dashboard certificate names
-  --listen-public          Bind the dashboard/REST API (9080) and the agent
-                           gRPC endpoint (9090) on 0.0.0.0. The default is
-                           127.0.0.1: expose them only through a reverse proxy
-                           or after changing the administrator password.
+  --listen-public          Also bind the agent gRPC endpoint (9090) on
+                           0.0.0.0. The dashboard/REST API (9080) already
+                           listens on every interface; gRPC stays on
+                           127.0.0.1 unless this is given, and only remote
+                           agents need it.
   --no-systemd             Skip systemd service file creation
   --interactive            Ask the questions even when options were given
   --non-interactive, --yes Never prompt; use the given values and defaults
@@ -663,9 +666,9 @@ print_plan_summary() {
         echo "  database:    $(mask_db_url "${DB_URL:-postgres://pingwaf:pingwaf@localhost:5432/pingwaf}")"
         echo "  admin:       ${ADMIN_EMAIL:-admin@pingwaf.local} (password: ${password_state})"
         if [[ "$LISTEN_PUBLIC" == "true" ]]; then
-            echo "  listen:      0.0.0.0:9080 (admin) / 0.0.0.0:9090 (gRPC) — change the admin password before exposing"
+            echo "  listen:      0.0.0.0:9080 (admin) / 0.0.0.0:9090 (gRPC) — restrict 9080 to the admin network"
         else
-            echo "  listen:      127.0.0.1:9080 (admin) / 127.0.0.1:9090 (gRPC) — loopback only"
+            echo "  listen:      0.0.0.0:9080 (admin) / 127.0.0.1:9090 (gRPC) — gRPC loopback until --listen-public"
         fi
         echo "  tls sans:    ${TLS_SANS:-none (the generated certificate covers the hostname used to reach it)}"
     fi
@@ -1163,13 +1166,18 @@ write_config() {
         fi
     fi
 
-    # Loopback by default: a fresh install still has the seeded administrator
-    # account, so the API/gRPC must not be reachable from the network until the
-    # password has been changed (or the operator opts into --listen-public /
-    # puts the console behind a reverse proxy).
-    local admin_addr="127.0.0.1:9080" grpc_addr="127.0.0.1:9090"
+    # The console listens on every interface. A loopback bind made a fresh
+    # install look unreachable from the operator's browser — nothing answered on
+    # the host's address, so the install itself appeared to have failed. The
+    # exposure is acceptable because the installer generates a random
+    # administrator password and a fresh database answers every write with 403
+    # `password_change_required` until it is changed; restricting 9080 to the
+    # admin network (or fronting it with a reverse proxy) is still recommended.
+    #
+    # gRPC stays on loopback: only remote agents need it, and they are the
+    # deployment that can actually firewall it (`--listen-public` opens it).
+    local admin_addr="0.0.0.0:9080" grpc_addr="127.0.0.1:9090"
     if [[ "$LISTEN_PUBLIC" == "true" ]]; then
-        admin_addr="0.0.0.0:9080"
         grpc_addr="0.0.0.0:9090"
     fi
 
@@ -1201,8 +1209,10 @@ write_config() {
 
 [server]
 db_url = "$(toml_string "$DB_URL")"
-# Admin API + gRPC listen on loopback unless --listen-public was given; agents
-# on other hosts and remote dashboards need an explicit choice (or a proxy).
+# The console listens on every interface so a fresh install is reachable from
+# the operator's browser; restrict 9080 to your admin network or put it behind
+# a reverse proxy. gRPC (agent connections) stays on loopback unless
+# --listen-public was given, which only remote agents need.
 admin_addr = "${admin_addr}"
 grpc_addr = "${grpc_addr}"
 # gRPC control plane TLS: "tls" (default) serves agents over TLS, reusing the
@@ -1633,12 +1643,14 @@ print_firewall_hints() {
     info "Firewall ports:"
     echo "    80/tcp   — HTTP traffic (proxied sites)"
     echo "    443/tcp  — HTTPS traffic (proxied sites)"
-    echo "    9080/tcp — Admin dashboard & REST API (HTTPS) — management network only"
-    echo "    9090/tcp — gRPC control plane (agent connections) — only if agents are remote"
+    echo "    9080/tcp — Admin dashboard & REST API (HTTPS) — open by default; restrict it to the admin network"
+    echo "    9090/tcp — gRPC control plane (agent connections) — loopback unless --listen-public"
     echo ""
-    echo "  Do NOT expose 9080/9090 before the administrator password has been"
-    echo "  changed. The generated config binds both to 127.0.0.1 by default;"
-    echo "  reinstall with --listen-public only when a proxy/remote agents need it."
+    echo "  The console binds 0.0.0.0 so a fresh install is reachable. Its"
+    echo "  administrator password is generated at install time and a fresh"
+    echo "  database refuses every write until it is changed — but restrict 9080"
+    echo "  to your admin network (or front it with a reverse proxy), and change"
+    echo "  the password at the first sign-in."
     echo ""
     if has ufw; then
         echo "  With UFW (business ports):"
@@ -1685,11 +1697,14 @@ else
     echo "  Quick start:"
     echo "    ${BINARY_NAME} ${MODE} --db-url \"${DB_URL}\""
     echo ""
-    echo "  Dashboard: https://localhost:9080  (self-signed certificate)"
+    echo "  Dashboard: https://<this-host>:9080  (self-signed certificate)"
+    echo "  Listen:    admin 0.0.0.0:9080 — restrict it to your admin network"
     if [[ "$LISTEN_PUBLIC" == "true" ]]; then
-        echo "  ${YELLOW}⚠ Admin/gRPC listen on 0.0.0.0 — change the password and restrict 9080/9090 to an admin network before exposing them.${NO_COLOR}"
+        echo "             gRPC 0.0.0.0:9090 (remote agents enabled)"
+        echo "  ${YELLOW}⚠ Both ports are open: change the administrator password and firewall 9080/9090 to the admin and agent networks.${NO_COLOR}"
     else
-        echo "  Listen:    127.0.0.1 only (admin 9080 / gRPC 9090); use --listen-public for remote agents or a dashboard proxy"
+        echo "             gRPC 127.0.0.1:9090 — add --listen-public for remote agents"
+        echo "  ${YELLOW}⚠ The console is reachable from the network: change the administrator password at the first sign-in and firewall 9080 to your admin network.${NO_COLOR}"
     fi
     if [[ "$CONFIG_PRESENT" == "true" ]]; then
         echo "  Administrator: unchanged — ${CONFIG_DIR}/pingwaf.toml was left as it was."

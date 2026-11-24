@@ -14,9 +14,10 @@
 # PostgreSQL connection string
 db_url = "postgres://pingwaf:pingwaf@localhost:5432/pingwaf"
 # REST API + dashboard listen address (served over HTTPS when tls_enabled).
-# Loopback by default; use 0.0.0.0 only behind a reverse proxy or when remote
-# agents/dashboard access is intended, and change the admin password first.
-admin_addr = "127.0.0.1:9080"
+# Every interface by default so the console is reachable right after install;
+# restrict it with a firewall or a reverse proxy, and change the admin password
+# at the first sign-in.
+admin_addr = "0.0.0.0:9080"
 # Serve the REST API and dashboard over TLS (required by passkeys).
 # A self-signed certificate is generated on first boot; replace it from
 # Settings → Control plane HTTPS once a real certificate is available.

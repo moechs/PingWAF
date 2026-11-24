@@ -114,6 +114,19 @@ verbatim for reference and attribution, and is not maintained here.
 
 ### Changed
 
+- **The console listens on `0.0.0.0` by default.** The installer and the compose
+  file bound the dashboard to `127.0.0.1`, so a fresh install answered nothing on
+  the host's own address: opening `https://<host>:9080` from any other machine
+  failed and the installation looked broken before the first login was even
+  possible. `admin_addr` is now written as `0.0.0.0:9080` (the built-in default
+  all along), compose publishes `PINGWAF_ADMIN_BIND=0.0.0.0` and the shipped
+  `pingwaf.toml` matches. The exposure stays bounded by what the installer
+  already does — the administrator password is generated per install and a fresh
+  database answers every write with `403 password_change_required` until it is
+  changed. gRPC (9090) is unchanged (`127.0.0.1` until `--listen-public`, which
+  now governs only gRPC). Restrict 9080 with a firewall,
+  `PINGWAF_ADMIN_BIND=<admin-ip>` or a reverse proxy; deployments that already
+  front it with a proxy keep working untouched.
 - **Reworked traffic dashboard (traffic + site-detail traffic pages).** The
   oversized world map is replaced by an interactive 3D globe (d3-geo
   orthographic projection over the bundled world-atlas topology, rendered as
