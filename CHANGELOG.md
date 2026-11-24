@@ -10,6 +10,8 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+## [PingWAF 0.32.49] — 2026-11-25
+
 ### Added
 
 - **Adaptive proof-of-work difficulty.** A challenge's difficulty now starts at
@@ -68,6 +70,38 @@ verbatim for reference and attribution, and is not maintained here.
 
 ### Fixed
 
+- **The JS challenge no longer loops on HTTP/2 when the browser splits its
+  cookies.** HTTP/2 lets a client send its cookie jar as several `Cookie`
+  header fields (RFC 9113 §8.2.3) and Chromium does exactly that once the jar
+  grows, so a request arrives as `cookie: app_id=…`, `cookie: session_id=…`,
+  `cookie: __pingwaf_clearance=…`. Every clearance read took only the first
+  field: the visitor solved the challenge, was issued a fresh signed cookie,
+  and was challenged again on the next request — an endless loop that stopped
+  the moment HTTP/2 was disabled in the browser (issue #108, reproducible with
+  Under Attack Mode and with WAF rules whose action is Challenge).
+  `get_cookie_value()` now parses every `Cookie` field in wire order, joined
+  with the `"; "` separator RFC 9113 requires a recipient to assume, and the
+  WAF plugin's cookie map and clearance extractor do the same. Fixed at the
+  shared accessor because the single-field read also hid cookies from OIDC
+  sessions, the JWT-in-cookie mode, CSRF double-submit, visitor auth, sticky
+  sessions, hash-by-cookie, `match_cookies` location conditions and access-log
+  cookie tags.
+- **A site's "self-signed" mode now actually issues a certificate.** The flag
+  was stored and pushed to the edge but never consumed: a site that enabled
+  HTTPS with `self_signed: true` (the console's default for a new site) pushed
+  a TLS listener with no certificate, so every handshake on 443 failed with
+  `tls_choose_sigalg: no suitable signature algorithm` while the console
+  promised automatic issuance. The control plane now issues a leaf covering the
+  site's domain and `alternate_domains` into `site_ssl.cert_pem/key_pem`
+  (issuer `PingWAF Self-Signed`), renews it before expiry, and issues one for
+  the clone of a self-signed site. A backfill migration flags existing sites
+  that had HTTPS on with no certificate source at all, and the startup
+  reconcile issues their leaves, so an upgraded deployment stops failing every
+  handshake without operator action. Enabling HTTPS with no source at all is
+  now rejected with `400` instead of silently pushing a listener that cannot
+  complete one; an uploaded pair, a selected certificate or an ACME order turns
+  self-signed mode off, and a delivered ACME certificate takes the site over
+  from the generated leaf.
 - **The ASN ranking's `limit` now counts only real networks.** The endpoint
   filtered AS0 and out-of-range values in Rust *after* the SQL `LIMIT`, so a
   window dominated by such rows (written by an older writer or a manual
