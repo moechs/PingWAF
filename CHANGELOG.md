@@ -10,6 +10,17 @@ verbatim for reference and attribution, and is not maintained here.
 
 ## [Unreleased]
 
+## [PingWAF 0.32.52] — 2026-11-25
+
+### Fixed
+
+- **The cache tests' access-time helper stays inside the MSRV.** 0.32.51's CI
+  was red on the Rust 1.96 job that enforces `rust-version = "1.96"`:
+  `std::fs::set_times` is still behind `feature(fs_set_times)` there even
+  though it is accepted by newer toolchains. The helper now uses
+  `File::set_times` with `FileTimes::set_accessed` (stable since 1.75). Shipped
+  binaries were never affected — the code is `#[cfg(test)]`.
+
 ## [PingWAF 0.32.51] — 2026-11-25
 
 ### Security
