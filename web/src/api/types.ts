@@ -1016,6 +1016,10 @@ export interface TimeBucket {
   client_errors: number
   server_errors: number
   avg_latency_ms: number
+  /** Total-latency percentiles for the bucket (`PERCENTILE_CONT` server-side). */
+  p50_latency_ms: number
+  p90_latency_ms: number
+  p99_latency_ms: number
   blocked: number
 }
 
@@ -1052,6 +1056,17 @@ export interface TopIp {
   blocked: number
   /** Site the IP most recently requested; the target for quick actions. */
   top_site_id?: string | null
+  /**
+   * Network the address belongs to, when the edge resolved one. `null` for
+   * private addresses, agents without GeoIP ASN data and rows written before
+   * the column existed — render `—`, never a guess.
+   */
+  asn?: number | null
+  /**
+   * Organization behind `asn` from the control plane's ASN table; the
+   * `Unknown (AS<n>)` fallback is localised by `isUnknownAsnName`.
+   */
+  asn_name?: string | null
 }
 
 /**
@@ -2498,6 +2513,8 @@ export const BASIC_AUTH_MAX_DELAY_SECONDS = 10
 export interface GeoCountryStat {
   country_code: string
   requests: number
+  /** Requests the WAF refused (403/429) in the same window. */
+  blocked?: number
 }
 
 /* ── Traffic analytics (site-scoped) ──────────────────────────────── */
