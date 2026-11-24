@@ -19,7 +19,7 @@
 ### Dashboard Overview
 
 The dashboard provides:
-- **Analytics**: Request trends, per-site traffic over time, top rules triggered, status codes, client-type mix (desktop / mobile / AI bots / other)
+- **Analytics**: Request trends with outbound bandwidth on one shared time axis, per-site traffic over time, geographic distribution (an interactive globe plus a country ranking that drills into the access logs), the top networks by ASN (name, `ASxxxxx`, requests and share of the window), top rules triggered, status codes, client-type mix (desktop / mobile / AI bots / other)
 - **Sites**: Manage protected websites
 - **Agents**: Monitor connected data-plane agents
 - **Logs**: Security events and access logs
@@ -441,9 +441,75 @@ Dimension-based rate limit rules live on the separate Rate Limiting page; this t
 | Mode | `off`, `passive`, `active` |
 | Type | `js_challenge`, `captcha`, `managed` |
 | Expiry | How long a passed challenge remains valid |
+| Base difficulty | Proof-of-work leading zero bits a normal visitor solves (default 20) |
+| Max difficulty | Ceiling the difficulty rises to under pressure (default 24) |
+| Challenge limit / min | Challenge pages issued per IP per minute (default 120) |
+| Verify limit / min | Solution submissions accepted per IP per minute (default 300) |
 
 - **Passive**: Challenge only when suspicious behavior is detected
 - **Active**: Challenge all requests matching configured criteria
+
+#### Adaptive difficulty
+
+Every challenge is issued with its own difficulty, stored server-side and
+checked on submission — the client never supplies it and a settings change does
+not invalidate pages already in flight. The difficulty starts at the base and
+rises per host+IP when that client keeps failing verification (one step per
+failure, forgotten after a quiet minute) or sends more requests than the rate
+threshold (one step per threshold-worth above it). It stops at the max, and a
+successful verification drops it back to the base.
+
+Set **Max difficulty** equal to **Base difficulty** to pin the work at a fixed
+value. Both must be 4–28; max may not be below base.
+
+#### Per-IP challenge limits
+
+Both limits are per host+IP over a 60-second window, and both apply to every
+challenge the site can mint — the CC gate and a WAF rule / IP-geo rule / bot /
+rate-limit challenge alike, which all use the site's difficulty and the same
+budget. Above the issuance limit the visitor gets a `429` rate-limit page
+instead of a challenge page (it carries `x-pingwaf-mitigated: block`), so the
+challenge endpoint cannot be used as an amplifier. Above the verification limit
+the submission is refused with `429` before any work is done, and the pending
+challenge is left intact — a legitimate visitor can still complete it once the
+window rolls over. Both refusals appear in the access log.
+
+The bounded counter table holds 8192 host+IP keys per window. When it is full of
+*other* clients, issuance keeps working (the page is minted without a budget
+entry) so an attacker cannot lock every new visitor out, while verification
+fails closed so a full table never becomes an unmetered guessing channel. Raise
+the limits for sites whose visitors share one NAT address; the counters are per
+edge process, so N instances allow N × the configured value.
+
+### Challenge page template
+
+The challenge page is customized from the same global template editor as the
+error pages: **Settings → Custom Pages → Challenge page** (`scope =
+challenge`, fixed status 503). It is a **separate scope**: editing it does not
+change the site or unmatched-host 503 error pages, and those pages cannot
+replace a challenge response. One template applies to every site, matching the
+existing global error-page model. The template is presentation only: the
+fingerprinting, proof-of-work, verification and redirect JavaScript is compiled
+into the binary and injected at `{{ challenge_scripts | safe }}`; the template
+cannot replace it.
+
+The template must:
+
+- inject the compiled scripts with `{{ challenge_scripts | safe }}` (without
+  `| safe`, Tera HTML-escapes them and the page is rejected);
+- contain the elements `countdown`, `title`, `subtitle`, `status`,
+  `spinnerWrap`, `progressBar` and `progressFill` (the compiled script looks
+  them up by id; single- or double-quoted `id` works);
+- not contain its own `<script>` tags (only the compiled scripts may run).
+
+Available variables: `challenge_scripts`, `brand_name`, `request_id`,
+`difficulty`, `verify_endpoint`, `original_url`. `brand_name` and `request_id`
+are HTML-escaped by Tera.
+
+A template that fails to render, omits the `| safe` filter, loses a required
+DOM id or contains `<script>` falls back to the built-in page with a warning.
+The challenge page applies to the JS, managed and interactive challenge types
+because they share the same renderer.
 
 ## Cache Configuration
 
@@ -642,6 +708,13 @@ Sites → [site] → SSL Settings
   [Sharing certificates between sites](#sharing-certificates-between-sites).
   Choosing a certificate the site neither owns nor has linked fails with
   `does not belong to this site and is not linked to it`.
+- Self-signed certificate — PingWAF issues and renews a leaf covering the
+  site's domain and alternate hostnames, and browsers warn because it is not
+  publicly trusted. New sites start in this mode; uploading a certificate,
+  selecting one, or configuring ACME replaces it automatically. Enabling HTTPS
+  with no certificate source at all is refused (`HTTPS is enabled but the site
+  has no certificate`) rather than serving a listener that cannot complete a
+  handshake.
 - Minimum TLS version (1.2 or 1.3)
 - Force HTTPS redirect
 - HSTS configuration
@@ -793,29 +866,40 @@ removed, the response switched to chunked, strong `ETag` weakened to `W/`,
 Multi-value encodings (e.g. `gzip, br`) are still passed through untouched,
 no replacement.
 
-## Custom Error Pages
+## Custom Pages
 
 ```
-Sites → [site] → Error Pages → Add
+Settings → Custom Pages
 ```
+
+The same global editor holds the error-response templates and the challenge
+page. Each page carries a **scope**:
+
+| Scope | Use |
+|-------|-----|
+| `site` | Error responses of matched sites (403, 429, 502, 503, 504, …) |
+| `unmatched_host` | Requests whose `Host` matches no configured site |
+| `challenge` | The JS / managed / interactive challenge page (fixed 503) |
 
 | Field | Description |
 |-------|-------------|
-| Status code | HTTP status to customize (e.g., 403, 429, 502) |
-| Content type | `html`, `json`, or `text` |
-| Body | Custom response content |
+| Status code | HTTP status to customize (challenge is fixed at 503) |
+| Content type | `html`, `json`, or `text` (challenge is always `text/html`) |
+| Body | Tera template rendered by the edge |
 
-### Unmatched Host error pages
+The API and database keep the historical `error-pages` / `error_pages` names
+for compatibility; the console calls the feature **Custom Pages**.
+
+### Unmatched Host pages
 
 ```
-Settings → Error pages → Unmatched Host (unmatched_host)
+Settings → Custom Pages → Unmatched Host (unmatched_host)
 ```
 
-Error pages carry a **scope**. `site` (the default) pages replace error
-responses of sites that matched; `unmatched_host` pages answer requests that
-reached the gateway but whose `Host` header matched **no** configured site —
-someone poking at the bare IP + port, or a hostname that was never configured
-(or has since been removed).
+`site` (the default) pages replace error responses of sites that matched;
+`unmatched_host` pages answer requests that reached the gateway but whose
+`Host` header matched **no** configured site — someone poking at the bare IP +
+port, or a hostname that was never configured (or has since been removed).
 
 When to use one: to give scanners, stale DNS entries and direct-IP probes a
 branded answer instead of the gateway's plain default 404.
@@ -832,6 +916,17 @@ branded answer instead of the gateway's plain default 404.
 - **Matched sites are never affected**: the fallback location sits below
   every site's own locations, so a request for a configured hostname resolves
   to that site as usual.
+
+### Challenge page
+
+```
+Settings → Custom Pages → Challenge page (challenge)
+```
+
+Presentation-only template for the JS / managed / interactive challenge page.
+The compiled challenge scripts are injected at
+`{{ challenge_scripts | safe }}`; the required DOM ids and the no-`<script>`
+rule are described under [Challenges](#challenges-cc-protection).
 
 ## Log Management
 
@@ -1008,6 +1103,24 @@ key. An explicitly configured secret always wins.
    pingwaf agent --server-url https://control-plane:9090 --server-ca-cert /var/lib/pingwaf/data/grpc-ca.pem --api-key YOUR_KEY
    ```
 3. The agent appears automatically in **Agents**
+
+### Assigning sites to an agent
+
+By default an agent receives every site owned by its API key — the legacy
+behaviour, and the highest-memory mode. On a multi-site fleet, narrow it:
+
+```
+Agents → [agent] → Manage sites
+```
+
+- **All sites** — the default; the agent carries every site its key owner has.
+- **Selected sites** — only the checked sites are pushed. The rule bundle,
+  certificate set and per-site caches then scale with the selection instead of
+  the whole account; an empty selection leaves the agent idle until assigned.
+
+The assignment is validated against the API key's owner and takes effect
+immediately for a connected agent; an offline node receives it on reconnect.
+The same setting is available as `PUT /api/v1/agents/{id}/sites`.
 
 ### Monitoring Agents
 

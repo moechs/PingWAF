@@ -39,6 +39,11 @@ gRPC stream (TLS with the control-plane CA by default). Disconnected behaviour
 is explicit: fail-open (keep serving the last bundle) or fail-closed (refuse
 hosts without a synced bundle), configurable per site and globally.
 
+The data plane also ships as its own binary, `pingwaf-agent`
+(`src/edge_main.rs`, `--features edge`): the same agent and proxy with the
+control-plane modules and the dashboard-embedding admin plugin compiled out.
+`install.sh --mode agent` installs it; it never links `pingwaf-server`.
+
 ### PostgreSQL
 
 The database is a **secret store**: site TLS private keys, HTTP basic-auth

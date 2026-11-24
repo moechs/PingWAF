@@ -35,7 +35,7 @@ use crate::api::error::ApiError;
 use crate::api::state::AppState;
 use crate::auth::AdminUser;
 use crate::grpc::registry::{AgentRegistry, HeartbeatMetrics};
-use crate::models::{agent, api_key, control_plane_boot, site};
+use crate::models::{agent, agent_sites, api_key, control_plane_boot, site};
 
 /// `GET /api/v1/system/metrics` — process/host CPU and memory snapshots.
 #[derive(Debug, Serialize)]
@@ -721,9 +721,28 @@ async fn agent_site_counts(
         })
         .collect();
 
+    let selected_ids: Vec<Uuid> = rows
+        .iter()
+        .filter(|row| row.site_scope == "selected")
+        .map(|row| row.id)
+        .collect();
+    let per_agent: HashMap<Uuid, u64> = if selected_ids.is_empty() {
+        HashMap::new()
+    } else {
+        let mut counts: HashMap<Uuid, u64> = HashMap::new();
+        for assignment in agent_sites::Entity::find()
+            .filter(agent_sites::Column::AgentId.is_in(selected_ids))
+            .all(db)
+            .await?
+        {
+            *counts.entry(assignment.agent_id).or_default() += 1;
+        }
+        counts
+    };
+
     let key_ids: Vec<Uuid> = rows
         .iter()
-        .filter(|row| row.site_id.is_none())
+        .filter(|row| row.site_scope != "selected" && row.site_id.is_none())
         .filter_map(|row| row.api_key_id)
         .collect();
     let owner_of_key: HashMap<Uuid, Uuid> = if key_ids.is_empty() {
@@ -744,15 +763,19 @@ async fn agent_site_counts(
     Ok(rows
         .iter()
         .map(|row| {
-            let count = match row.site_id {
-                Some(_) => 1,
-                // An unbound agent whose key is gone owns nothing: the row is
-                // still listed, its site count is honestly zero.
-                None => row
-                    .api_key_id
-                    .and_then(|key_id| owner_of_key.get(&key_id).copied())
-                    .and_then(|owner| per_owner.get(&owner).copied())
-                    .unwrap_or(0),
+            let count = if row.site_scope == "selected" {
+                per_agent.get(&row.id).copied().unwrap_or(0)
+            } else {
+                match row.site_id {
+                    Some(_) => 1,
+                    // An unbound agent whose key is gone owns nothing: the row
+                    // is still listed, its site count is honestly zero.
+                    None => row
+                        .api_key_id
+                        .and_then(|key_id| owner_of_key.get(&key_id).copied())
+                        .and_then(|owner| per_owner.get(&owner).copied())
+                        .unwrap_or(0),
+                }
             };
             (row.id, count)
         })
@@ -878,6 +901,7 @@ mod tests {
         agent::Model {
             id: Uuid::new_v4(),
             site_id: None,
+            site_scope: "all".to_string(),
             hostname: hostname.to_string(),
             display_name: None,
             ip_address: "10.0.0.5".to_string(),

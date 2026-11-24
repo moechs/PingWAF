@@ -864,6 +864,19 @@ message ChallengeConfig {
   uint32 request_threshold = 10;         // Requests per minute to trigger
   bool browser_integrity_check = 11;
   bool tls_fingerprint_check = 12;
+
+  // Adaptive proof-of-work difficulty. `base_difficulty` is the work a normal
+  // visitor does; the edge raises it (up to `max_difficulty`) for a host+IP
+  // under request or verification-failure pressure. Zero means "unset": an
+  // agent talking to an older control plane falls back to 20 / 24, which is
+  // the difficulty every deployment ran with before it was configurable.
+  uint32 base_difficulty = 13;
+  uint32 max_difficulty = 14;
+
+  // Per host+IP limits in a 60-second window, for challenge issuance and for
+  // solution verification. Zero means "unset" (agent falls back to 120 / 300).
+  uint32 issue_limit_per_minute = 15;
+  uint32 verify_limit_per_minute = 16;
 }
 
 enum ChallengeLevel {

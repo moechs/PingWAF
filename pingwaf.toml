@@ -13,7 +13,10 @@
 [server]
 # PostgreSQL connection string
 db_url = "postgres://pingwaf:pingwaf@localhost:5432/pingwaf"
-# REST API + dashboard listen address (served over HTTPS when tls_enabled)
+# REST API + dashboard listen address (served over HTTPS when tls_enabled).
+# Every interface by default so the console is reachable right after install;
+# restrict it with a firewall or a reverse proxy, and change the admin password
+# at the first sign-in.
 admin_addr = "0.0.0.0:9080"
 # Serve the REST API and dashboard over TLS (required by passkeys).
 # A self-signed certificate is generated on first boot; replace it from
@@ -25,8 +28,9 @@ tls_enabled = true
 # Host the dashboard is reached under from the outside (optionally with port).
 # Pinned into the HTTP-to-HTTPS redirect instead of the client's Host header.
 # public_host = "waf.example.com"
-# gRPC control plane listen address (agents connect here)
-grpc_addr = "0.0.0.0:9090"
+# gRPC control plane listen address (agents connect here). Loopback by default;
+# set 0.0.0.0 for remote agents (keep gRPC TLS on).
+grpc_addr = "127.0.0.1:9090"
 # TLS for the gRPC control plane: "tls" (default) serves agents over TLS,
 # reusing the dashboard certificate — self-signed on first boot unless the
 # optional grpc_tls_cert/key below are configured. "off" serves plaintext
@@ -38,7 +42,9 @@ grpc_addr = "0.0.0.0:9090"
 # grpc_tls_key = "/etc/pingwaf/certs/grpc-key.pem"
 # JWT signing secret (must be >= 16 characters, change in production!)
 jwt_secret = "change-me-in-production"
-# Default admin account seeded on first boot
+# Default admin account seeded on first boot. Change the password before the
+# first start (or set PINGWAF_ADMIN_PASSWORD); the seed only applies when the
+# users table is empty, and a fresh database rejects writes until it is changed.
 admin_email = "admin@pingwaf.local"
 admin_password = "pingwaf123"
 # Serve the embedded dashboard (SPA) from this process
@@ -61,7 +67,11 @@ serve_frontend = true
 # server_ca_cert = "/etc/pingwaf/certs/grpc-ca.pem"
 # API key for agent authentication (generated on first registration)
 api_key = ""
-# Local rule cache directory (persisted across restarts)
+# Local rule cache directory (persisted across restarts). Relative paths are
+# resolved against the process working directory; the shipped systemd unit sets
+# WorkingDirectory=/var/lib/pingwaf, so this lands in
+# /var/lib/pingwaf/data/cache. Use an absolute path when running without the
+# unit (the installer writes /var/lib/pingwaf/cache).
 cache_dir = "./data/cache"
 # Heartbeat interval in seconds — fallback only: the control plane hands
 # agents its own interval at registration and that value takes precedence

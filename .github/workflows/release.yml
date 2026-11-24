@@ -7,9 +7,15 @@ name: Release
 # It produces the tarballs install.sh downloads, named EXACTLY:
 #   pingwaf-linux-amd64.tar.xz  pingwaf-linux-amd64.tar.gz
 #   pingwaf-linux-arm64.tar.xz  pingwaf-linux-arm64.tar.gz
+#   pingwaf-agent-linux-amd64.tar.xz  pingwaf-agent-linux-amd64.tar.gz
+#   pingwaf-agent-linux-arm64.tar.xz  pingwaf-agent-linux-arm64.tar.gz
+# The `pingwaf-agent` archives carry the agent-only build (`--bin
+# pingwaf-agent --features tracing,edge`): the data plane without PostgreSQL,
+# the REST API or the embedded dashboard. `install.sh --mode agent` prefers
+# that asset and falls back to `pingwaf-...` for releases that predate it.
 # install.sh prefers the .tar.xz asset (smaller) and falls back to the legacy
 # .tar.gz when xz(1) is missing locally or the download 404s, resolving
-# `pingwaf-${OS}-${ARCH}.tar.{xz,gz}` from
+# `<prefix>-${OS}-${ARCH}.tar.{xz,gz}` from
 #   https://github.com/shuaiZend/PingWAF/releases/download/v${VERSION}/<asset>
 # so these names must not drift. Each tarball ships a matching `.sha256`.
 #
@@ -284,6 +290,40 @@ jobs:
           ls -lh "$ASSET.tar.xz" "$ASSET.tar.gz" \
                  "$ASSET.tar.xz.sha256" "$ASSET.tar.gz.sha256"
 
+      # The agent-only build: the same data plane with the control plane
+      # compiled out (`edge`). Its own archive is what `install.sh --mode agent`
+      # downloads; keeping it in this job means both binaries share the cargo
+      # cache (the `edge` feature changes no dependency).
+      - name: Build and package pingwaf-agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin pingwaf-agent ${{ matrix.features }},edge --target ${{ matrix.target }}
+          ls -lh "target/${{ matrix.target }}/release/pingwaf-agent"
+
+          ASSET="pingwaf-agent-${{ matrix.plat }}-${{ matrix.arch }}"
+          rm -rf "$ASSET" "$ASSET.tar.xz" "$ASSET.tar.gz" \
+                 "$ASSET.tar.xz.sha256" "$ASSET.tar.gz.sha256"
+          mkdir -p "$ASSET"
+          cp "target/${{ matrix.target }}/release/pingwaf-agent" "$ASSET/pingwaf-agent"
+          cp LICENSE README.md "$ASSET/"
+          cp pingwaf.toml "$ASSET/" 2>/dev/null || true
+          # Deliberately no pingwaf.service: that unit runs `pingwaf
+          # all-in-one`. install.sh writes the agent's own unit; shipping the
+          # all-in-one one here would be a trap for a manual install.
+          chmod +x "$ASSET/pingwaf-agent"
+          tar -cJf "$ASSET.tar.xz" "$ASSET"
+          tar -czf "$ASSET.tar.gz" "$ASSET"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET.tar.xz" > "$ASSET.tar.xz.sha256"
+            sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256"
+          else
+            shasum -a 256 "$ASSET.tar.xz" > "$ASSET.tar.xz.sha256"
+            shasum -a 256 "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256"
+          fi
+          ls -lh "$ASSET.tar.xz" "$ASSET.tar.gz" \
+                 "$ASSET.tar.xz.sha256" "$ASSET.tar.gz.sha256"
+
       # SBOM for the source tree that produced the archive. `dir:` (not the
       # tarball) is deliberate: syft's `dir:` source cannot scan a single file,
       # and scanning the repository's Cargo.lock gives a dependency inventory
@@ -297,7 +337,8 @@ jobs:
             --exclude './target/**' \
             -o "spdx-json=pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.spdx.json"
 
-      # Signed SLSA provenance for both archives: consumers can verify with
+      # Signed SLSA provenance for all four archives (full + agent, xz + gz):
+      # consumers can verify with
       # `gh attestation verify pingwaf-linux-amd64.tar.gz --repo <repo>`.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
@@ -305,6 +346,8 @@ jobs:
           subject-path: |
             pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.tar.xz
             pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.tar.gz
+            pingwaf-agent-${{ matrix.plat }}-${{ matrix.arch }}.tar.xz
+            pingwaf-agent-${{ matrix.plat }}-${{ matrix.arch }}.tar.gz
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
@@ -326,6 +369,10 @@ jobs:
             pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.tar.xz.sha256
             pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.tar.gz
             pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.tar.gz.sha256
+            pingwaf-agent-${{ matrix.plat }}-${{ matrix.arch }}.tar.xz
+            pingwaf-agent-${{ matrix.plat }}-${{ matrix.arch }}.tar.xz.sha256
+            pingwaf-agent-${{ matrix.plat }}-${{ matrix.arch }}.tar.gz
+            pingwaf-agent-${{ matrix.plat }}-${{ matrix.arch }}.tar.gz.sha256
             pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.spdx.json
 
   docker:

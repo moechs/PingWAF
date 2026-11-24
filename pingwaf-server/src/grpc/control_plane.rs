@@ -5,6 +5,7 @@
 //! and every other RPC verifies that token before touching the database.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -55,10 +56,10 @@ use crate::grpc::registry::{
     AgentRegistry, ConfigDrift, HeartbeatMetrics, COMMAND_CHANNEL_CAPACITY,
 };
 use crate::models::{
-    access_log, action, agent, agent_blocked_ip, agent_metric, agent_status,
-    api_key, certificate_events, certificate_links, geo_rules, host_sample,
-    ip_access_rules, path_exceptions, security_event, site, site_basic_auth,
-    site_certificates, site_oidc,
+    access_log, action, agent, agent_blocked_ip, agent_metric, agent_sites,
+    agent_status, api_key, certificate_events, certificate_links, geo_rules,
+    host_sample, ip_access_rules, path_exceptions, security_event, site,
+    site_basic_auth, site_certificates, site_oidc,
 };
 
 /// Stream type returned by the server-streaming RPCs.
@@ -231,6 +232,35 @@ impl ControlPlaneService {
         &self,
         row: &agent::Model,
     ) -> Result<Vec<site::Model>, Status> {
+        if row.site_scope == "selected" {
+            let Some(key_id) = row.api_key_id else {
+                return Ok(Vec::new());
+            };
+            let key = api_key::Entity::find_by_id(key_id)
+                .one(&self.db)
+                .await
+                .map_err(db_status)?
+                .ok_or_else(|| {
+                    Status::unauthenticated("API key was revoked")
+                })?;
+            let assigned: Vec<Uuid> = agent_sites::Entity::find()
+                .filter(agent_sites::Column::AgentId.eq(row.id))
+                .all(&self.db)
+                .await
+                .map_err(db_status)?
+                .into_iter()
+                .map(|assignment| assignment.site_id)
+                .collect();
+            if assigned.is_empty() {
+                return Ok(Vec::new());
+            }
+            return site::Entity::find()
+                .filter(site::Column::Id.is_in(assigned))
+                .filter(site::Column::UserId.eq(key.user_id))
+                .all(&self.db)
+                .await
+                .map_err(db_status);
+        }
         if let Some(site_id) = row.site_id {
             let owned = site::Entity::find_by_id(site_id)
                 .one(&self.db)
@@ -468,7 +498,9 @@ impl ControlPlaneTrait for ControlPlaneService {
             Some(row) => {
                 let agent_id = row.id;
                 let mut active: agent::ActiveModel = row.into();
-                active.site_id = Set(site_id);
+                // A re-registration must not clear an operator's site scope
+                // or legacy single-site binding; only a brand-new row starts
+                // with `all` / no binding.
                 active.version = Set(optional(&payload.version));
                 active.os_info = Set(optional(&payload.os_info));
                 active.cpu_cores = Set(positive_i32(payload.cpu_cores as i64));
@@ -498,6 +530,7 @@ impl ControlPlaneTrait for ControlPlaneService {
                 let created = agent::ActiveModel {
                     id: Set(agent_id),
                     site_id: Set(site_id),
+                    site_scope: Set("all".to_string()),
                     hostname: Set(payload.hostname.clone()),
                     // The label is the operator's: a registering agent never
                     // supplies or clears it.
@@ -1103,17 +1136,33 @@ impl ControlPlaneTrait for ControlPlaneService {
                 );
                 continue;
             }
-            if !visibility.allows(&message.site_id) {
+            if !visibility
+                .allows_cert_event(&message.site_id, &message.certificate_id)
+            {
                 // Dropped, not rejected: see `ship_logs`. The alert and the
                 // certificate state transition below both act on the site, so
-                // the check has to happen before either.
+                // the check has to happen before either. An empty stamp is a
+                // global ACME event (environment/account/authorization lines)
+                // and is accepted; only a non-empty foreign site is dropped.
+                // An empty site that names a certificate is not global: it
+                // would let an agent fail another tenant's certificate by id,
+                // so it is dropped too.
                 dropped += 1;
-                tracing::warn!(
-                    site_id = %message.site_id,
-                    agent_id = %authenticated_id,
-                    dropped,
-                    "certificate event stamped with a site this agent does not serve"
-                );
+                if message.site_id.is_empty() {
+                    tracing::warn!(
+                        certificate_id = %message.certificate_id,
+                        agent_id = %authenticated_id,
+                        dropped,
+                        "certificate event without a site stamp names a certificate; dropped"
+                    );
+                } else {
+                    tracing::warn!(
+                        site_id = %message.site_id,
+                        agent_id = %authenticated_id,
+                        dropped,
+                        "certificate event stamped with a site this agent does not serve"
+                    );
+                }
                 continue;
             }
             received += 1;
@@ -2809,6 +2858,26 @@ async fn flush_cert_events(
     Ok(())
 }
 
+/// AS number for a shipped entry: the agent's own resolution when it sent
+/// one, otherwise the control plane's local MaxMind ASN database.
+///
+/// The `lookup` parameter is the seam that makes the fallback testable — the
+/// production callers pass [`crate::asn::lookup_ip`], tests pass a fake. The
+/// lookup is in-process in both cases: the database is a local file read once,
+/// so no request ever performs a network call.
+fn effective_asn(
+    entry: &LogEntry,
+    lookup: impl FnOnce(IpAddr) -> Option<u32>,
+) -> Option<u32> {
+    // The edge resolves the ASN itself when its GeoIP data carries one; a
+    // control-plane lookup is only the fallback, never an override.
+    if entry.asn != 0 {
+        return Some(entry.asn);
+    }
+    let ip: IpAddr = entry.client_ip.trim().parse().ok()?;
+    lookup(ip).filter(|asn| *asn != 0)
+}
+
 /// Maps a shipped log entry onto the `access_logs` row.
 fn access_log_row(
     entry: &LogEntry,
@@ -2851,6 +2920,11 @@ fn access_log_row(
         user_agent: Set(optional(&entry.user_agent)),
         referer: Set(optional(&entry.referer)),
         country_code: Set(truncate(&entry.country_code, MAX_COUNTRY)),
+        // Autonomous system of the client address: the agent's own value, or
+        // the control plane's ASN database when the agent could not resolve
+        // it. `None` (no database, a miss, or a private/reserved address) is
+        // stored as NULL, so the ASN ranking never counts a bogus AS0.
+        asn: Set(effective_asn(entry, crate::asn::lookup_ip).map(i64::from)),
         tls_version: Set(truncate(&entry.tls_version, MAX_TLS_VERSION)),
         // Who made the request, when the site authenticated them. `optional`
         // maps an empty string to NULL: the column means "no identity", and a
@@ -3180,7 +3254,9 @@ fn access_log_document(
         ja3_hash: optional(&entry.ja3_hash),
         country_code: optional(&entry.country_code),
         city: optional(&entry.city),
-        asn: positive_u32(entry.asn),
+        // Same value the PostgreSQL row stores, so the two stores never
+        // disagree about the network a request came from.
+        asn: effective_asn(entry, crate::asn::lookup_ip),
 
         user_agent: optional(&entry.user_agent),
         referer: optional(&entry.referer),
@@ -3233,7 +3309,7 @@ fn security_event_document(
         user_agent: optional(&entry.user_agent),
         user_identity: optional(&entry.user_identity),
         country_code: optional(&entry.country_code),
-        asn: positive_u32(entry.asn),
+        asn: effective_asn(entry, crate::asn::lookup_ip),
 
         request_headers: headers_json(&entry.request_headers),
         request_body,
@@ -3379,6 +3455,20 @@ impl SiteVisibility {
     fn allows(&self, stamped: &str) -> bool {
         site_stamp_is_visible(stamped, &self.sites)
     }
+
+    /// Certificate events may be global: the ACME environment/account/
+    /// authorization lines carry no site, and the `certificate_events.site_id`
+    /// column is nullable for exactly that reason. Only a non-empty foreign
+    /// stamp is dropped. An empty stamp that still names a certificate is not
+    /// global — it could fail another tenant's certificate by id — so it is
+    /// rejected. The heartbeat/log/security paths keep using [`Self::allows`],
+    /// which rejects an empty stamp.
+    fn allows_cert_event(&self, site_id: &str, certificate_id: &str) -> bool {
+        if site_id.is_empty() {
+            return certificate_id.is_empty();
+        }
+        self.allows(site_id)
+    }
 }
 
 /// Drops heartbeat entries stamped with a site the reporting agent does not
@@ -3503,6 +3593,25 @@ mod tests {
         assert!(!site_stamp_is_visible("   ", &[site]));
         assert!(!site_stamp_is_visible("not-a-uuid", &[site]));
         assert!(!site_stamp_is_visible(&Uuid::new_v4().to_string(), &[site]));
+    }
+
+    /// Global certificate events (no `site_id`) must be accepted: the ACME
+    /// environment/account/authorization lines have no site, and the column is
+    /// nullable. Dropping them also logged the misleading "site this agent
+    /// does not serve" warning with an empty `site_id`.
+    #[test]
+    fn an_empty_certificate_stamp_is_global_not_foreign() {
+        let site = Uuid::new_v4();
+        let visibility = SiteVisibility::new(vec![site]);
+        // Global ACME lines: no site and no certificate binding.
+        assert!(visibility.allows_cert_event("", ""));
+        // A site-scoped event follows the same visibility rule as the rest.
+        assert!(visibility.allows_cert_event(&site.to_string(), "cert"));
+        assert!(
+            !visibility.allows_cert_event(&Uuid::new_v4().to_string(), "cert")
+        );
+        // An empty site with a certificate id could target another tenant.
+        assert!(!visibility.allows_cert_event("", "cert"));
     }
 
     /// DR32-08: after a visibility refresh, a site the agent was unbound from
@@ -3765,6 +3874,73 @@ mod tests {
             .expect("event");
         assert!(event.action.is_set());
         assert_eq!(event.score.unwrap(), Some(42));
+    }
+
+    /// The AS number stored for a row: the agent's own value wins, and the
+    /// control plane's ASN database is consulted only when the agent sent 0.
+    /// A miss, an unparsable address and a database that answers 0 all end as
+    /// NULL rather than a guessed network.
+    #[test]
+    fn the_asn_falls_back_to_the_control_plane_database() {
+        let mut entry = LogEntry {
+            client_ip: "8.8.8.8".into(),
+            ..Default::default()
+        };
+
+        // Agent could not resolve it: the database answers.
+        assert_eq!(
+            Some(64_500),
+            effective_asn(&entry, |ip| {
+                assert_eq!("8.8.8.8", ip.to_string());
+                Some(64_500)
+            })
+        );
+
+        // No database / a miss: NULL, never AS0.
+        assert_eq!(None, effective_asn(&entry, |_| None));
+        assert_eq!(None, effective_asn(&entry, |_| Some(0)));
+
+        // The agent's own resolution wins and the database is not consulted.
+        entry.asn = 15_169;
+        assert_eq!(
+            Some(15_169),
+            effective_asn(&entry, |_| panic!("must not consult the database"))
+        );
+
+        // An address that cannot be parsed is not looked up at all.
+        entry.asn = 0;
+        entry.client_ip = "not-an-ip".into();
+        assert_eq!(
+            None,
+            effective_asn(&entry, |_| panic!("must not look up garbage"))
+        );
+        entry.client_ip = "  ".into();
+        assert_eq!(
+            None,
+            effective_asn(&entry, |_| panic!(
+                "must not look up an empty address"
+            ))
+        );
+    }
+
+    /// The row and the Elasticsearch documents all carry the enriched value,
+    /// so the two stores cannot disagree about the network.
+    #[test]
+    fn the_enriched_asn_reaches_the_stored_row() {
+        // 1.2.3.4 is outside the ASN test fixture's prefix, so this holds
+        // whether or not another test has the fixture installed.
+        let entry = LogEntry {
+            client_ip: "1.2.3.4".into(),
+            ..Default::default()
+        };
+        // No database in the test process: the column stays NULL.
+        let row = access_log_row(&entry, None, None, Utc::now());
+        assert_eq!(None, row.asn.unwrap());
+
+        let mut resolved = entry.clone();
+        resolved.asn = 13_335;
+        let row = access_log_row(&resolved, None, None, Utc::now());
+        assert_eq!(Some(13_335), row.asn.unwrap());
     }
 
     /// The identity is stored on both tables, an absent one stays NULL, and an

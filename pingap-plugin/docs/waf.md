@@ -29,7 +29,9 @@ rules), and the resulting verdict is mapped onto the proxy pipeline.
 | `body_stage_policy` | string | `balanced` | What to do when the body staging budget runs out: `balanced` forwards the checked prefix and emits `body_prefix_only`; `strict` rejects instead of forwarding an uninspected tail; `throughput` withholds nothing. |
 | `encoded_body_policy` | string | `inspect_wire` | What to do with a `Content-Encoding` the engine cannot undo: `inspect_wire` scans the encoded bytes and emits `body_encoded_uninspected`; `reject` answers `415`. |
 | `truncated_body_policy` | string | `monitor` | What to do when the scan surface was truncated (query/form/value/body cap, or an inspection deadline): `monitor` forwards and emits `body_scan_truncated` / `body_scan_deadline`; `reject` answers `413` for a `pass` or `monitor` verdict (never for `block`, and never in observation mode). `body_stage_policy = "strict"` rejects regardless of this value. An unrecognised value is treated as `reject` and logged. |
-| `pow_difficulty` | int | `20` | Proof-of-work difficulty used when a `Challenge` verdict delegates to the challenge subsystem. |
+| `pow_difficulty` | int | `20` | Base proof-of-work difficulty for a `Challenge` verdict, used when the site carries no challenge settings (standalone mode). A site that has them uses its own `base_difficulty`/`max_difficulty`. |
+| `pow_max_difficulty` | int | `24` | Adaptive ceiling paired with `pow_difficulty` for a site without challenge settings. Set it equal to `pow_difficulty` to pin the work. |
+| `pow_issue_limit_per_min` | int | `120` | Fallback per-host+IP challenge-issuance budget for a site without challenge settings. It shares the process-wide budget with the challenge plugin, so pages minted here count against the site's `issue_limit_per_min` too. |
 | `step` | string | `early_request` | `early_request` or `request`. Any other value is a configuration error. |
 
 ## Verdicts
@@ -107,9 +109,11 @@ stacks = ["php"]
 
 - `waf` runs at `early_request` by default, ahead of most other plugins, so
   malicious traffic is rejected before authentication, caching or upstream work.
-- Pair with [`challenge`](challenge.md): a `Challenge` verdict renders the
-  challenge page, and the challenge plugin's verify endpoint completes the flow.
-  Keep `pow_difficulty` and `cookie_secret` consistent between the two.
+- Pair with [`challenge`](challenge.md): a `Challenge` verdict is minted through
+  the challenge subsystem's guarded path — the site's difficulty, the shared
+  per-host+IP issuance budget and the adaptive pressure all apply — and the
+  challenge plugin's verify endpoint completes the flow. Keep `cookie_secret`
+  consistent between the two.
 - The engine runs on **every** request. Leave `inspect_body` off unless you need
   body-level detection, and keep `max_body_size` bounded.
 - **Body inspection is prefix-only**: with `inspect_body` on, only the first

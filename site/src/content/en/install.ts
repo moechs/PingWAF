@@ -46,7 +46,7 @@ const install = {
       {
         id: "agent",
         label: "Agent",
-        body: "A data-plane node that proxies traffic and connects to a control plane over gRPC. Keeps no database; needs --server-url and an enrollment key.",
+        body: "A data-plane node that proxies traffic and connects to a control plane over gRPC. The installer fetches the agent-only build (no database, REST API or dashboard); needs --server-url and an enrollment key. The control plane must be 0.32.40+ for certificate distribution; agents are currently unbound and receive every site owned by the key's owner.",
         flags: ["--mode agent", "--server-url https://cp:9090", "--api-key pwk_…"],
       },
     ],

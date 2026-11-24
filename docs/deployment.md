@@ -28,10 +28,12 @@ are kept). The installer:
 - **generates `PINGWAF_SECRET_KEY`** into `.env` and reuses it on `--force`;
   rotating it silently would make every sealed notification/AI/backup credential
   unreadable;
-- **publishes the console (9080) and gRPC (9090) on `127.0.0.1` only.** Set
-  `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` to `0.0.0.0` (or a private
-  interface) only when a reverse proxy or remote agents need them, and change
-  the administrator password first;
+- **publishes the console (9080) on `0.0.0.0` and gRPC (9090) on
+  `127.0.0.1`.** The console has to be reachable for a fresh install to be
+  usable; restrict it with `PINGWAF_ADMIN_BIND` (an admin interface), a
+  firewall, or a reverse proxy, and change the administrator password at the
+  first sign-in. Set `PINGWAF_GRPC_BIND=0.0.0.0` only when remote agents need
+  it;
 - **never deletes data volumes.** `--force` rewrites `.env` but keeps
   `postgres-data` / `pingwaf-data` / `pingwaf-certs`; volume pruning is a
   separate, explicit action (see [Upgrade Procedure](#upgrade-procedure)).
@@ -156,7 +158,7 @@ The systemd path solves the same problem a different way — the unit grants
 | `PINGWAF_TAG` | `latest` | PingWAF image tag — pin a release (or a digest) in production |
 | `PINGWAF_HTTP_PORT` / `PINGWAF_HTTPS_PORT` | `80` / `443` | Host ports for proxied traffic |
 | `PINGWAF_ADMIN_PORT` / `PINGWAF_GRPC_PORT` | `9080` / `9090` | Host ports for the console/API and the agent gRPC endpoint |
-| `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` | `127.0.0.1` | Host address the console/API and the agent gRPC endpoint publish on. **Loopback by default** — a fresh install still has a just-generated administrator password. Set `0.0.0.0` (or a private interface) only behind a reverse proxy / for remote agents, and restrict it with a firewall |
+| `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` | `0.0.0.0` / `127.0.0.1` | Host address the console/API and the agent gRPC endpoint publish on. The console is published on every interface so a fresh install is reachable — set it to a specific admin interface (or firewall the port / front it with a reverse proxy) and change the administrator password at the first sign-in. gRPC stays loopback unless remote agents need it |
 | `PINGWAF_TLS_SANS` | empty | Comma-separated SANs for the self-signed console certificate |
 | `TLS_ENABLED` | `true` | Serve the console over HTTPS |
 | `POSTGRES_PASSWORD` | `pingwaf` (development fallback) | PostgreSQL password. **Set a random value in `.env`** (`openssl rand -hex 16`) for any real deployment: the compose file still falls back to `pingwaf` when unset, and the compose installer does not generate this one |
@@ -218,7 +220,7 @@ and `--no-systemd`:
 | --- | --- | --- |
 | `--admin-email` | `PINGWAF_ADMIN_EMAIL` | Seed administrator e-mail (server / all-in-one) |
 | `--admin-password` | `PINGWAF_ADMIN_PASSWORD` | Seed administrator password (server / all-in-one); when empty a random password is generated and printed once |
-| `--listen-public` | `PINGWAF_LISTEN_PUBLIC` | Bind the dashboard (9080) and gRPC (9090) on `0.0.0.0` instead of the default `127.0.0.1`. Use it only behind a reverse proxy or for remote agents, and change the administrator password first |
+| `--listen-public` | `PINGWAF_LISTEN_PUBLIC` | Also bind the agent gRPC endpoint (9090) on `0.0.0.0`; it stays on `127.0.0.1` by default and only remote agents need it opened. The dashboard/REST API (9080) already listens on every interface — restrict it to your admin network |
 | `--tls-sans` | `PINGWAF_TLS_SANS` | Comma-separated SANs of the dashboard certificate |
 | `--server-ca-cert` | `PINGWAF_SERVER_CA_CERT` | PEM file with the CA that signed the control plane's gRPC certificate (agent mode, https); readability is verified before installing |
 | `--server-tls-name` | `PINGWAF_SERVER_TLS_NAME` | Name used for SNI and certificate verification when the certificate has no SAN for the URL host (agent mode; requires a release that knows the flag) |
@@ -246,20 +248,34 @@ the script resolved from your options.
   systemd unit reads it through `EnvironmentFile=-/etc/pingwaf/pingwaf.env`.
   An existing key is kept on upgrade: rotating it silently would make every
   sealed notification/AI/backup credential unreadable.
-- **Listen addresses** — `127.0.0.1:9080` (console) and `127.0.0.1:9090`
-  (gRPC) by default. `--listen-public` (or `PINGWAF_LISTEN_PUBLIC=1`) publishes
-  them on `0.0.0.0` and prints a reminder to change the administrator password
-  first; prefer a TLS reverse proxy over exposing the console directly.
+- **mimalloc arena** — the generated unit pins `MIMALLOC_ARENA_RESERVE` and
+  `MIMALLOC_ARENA_EAGER_COMMIT` from the memory ceiling (cgroup v2/v1 limit,
+  else `MemTotal`): 64 MiB below 1 GiB, 256 MiB below 4 GiB, 512 MiB up to
+  16 GiB, else 1 GiB; eager commit is enabled only at 4 GiB and above. This is
+  required because mimalloc creates its first arena before
+  `allocator_tune::apply()` can set the option, and an existing arena cannot
+  be shrunk. Override the values with `systemctl edit pingwaf` when the host
+  has a non-standard memory layout.
+- **Listen addresses** — the console listens on `0.0.0.0:9080` and the agent
+  gRPC endpoint on `127.0.0.1:9090`. The console binds every interface so a
+  fresh install is reachable from the operator's browser; restrict 9080 to your
+  admin network (firewall or `admin_addr`) or front it with a TLS reverse proxy,
+  and change the administrator password at the first sign-in — a fresh database
+  refuses every write until you do. `--listen-public` (or
+  `PINGWAF_LISTEN_PUBLIC=1`) opens gRPC too, which only remote agents need.
 
 > Prebuilt release assets are published for **Linux** (amd64/arm64) only; on
 > macOS, [build from source](./quick-start.md#path-2-build-from-source).
 >
-> Each release ships two archives per architecture:
-> `pingwaf-linux-{amd64,arm64}.tar.xz` (primary, smaller) and
-> `pingwaf-linux-{amd64,arm64}.tar.gz` (compatibility fallback), each with a
-> `.sha256` sidecar. `install.sh` prefers the `.tar.xz` asset, skips straight
-> to `.tar.gz` when `xz(1)` is not installed locally, and falls back on a
-> failed download (e.g. releases that predate `.tar.xz`).
+> Each release ships four archives per architecture:
+> `pingwaf-linux-{amd64,arm64}.tar.xz` / `.tar.gz` for the control plane and
+> all-in-one modes, and `pingwaf-agent-linux-{amd64,arm64}.tar.xz` / `.tar.gz`
+> for the agent-only build (no PostgreSQL, REST API or embedded dashboard),
+> each with a `.sha256` sidecar. `install.sh --mode agent` prefers the
+> `pingwaf-agent` asset and installs it as `/usr/local/bin/pingwaf`; a release
+> that predates it falls back to the full binary with a warning. The installer
+> prefers the `.tar.xz` asset, skips straight to `.tar.gz` when `xz(1)` is not
+> installed locally, and falls back on a failed download.
 >
 > The binaries are linked against the glibc of the runner that builds them
 > (Ubuntu 24.04, **glibc 2.39**), so they run on Debian 12+/Ubuntu 24.04+ and
@@ -267,15 +283,26 @@ the script resolved from your options.
 > Alpine, ...) `install.sh` stops with the loader's error — build from source
 > there, or run the container image.
 
+> **Manual tarball install.** The archive contains `pingwaf`, `pingwaf.service`
+> and `pingwaf.toml` **inside** `pingwaf-linux-<arch>/`; copy the unit from
+> there, not from the top of the extraction directory. Use `PINGWAF_DB_URL`
+> (not `PINGWAF_DATABASE_URL`) for a non-default database, set
+> `PINGWAF_SECRET_KEY` and an admin password before the first start, and keep
+> the unit's `WorkingDirectory=/var/lib/pingwaf` so the relative
+> `cache_dir = "./data/cache"` is writable under `ProtectSystem=strict`. A
+> manual unit has no memory probe; pin `MIMALLOC_ARENA_RESERVE` on hosts below
+> 4 GiB. The full checklist is in [quick-start Path 3](./quick-start.md#path-3-binary--systemd-production).
+
 ### 2. Set Up PostgreSQL
 
 ```bash
-# Install PostgreSQL
-sudo apt install postgresql-16
+# Install PostgreSQL (use the distribution's default package; Ubuntu 26.04
+# ships postgresql-18 and has no postgresql-16. Anything 14+ works.)
+sudo apt install postgresql
 
-# Create user and database
-sudo -u postgres createuser pingwaf
-sudo -u postgres createdb -O pingwaf pingwaf
+# Create user and database (idempotent: skip an existing role/database)
+sudo -u postgres createuser pingwaf 2>/dev/null || true
+sudo -u postgres createdb -O pingwaf pingwaf 2>/dev/null || true
 sudo -u postgres psql -c "ALTER USER pingwaf PASSWORD 'your-secure-password';"
 ```
 
@@ -340,8 +367,8 @@ file and in the environment is taken from the environment.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `db_url` | string | `postgres://pingwaf:pingwaf@localhost:5432/pingwaf` | PostgreSQL DSN |
-| `admin_addr` | string | `0.0.0.0:9080` | REST API + dashboard address |
-| `grpc_addr` | string | `0.0.0.0:9090` | gRPC control plane address |
+| `admin_addr` | string | `0.0.0.0:9080` (CLI, installer and example config alike) | REST API + dashboard address; restrict it with a firewall or a reverse proxy |
+| `grpc_addr` | string | `0.0.0.0:9090` (CLI default; the installer and example config use `127.0.0.1:9090` until `--listen-public`) | gRPC control plane address |
 | `grpc_tls_mode` | string | `tls` | `tls` (default) or `off`. With `tls` and no certificate configured, a self-signed CA + server certificate is generated on first boot and reused after |
 | `grpc_tls_cert` | string | — | PEM certificate for the gRPC listener; takes priority over the self-signed pair (requires `grpc_tls_key`) |
 | `grpc_tls_key` | string | — | PEM private key for `grpc_tls_cert` |
@@ -501,7 +528,30 @@ the host agents dial, set `server_tls_name` to a SAN it does carry — the
 parameter requires 0.32.17 or newer; on older binaries, point the SAN name at
 the control plane in `/etc/hosts` instead.
 
-Generate an agent API key from the dashboard: **Settings → API Keys → Create Key**.
+Create the enrollment key from the console's **Nodes → Add node** flow (or
+`POST /api/v1/agents/enroll`); it returns the install command. A generic
+**Settings → API Keys** key is also accepted, but both are unbound: an agent
+receives **every site owned by the key's owner**, not just one site. The
+control plane's own dashboard site (typically `waf.<domain>` with upstream
+`127.0.0.1:9080`) is included; on an edge that loopback has no dashboard and
+the site returns 502. There is no per-node site binding yet, so use a
+dedicated control plane or remove sites an edge must not run.
+
+For ACME, the control plane must be **0.32.40 or newer**: that release syncs
+the PEMs issued by its embedded data plane into `site_certificates` and pushes
+them to the agents. An older control plane sends `acme_email` without a PEM,
+so each agent starts its own HTTP-01 order; the CA validation request reaches
+the host that owns port 80 (usually the control plane), not the agent, and the
+order fails with `acme_failed`. If the control plane cannot be upgraded yet,
+set `PINGAP_DISABLE_ACME=true` in the agent unit and upload certificates
+instead. An agent that really is the HTTP-01 endpoint for its domains can
+still issue locally, but a remote agent behind the control plane cannot.
+
+The installer copies `--server-ca-cert` to `/etc/pingwaf/grpc-ca.pem` and
+writes that durable path into the config/unit; the source file may live in a
+temporary directory. The console's generated command does not include the CA
+or `--server-tls-name`, so add them when the control plane uses its
+self-signed certificate.
 
 The log, certificate-event and metric shipping streams authenticate with the
 agent token sent as `x-agent-token` gRPC metadata. **In distributed
@@ -709,6 +759,15 @@ Configure through the dashboard:
    - **DNS-01**: Supports Cloudflare, AliDNS, Huawei DNS, Tencent DNS
 
 Certificates are automatically renewed before expiry.
+
+In **all-in-one** mode the embedded data plane is the ACME issuer. The control
+plane mirrors the PEMs it issues (from the data plane's `acme_state.toml`) into
+the ACME-managed `site_certificates` rows every 30 seconds and pushes the
+updated bundle to every agent, so an edge agent whose port 80 points at the
+control plane does not have to issue (and fail) its own HTTP-01 order. Set
+`PINGWAF_ACME_STATE` to override the file path. A remote agent that is itself
+the HTTP-01 endpoint can still issue locally; use **DNS-01** when it is not the
+instance owning the domain's port 80.
 
 ### Manual Certificates
 
@@ -1101,6 +1160,14 @@ Take a backup before every upgrade, and pin the exact version you deploy —
 `:latest` makes an upgrade an unauditable drift and leaves you without a known
 rollback target.
 
+> **Console listen address.** New installs bind the console on `0.0.0.0:9080`.
+> An upgrade never rewrites an existing configuration, so an installation
+> created before that change keeps `admin_addr = "127.0.0.1:9080"` (and compose
+> keeps the old `.env` value) and stays reachable only from the host itself.
+> Set `admin_addr = "0.0.0.0:9080"` — or `PINGWAF_ADMIN_BIND=0.0.0.0` in
+> `.env` — when you want the new behavior, then restrict the port with a
+> firewall or a reverse proxy.
+
 ### Docker
 
 ```bash
@@ -1408,6 +1475,19 @@ psql "postgres://pingwaf:password@localhost:5432/pingwaf" -c "SELECT 1"
 2. Check the API key is valid
 3. Review agent logs: `RUST_LOG=debug pingwaf agent --server-url ...`
 4. Ensure clocks are synchronized (NTP)
+
+`wrong version number` on port **443** is not a control-plane connection
+error: it means a client spoke plaintext HTTP to the TLS listener (a scanner
+or a misconfigured client). It is expected noise on a public edge; filter or
+rate-limit it in the log collector rather than disabling the listener's error
+target. Control-plane TLS problems are the `UnknownIssuer` / `NotValidForName`
+family covered under [Agent Can't Reach the Control Plane](#agent-cant-reach-the-control-plane).
+
+If `/etc/pingwaf/pingwaf.toml` already exists, `install.sh --server-url …`
+and `--api-key …` do **not** rewrite it: in agent mode the file wins over the
+unit's environment. The effective URL is the one in the startup log
+(`server_url=…`); edit `[agent]` in the file and restart when it differs from
+what the installer was given.
 
 TLS handshake errors (`GoAway … FRAME_SIZE_ERROR`, `UnknownIssuer`,
 `NotValidForName`) have a dedicated walkthrough under

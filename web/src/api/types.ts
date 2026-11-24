@@ -1016,6 +1016,10 @@ export interface TimeBucket {
   client_errors: number
   server_errors: number
   avg_latency_ms: number
+  /** Total-latency percentiles for the bucket (`PERCENTILE_CONT` server-side). */
+  p50_latency_ms: number
+  p90_latency_ms: number
+  p99_latency_ms: number
   blocked: number
 }
 
@@ -1052,6 +1056,31 @@ export interface TopIp {
   blocked: number
   /** Site the IP most recently requested; the target for quick actions. */
   top_site_id?: string | null
+  /**
+   * Network the address belongs to, when the edge resolved one. `null` for
+   * private addresses, agents without GeoIP ASN data and rows written before
+   * the column existed — render `—`, never a guess.
+   */
+  asn?: number | null
+  /**
+   * Organization behind `asn` from the control plane's ASN table; the
+   * `Unknown (AS<n>)` fallback is localised by `isUnknownAsnName`.
+   */
+  asn_name?: string | null
+}
+
+/**
+ * `api::analytics::TopAsn` — one network in the ASN traffic ranking.
+ *
+ * `asn` is a real AS number (never 0: unresolved addresses are stored as NULL
+ * and excluded from the ranking). `asn_name` is resolved by the control plane
+ * from its bundled/operator ASN table and reads `Unknown (AS<number>)` when the
+ * network has no entry — the UI still localises that fallback.
+ */
+export interface TopAsn {
+  asn: number
+  asn_name: string
+  requests: number
 }
 
 /** `api::analytics::TopPath` */
@@ -1105,6 +1134,12 @@ export interface Agent {
   id: string
   site_id: string | null
   site_domain: string | null
+  /** `all` = every site owned by the API key; `selected` = `site_ids`. */
+  site_scope: 'all' | 'selected'
+  /** Sites assigned to a selected agent; empty for `all`. */
+  site_ids: string[]
+  /** Domains matching `site_ids`, in order. */
+  site_domains: string[]
   hostname: string
   /** Operator-assigned label; null = show the hostname instead. */
   display_name: string | null
@@ -1156,6 +1191,11 @@ export interface Agent {
   pending_commands: number
   /** Whether the gRPC control plane serves TLS; false = plaintext (degraded). */
   grpc_tls: boolean
+}
+
+export interface UpdateAgentSitesRequest {
+  scope: 'all' | 'selected'
+  site_ids?: string[]
 }
 
 export interface AgentListQuery extends PaginationQuery {
@@ -2079,6 +2119,17 @@ export interface ChallengeConfig {
   exempt_paths: string[]
   browser_integrity_check: boolean
   tls_fingerprint_check: boolean
+  /**
+   * Proof-of-work difficulty (leading zero bits) a normal visitor solves.
+   * Default 20; the adaptive step starts here.
+   */
+  base_difficulty: number
+  /** Ceiling the difficulty may rise to under request/failure pressure. */
+  max_difficulty: number
+  /** Challenge pages issued per IP per 60-second window (over it: 429). */
+  issue_limit_per_min: number
+  /** Solution submissions accepted per IP per 60-second window. */
+  verify_limit_per_min: number
 }
 
 /** Patch semantics: omitted fields keep their current value (mirrors the server). */
@@ -2283,7 +2334,7 @@ export interface CreateRewriteRuleRequest {
 
 export type UpdateRewriteRuleRequest = Partial<CreateRewriteRuleRequest>
 
-/* ── Custom error pages ───────────────────────────────────────────── */
+/* ── Custom pages ───────────────────────────────────────────── */
 
 export type ErrorPageContentType = 'text/html' | 'application/json' | 'text/plain'
 
@@ -2309,7 +2360,7 @@ export const ERROR_PAGE_STATUS_CODES = [403, 429, 502, 503, 504] as const
  * site or a client reaches the gateway by bare IP. Upsert is keyed on
  * `(scope, status_code)`.
  */
-export type ErrorPageScope = 'site' | 'unmatched_host'
+export type ErrorPageScope = 'site' | 'unmatched_host' | 'challenge'
 
 export interface ErrorPage {
   id: string
@@ -2462,6 +2513,8 @@ export const BASIC_AUTH_MAX_DELAY_SECONDS = 10
 export interface GeoCountryStat {
   country_code: string
   requests: number
+  /** Requests the WAF refused (403/429) in the same window. */
+  blocked?: number
 }
 
 /* ── Traffic analytics (site-scoped) ──────────────────────────────── */
@@ -2479,6 +2532,7 @@ export interface TrafficOverview {
   topPaths: TopPath[]
   topIps: TopIp[]
   topRules: TopRule[]
+  topAsns: TopAsn[]
   statusCodes: StatusCodeCount[]
 }
 

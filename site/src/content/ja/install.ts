@@ -46,7 +46,7 @@ const install = {
       {
         id: "agent",
         label: "Agent",
-        body: "トラフィックをプロキシし、gRPC でコントロールプレーンに接続するデータプレーンノードです。データベースを持ちません。--server-url と登録キーが必要です。",
+        body: "トラフィックをプロキシし、gRPC でコントロールプレーンに接続するデータプレーンノードです。インストーラーはエージェント専用ビルド（データベース・REST API・ダッシュボードなし）を取得します。--server-url と登録キーが必要です。",
         flags: ["--mode agent", "--server-url https://cp:9090", "--api-key pwk_…"],
       },
     ],

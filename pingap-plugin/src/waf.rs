@@ -30,9 +30,10 @@ use super::{
 };
 use crate::bot_dns::{DnsVerdict, bot_dns_verifier, known_bot_family};
 use crate::challenge::{
-    ChallengeKind, VERIFY_ENDPOINT, basic_auth_page, block_page,
-    build_challenge_response, fail_closed_page, paused_page, rate_limit_page,
-    resolve_cookie_secret,
+    ChallengeKind, ChallengeLimits, DEFAULT_ISSUE_LIMIT_PER_MIN,
+    DEFAULT_VERIFY_LIMIT_PER_MIN, MintRequest, VERIFY_ENDPOINT,
+    basic_auth_page, block_page, fail_closed_page, mint_challenge, paused_page,
+    rate_limit_page, resolve_cookie_secret,
 };
 use crate::host_cache::{HostCacheSweep, touch};
 use crate::path_filter::{MatchType, PathFilter};
@@ -2207,18 +2208,19 @@ impl ExpressionState {
     }
 }
 
-/// Parses the `Cookie` header into name/value pairs.
+/// Parses the `Cookie` header(s) into name/value pairs.
+///
+/// HTTP/2 clients may split the cookie jar across several `Cookie` fields
+/// (RFC 9113 §8.2.3) and Chromium does so once the jar grows. Reading only the
+/// first field hid every cookie after the split — including the clearance
+/// cookie, which made the challenge re-issue forever (2026-11-24, issue #108).
 fn parse_cookies(
     headers: &[(String, String)],
 ) -> Vec<(Cow<'static, str>, Cow<'static, str>)> {
-    let Some(raw) = headers
+    headers
         .iter()
-        .find(|(k, _)| k == "cookie")
-        .map(|(_, v)| v.as_str())
-    else {
-        return Vec::new();
-    };
-    raw.split(';')
+        .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+        .flat_map(|(_, v)| v.split(';'))
         .filter_map(|pair| {
             let (name, value) = pair.trim().split_once('=')?;
             Some((
@@ -2229,18 +2231,30 @@ fn parse_cookies(
         .collect()
 }
 
+/// The request's User-Agent, used to bind a challenge to the client that
+/// requested it.
+fn request_user_agent(headers: &[(String, String)]) -> &str {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default()
+}
+
 /// Extracts the clearance cookie value, if the client carries one.
+///
+/// Every `Cookie` field is searched, in wire order: an HTTP/2 client may split
+/// the jar over several fields, and the clearance one can land in any of them.
 fn clearance_cookie(headers: &[(String, String)]) -> Option<String> {
     headers
         .iter()
-        .find(|(k, _)| k == "cookie")
-        .and_then(|(_, v)| {
-            v.split(';').find_map(|pair| {
-                let (name, value) = pair.trim().split_once('=')?;
-                name.trim()
-                    .eq_ignore_ascii_case(CLEARANCE_COOKIE_NAME)
-                    .then(|| value.trim().to_string())
-            })
+        .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+        .flat_map(|(_, v)| v.split(';'))
+        .find_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case(CLEARANCE_COOKIE_NAME)
+                .then(|| value.trim().to_string())
         })
 }
 
@@ -2310,6 +2324,11 @@ struct PendingAccess {
     referer: String,
     tls_version: String,
     country_code: String,
+    /// Autonomous system number of `client_ip`, resolved once in the request
+    /// phase. 0 when the address is private/reserved, the embedded GeoIP
+    /// database has no answer, or no agent is attached (the field is only
+    /// collected for the log pipeline).
+    asn: u32,
     /// Who the request was made by, backfilled by the OIDC plugin once it has
     /// validated a session. Empty while the request is anonymous, and also
     /// when the site has no gate at all.
@@ -3172,6 +3191,7 @@ fn emit_access(
         referer: pending.referer,
         tls_version: pending.tls_version,
         country_code: pending.country_code,
+        asn: pending.asn,
         user_identity: pending.user_identity,
         request_headers: pending.request_headers,
         request_body: pending.request_body,
@@ -3327,6 +3347,14 @@ pub(crate) fn emit_challenge_access(
             .unwrap_or_default()
             .to_string(),
         country_code: String::new(),
+        // No `RequestData` on this path, so the country is unknown; the
+        // address is right here, though, and one embedded-database lookup
+        // keeps challenged requests in the ASN ranking.
+        asn: client_ip
+            .parse()
+            .ok()
+            .and_then(lookup_asn_addr)
+            .unwrap_or(0),
         // Filled in by the OIDC plugin when a session names the caller; this
         // response is generated before that plugin runs.
         user_identity: String::new(),
@@ -3485,8 +3513,12 @@ pub struct WafPlugin {
     /// first KiB of every body is captured for the access log.
     inspect_body: bool,
     max_body_size: usize,
-    /// Proof-of-work difficulty used when delegating a `Challenge` verdict.
-    pow_difficulty: u32,
+    /// Guards used when a `Challenge` verdict has to mint a page for a site
+    /// that carries no challenge configuration (standalone mode): this
+    /// plugin's `pow_difficulty` as the base, the documented adaptive ceiling
+    /// and per-IP issuance budget. A site that does carry settings uses those
+    /// instead — see [`mint_challenge`].
+    mint_fallback: ChallengeLimits,
     /// Max time a body may stay withheld from the upstream before the
     /// fail-open flush (`min(configured, 30s)`, default 30s).
     body_stage_timeout: Duration,
@@ -3827,7 +3859,10 @@ impl WafPlugin {
         site_rules: &Arc<CacheSiteRules>,
     ) -> Arc<SiteContext> {
         let now = crate::host_cache::unix_now();
-        match self.site_contexts_by_id.entry(site_rules.site_id.clone()) {
+        match self
+            .site_contexts_by_id
+            .entry(site_rules.site_id.to_string())
+        {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 if Arc::ptr_eq(&entry.get().rules, site_rules) {
                     touch(&entry.get().last_used, now);
@@ -3944,7 +3979,7 @@ impl WafPlugin {
         let choice = context.choice(&site_rules);
         ResolvedSite {
             choice,
-            site_id: site_rules.site_id.clone(),
+            site_id: site_rules.site_id.to_string(),
             context: Some(context),
         }
     }
@@ -4247,7 +4282,7 @@ impl WafPlugin {
         request_data: &RequestData,
         denial: &Denial,
         original_url: &str,
-        pow_difficulty: u32,
+        mint_fallback: ChallengeLimits,
         skip_challenge: bool,
         event_type: &str,
     ) -> RequestPluginResult {
@@ -4281,7 +4316,7 @@ impl WafPlugin {
             }
             return RequestPluginResult::Continue;
         }
-        let response = if denial.challenge {
+        let (response, challenged) = if denial.challenge {
             // A client holding a valid clearance for this site already
             // solved its challenge: re-issuing it would loop forever, so
             // let it pass.
@@ -4292,17 +4327,25 @@ impl WafPlugin {
             if clearance_valid(clearance_cookie(&request_data.headers), host) {
                 return RequestPluginResult::Continue;
             }
-            build_challenge_response(
+            let outcome = mint_challenge(MintRequest {
                 request_id,
                 original_url,
-                host,
-                pow_difficulty,
-                ChallengeKind::Js,
-            )
+                site_id: host,
+                client_ip: &request_data.client_ip,
+                user_agent: request_user_agent(&request_data.headers),
+                // The WAF keeps no per-IP request window, so this mint
+                // carries failure pressure only.
+                request_rate: 0,
+                kind: ChallengeKind::Js,
+                fallback: mint_fallback,
+                fallback_rate_threshold: u32::MAX,
+            });
+            let challenged = outcome.is_challenge();
+            (outcome.into_response(), challenged)
         } else {
-            block_page(request_id, &verdict.details)
+            (block_page(request_id, &verdict.details), false)
         };
-        let response = stamp_mitigated(response, denial.challenge);
+        let response = stamp_mitigated(response, challenged);
         emit_generated_access(agent, request_id, &response);
         RequestPluginResult::Respond(response)
     }
@@ -4545,7 +4588,7 @@ impl WafPlugin {
             &rule_name,
             Self::engine_event_type(&verdict),
         );
-        let response = if verdict.action == WafAction::Block {
+        let (response, challenged) = if verdict.action == WafAction::Block {
             // Auto-block the client for a grace window: repeat requests are
             // refused at the edge (see the entry check above) instead of
             // running the engine every time.
@@ -4557,7 +4600,7 @@ impl WafPlugin {
                     &format!("waf: {rule_name}"),
                 );
             }
-            block_page(request_id, &verdict.details)
+            (block_page(request_id, &verdict.details), false)
         } else {
             if skip_challenge {
                 // The path exception exempts this request from challenges.
@@ -4578,24 +4621,31 @@ impl WafPlugin {
                 }
                 return VerdictOutcome::Continue;
             }
-            // Challenge verdict — delegate to the challenge subsystem.
+            // Challenge verdict — delegate to the challenge subsystem through
+            // the same guarded mint the CC gate uses, so the site's
+            // difficulty and per-IP issuance budget apply here too.
             let original_url = if request_data.query.is_empty() {
                 request_data.path.clone()
             } else {
                 format!("{}?{}", request_data.path, request_data.query)
             };
-            build_challenge_response(
+            let outcome = mint_challenge(MintRequest {
                 request_id,
-                &original_url,
-                host,
-                self.pow_difficulty,
-                ChallengeKind::Js,
-            )
+                original_url: &original_url,
+                site_id: host,
+                client_ip: &request_data.client_ip,
+                user_agent: request_user_agent(&request_data.headers),
+                request_rate: 0,
+                kind: ChallengeKind::Js,
+                fallback: self.mint_fallback,
+                fallback_rate_threshold: u32::MAX,
+            });
+            let challenged = outcome.is_challenge();
+            (outcome.into_response(), challenged)
         };
         // D26: an upstream 403 and a WAF block share the status code; the
         // marker is what makes the origin of the response unambiguous.
-        let response =
-            stamp_mitigated(response, verdict.action == WafAction::Challenge);
+        let response = stamp_mitigated(response, challenged);
         // The access entry is emitted here, before `handle_request` gets the
         // Respond outcome: fill the request facts first.
         backfill_pending_facts(request_id, request_data);
@@ -4657,6 +4707,27 @@ impl TryFrom<&PluginConf> for WafPlugin {
                 .clamp(1, 8 * 1024 * 1024) as usize;
         let pow_difficulty =
             get_int_conf_or_default(value, "pow_difficulty", 20) as u32;
+        // A rule/access/rate-limit challenge is minted through the same
+        // guarded path as the CC gate; these are the fallbacks for a site
+        // without challenge settings (standalone mode). `pow_max_difficulty`
+        // defaults to the documented adaptive ceiling, so pinning the
+        // difficulty means setting it equal to `pow_difficulty`.
+        let mint_fallback = ChallengeLimits::standalone(
+            pow_difficulty,
+            get_int_conf_or_default(
+                value,
+                "pow_max_difficulty",
+                i64::from(pingwaf_challenge::DEFAULT_MAX_DIFFICULTY),
+            )
+            .clamp(0, i64::from(u32::MAX)) as u32,
+            get_int_conf_or_default(
+                value,
+                "pow_issue_limit_per_min",
+                i64::from(DEFAULT_ISSUE_LIMIT_PER_MIN),
+            )
+            .clamp(0, i64::from(u32::MAX)) as u32,
+            DEFAULT_VERIFY_LIMIT_PER_MIN,
+        );
         // Mirrors the site's `downstream_read_timeout`: withheld bodies are
         // released once the client stops making progress. Hard-capped at
         // 30s; unset means 30s.
@@ -4727,7 +4798,7 @@ impl TryFrom<&PluginConf> for WafPlugin {
             ml_threshold,
             inspect_body,
             max_body_size,
-            pow_difficulty,
+            mint_fallback,
             body_stage_timeout,
             body_stage_policy,
             encoded_body_policy,
@@ -4896,6 +4967,15 @@ impl Plugin for WafPlugin {
         } else {
             None
         };
+        // AS number of the client, for the same consumer: the traffic pages
+        // rank networks by request count, and the control plane cannot
+        // resolve a name without the number. Resolved here (not per log line)
+        // so the pending entry carries it into every response path.
+        let asn = if agent.is_some() {
+            client_addr.and_then(lookup_asn_addr)
+        } else {
+            None
+        };
 
         // ── Full-request log capture and body inspection moved to the
         // request-body filter: body bytes are no longer read here. Reading
@@ -4988,6 +5068,7 @@ impl Plugin for WafPlugin {
                         .unwrap_or_default()
                         .to_string(),
                     country_code: String::new(),
+                    asn: asn.unwrap_or(0),
                     // Backfilled by the OIDC plugin
                     // (`amend_pending_access_identity`) once it has validated
                     // a session: this entry is built during the request phase,
@@ -5211,7 +5292,7 @@ impl Plugin for WafPlugin {
                         &request_data,
                         denial,
                         &original_url,
-                        self.pow_difficulty,
+                        self.mint_fallback,
                         bypasses("challenge"),
                         "ip_geo",
                     ));
@@ -5331,7 +5412,7 @@ impl Plugin for WafPlugin {
                             &request_data,
                             &denial,
                             &original_url,
-                            self.pow_difficulty,
+                            self.mint_fallback,
                             bypasses("challenge"),
                             "ai_bot",
                         ));
@@ -5377,7 +5458,7 @@ impl Plugin for WafPlugin {
                             &request_data,
                             &denial,
                             &original_url,
-                            self.pow_difficulty,
+                            self.mint_fallback,
                             bypasses("challenge"),
                             "bot",
                         ));
@@ -5511,13 +5592,27 @@ impl Plugin for WafPlugin {
                         );
                     }
                     let response = if tripped.challenge {
-                        build_challenge_response(
-                            &request_id,
-                            &original_url,
-                            &host,
-                            self.pow_difficulty,
-                            ChallengeKind::Js,
-                        )
+                        // A rate-limit rule that answers with a challenge
+                        // mints it through the same guarded path as the CC
+                        // gate: the site's difficulty and the shared per-IP
+                        // issuance budget apply, and the page is stamped as a
+                        // challenge (or as a rate limit when the budget
+                        // refuses it).
+                        let outcome = mint_challenge(MintRequest {
+                            request_id: &request_id,
+                            original_url: &original_url,
+                            site_id: &host,
+                            client_ip: &request_data.client_ip,
+                            user_agent: request_user_agent(
+                                &request_data.headers,
+                            ),
+                            request_rate: 0,
+                            kind: ChallengeKind::Js,
+                            fallback: self.mint_fallback,
+                            fallback_rate_threshold: u32::MAX,
+                        });
+                        let challenged = outcome.is_challenge();
+                        stamp_mitigated(outcome.into_response(), challenged)
                     } else {
                         rate_limit_page(
                             &request_id,
@@ -6547,7 +6642,7 @@ ml_threshold = 0.75
             site_id: "site-1".into(),
             domain: "example.com".into(),
             alternate_domains: Vec::new(),
-            status: pingwaf_agent::cache::site_status::ACTIVE.into(),
+            status: pingwaf_agent::cache::SiteStatus::Active,
             downstream_timeout_secs: 60,
             waf_config: waf,
             rate_limit_rules: Vec::new(),
@@ -6575,6 +6670,17 @@ ml_threshold = 0.75
             oidc: None,
             path_exceptions: Vec::new(),
         }
+    }
+
+    /// Guards a standalone WAF plugin would use for a mint, with the
+    /// difficulty pinned at `base` so a test can assert what the page says.
+    fn test_mint_fallback(base: u32) -> ChallengeLimits {
+        ChallengeLimits::standalone(
+            base,
+            base,
+            DEFAULT_ISSUE_LIMIT_PER_MIN,
+            DEFAULT_VERIFY_LIMIT_PER_MIN,
+        )
     }
 
     fn probe(query: &str) -> RequestData {
@@ -7972,6 +8078,7 @@ inspect_body = true"###,
                 referer: "ref".to_string(),
                 tls_version: String::new(),
                 country_code: String::new(),
+                asn: 0,
                 user_identity: String::new(),
                 request_headers: Vec::new(),
                 request_body: None,
@@ -9352,6 +9459,34 @@ inspect_body = true"###,
         );
     }
 
+    /// The client's AS number survives the hop from the pending entry to the
+    /// shipped log entry.
+    ///
+    /// Regression: the protocol field (`LogEntry.asn`) and the Elasticsearch
+    /// document both carried an ASN, but `AccessLogEntry` had no field for it
+    /// and the agent hardcoded 0, so the control plane's ASN column could
+    /// never be populated and the traffic pages had no networks to rank.
+    ///
+    /// The lookup itself is not asserted here on purpose: the embedded GeoIP
+    /// snapshot the edge ships carries country ranges only, so a real address
+    /// currently resolves to "unknown" (0). What must not regress is the
+    /// pass-through — a resolved number has to reach the wire.
+    #[tokio::test]
+    async fn test_access_log_carries_the_client_asn() {
+        let (_guard, agent, _dir) = install_test_agent().await;
+        let mut pending = skip_pending("/whoami", false);
+        pending.asn = 15_169; // AS15169, Google LLC
+        emit_access(&agent, "req-asn", pending, ResponseFacts::generated(200));
+
+        let entry = agent.client.pop_log().await.unwrap();
+        assert_eq!("req-asn", entry.request_id);
+        assert_eq!(
+            15_169, entry.asn,
+            "the ASN must reach the shipped entry, not be dropped in the \
+             agent's conversion"
+        );
+    }
+
     #[test]
     fn cap_headers_limits_size_and_count() {
         let headers: Vec<(String, String)> = (0..100)
@@ -10718,6 +10853,51 @@ inspect_body = true"###,
         assert_ne!(key(&mixed), key(&empty));
     }
 
+    /// HTTP/2 clients may split the cookie jar over several `Cookie` fields
+    /// (RFC 9113 §8.2.3, exercised by Chromium). Both the cookie map and the
+    /// clearance extractor used to read only the first field, so a valid
+    /// clearance placed after the split point was invisible and every request
+    /// was challenged again (2026-11-24, issue #108).
+    #[test]
+    fn cookies_are_read_from_every_cookie_field() {
+        let headers = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<(String, String)>>()
+        };
+
+        let split = headers(&[
+            ("cookie", "app_id=12345; preferences=A=1|B=1"),
+            ("cookie", "session_id=98765"),
+            ("cookie", "__pingwaf_clearance=signed-token"),
+        ]);
+        let names: Vec<String> = parse_cookies(&split)
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["app_id", "preferences", "session_id", "__pingwaf_clearance"]
+        );
+        assert_eq!(clearance_cookie(&split).as_deref(), Some("signed-token"));
+
+        // The layout must not matter: one joined field and a clearance in the
+        // first field both resolve to the same value.
+        let joined =
+            headers(&[("Cookie", "app_id=1; __pingwaf_clearance=t; b=2")]);
+        assert_eq!(clearance_cookie(&joined).as_deref(), Some("t"));
+        let first = headers(&[
+            ("Cookie", "__pingwaf_clearance=t2"),
+            ("cookie", "app_id=1"),
+        ]);
+        assert_eq!(clearance_cookie(&first).as_deref(), Some("t2"));
+
+        // No clearance anywhere stays None instead of matching something else.
+        let none = headers(&[("cookie", "app_id=1"), ("cookie", "b=2")]);
+        assert_eq!(clearance_cookie(&none), None);
+    }
+
     /// The key is a digest, so what it must not lose is the boundary between
     /// the parts and the rule they belong to.
     #[test]
@@ -11147,6 +11327,7 @@ inspect_body = true"###,
             referer: String::new(),
             tls_version: String::new(),
             country_code: String::new(),
+            asn: 0,
             user_identity: String::new(),
             request_headers: Vec::new(),
             request_body: None,
@@ -11507,7 +11688,7 @@ inspect_body = true"###,
             &request,
             &denial,
             "/x",
-            4,
+            test_mint_fallback(4),
             true,
             "ip_geo",
         );
@@ -11523,7 +11704,7 @@ inspect_body = true"###,
             &request,
             &denial,
             "/x",
-            4,
+            test_mint_fallback(4),
             false,
             "ip_geo",
         );
@@ -11543,11 +11724,106 @@ inspect_body = true"###,
             &request,
             &block,
             "/x",
-            4,
+            test_mint_fallback(4),
             true,
             "ip_geo",
         );
         assert!(matches!(blocked, RequestPluginResult::Respond(_)));
+    }
+
+    /// Reads one response header value, case-insensitively.
+    fn response_header(resp: &HttpResponse, name: &str) -> Option<String> {
+        resp.headers
+            .as_ref()?
+            .iter()
+            .find(|(n, _)| n.as_str() == name)
+            .map(|(_, v)| v.to_str().unwrap_or_default().to_string())
+    }
+
+    /// Regression (R2): a challenge minted by a WAF rule / access verdict goes
+    /// through the same guarded path as the CC gate.
+    ///
+    /// It used to be built with the plugin's static `pow_difficulty`, which no
+    /// site configures and which no per-IP budget covered — so a rule
+    /// challenge ignored the site's difficulty and could be minted without
+    /// limit. The mint must now use the site's base difficulty, record that
+    /// difficulty for verification, and cost the shared issuance budget.
+    #[tokio::test]
+    async fn waf_challenge_verdicts_share_the_site_difficulty_and_budget() {
+        let (_guard, _agent, _dir) =
+            crate::challenge::tests::install_challenge_agent(Some(
+                crate::challenge::tests::site_challenge_config(1, 300, 6, 6),
+            ))
+            .await;
+        let denial = Denial {
+            rule_id: "ip1".to_string(),
+            rule_name: "IP rule".to_string(),
+            detail: "client ip matched challenge rule".to_string(),
+            challenge: true,
+            basic_auth: false,
+        };
+        let mut request = probe("");
+        // A client no other test uses: the guards are process-wide.
+        request.client_ip = "198.51.100.21".to_string();
+        // A fallback that would mint difficulty 20: the site's 6 must win.
+        let fallback = test_mint_fallback(20);
+
+        let first = WafPlugin::deny_request(
+            None,
+            "site-1",
+            "req-waf-mint-1",
+            "example.com",
+            &request,
+            &denial,
+            "/x",
+            fallback,
+            false,
+            "ip_geo",
+        );
+        let RequestPluginResult::Respond(resp) = first else {
+            panic!("a challenge denial must answer");
+        };
+        assert_eq!(http::StatusCode::SERVICE_UNAVAILABLE, resp.status);
+        let body = String::from_utf8_lossy(&resp.body).to_string();
+        assert!(
+            body.contains("difficulty: 6"),
+            "the site's base difficulty must be used: {body}"
+        );
+        assert_eq!(
+            Some("challenge".to_string()),
+            response_header(&resp, "x-pingwaf-mitigated")
+        );
+        // The page states the difficulty the verifier will demand.
+        let pending = crate::challenge::peek_pending("req-waf-mint-1")
+            .expect("the WAF mint must register a pending challenge");
+        assert_eq!(6, pending.difficulty);
+
+        // The shared budget refuses the next page for the same client: a rule
+        // challenge cannot be used to bypass the per-IP limit.
+        let second = WafPlugin::deny_request(
+            None,
+            "site-1",
+            "req-waf-mint-2",
+            "example.com",
+            &request,
+            &denial,
+            "/x",
+            fallback,
+            false,
+            "ip_geo",
+        );
+        let RequestPluginResult::Respond(resp) = second else {
+            panic!("over the budget the WAF must answer");
+        };
+        assert_eq!(http::StatusCode::TOO_MANY_REQUESTS, resp.status);
+        assert_eq!(
+            Some("block".to_string()),
+            response_header(&resp, "x-pingwaf-mitigated")
+        );
+        assert!(
+            crate::challenge::peek_pending("req-waf-mint-2").is_none(),
+            "a refused page must not leave a pending challenge"
+        );
     }
 
     #[test]

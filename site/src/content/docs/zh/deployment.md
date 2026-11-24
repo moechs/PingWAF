@@ -17,7 +17,7 @@ minutes: 10
 | `9080` | REST API + 控制台 | 使用自签证书提供 HTTPS，直到你替换它；请保持私有 |
 | `9090` | gRPC 控制面 | Agent 在此连接；默认 TLS，`grpc_tls_mode = "off"` 会降级为明文 |
 | `80` | 代理流量 | 创建首个站点后开始绑定 |
-| `443` | 代理流量 | 证书签发或上传后才开放 |
+| `443` | 代理流量 | 创建首个站点后开始绑定；新站点会自动签发自签名证书 |
 
 `GET /healthz` 在 HTTP 与 HTTPS 下都会响应，适合作为 compose 健康检查与负载均衡探针；其余路径一律跳转 HTTPS。
 
@@ -69,7 +69,7 @@ curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh -
 curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh | bash -s -- --mode all-in-one
 ```
 
-参数：`--mode all-in-one|server|agent`，`--no-systemd` 跳过单元安装，`--admin-email` / `--admin-password` / `--tls-sans`（或对应的 `PINGWAF_*` 环境变量）免提问写入初始设置，`--dry-run` 只预览安装计划不做改动。
+Agent 模式下安装器会下载仅数据面的归档（`pingwaf-agent-<os>-<arch>`，不含 PostgreSQL、REST API 与控制台），并以 `/usr/local/bin/pingwaf` 名称安装，单元与命令保持不变。生成的单元还会根据内存上限固定 mimalloc 的第一个 arena（小于 1 GiB 用 64 MiB，小于 4 GiB 用 256 MiB，不超过 16 GiB 用 512 MiB，否则 1 GiB；仅 4 GiB 及以上开启 eager commit），因为 mimalloc 在运行时设置该选项之前就已创建 arena。参数：`--mode all-in-one|server|agent`，`--no-systemd` 跳过单元安装，`--admin-email` / `--admin-password` / `--tls-sans`（或对应的 `PINGWAF_*` 环境变量）免提问写入初始设置，`--dry-run` 只预览安装计划不做改动。
 
 ## 配置优先级
 
@@ -95,9 +95,15 @@ pingwaf agent
 
 纳管密钥在控制台创建（`POST /api/v1/agents/enroll` 会返回安装命令）。空的 `PINGWAF_API_KEY` 只在 all-in-one 模式的回环自动注册中有效。
 
+当前 agent **未绑定站点**：会收到 API key 属主的全部站点，而不是单个站点；控制面自身的控制台站点（通常上游 `127.0.0.1:9080`）也会下发，在边缘节点上该回环地址没有控制台，站点会 502。尚无按节点绑定站点的 API，部署边缘时应使用专用控制面，或删除边缘不应运行的站点。
+
+如果控制面是 ACME 签发者，需 **0.32.40+** 才会把内嵌数据面签发的 PEM 同步并推送给 agent。旧控制面只下发 `acme_email`、没有 PEM，每个 agent 会自己发起 HTTP-01，验证请求落到控制面而不是 agent，最终 `acme_failed`。暂不能升级控制面时，可在 agent 单元设置 `PINGAP_DISABLE_ACME=true` 停止重试，并改用上传证书。安装器会把 `--server-ca-cert` 复制到 `/etc/pingwaf/grpc-ca.pem`，控制台生成的命令不含 CA / `--server-tls-name`，自签控制面需手动补上。
+
 ## systemd
 
 仓库自带的 `pingwaf.service` 以 `pingwaf` 用户运行，设置 `Restart=always`、`LimitNOFILE=65536`、`ProtectSystem=strict`，只允许写入 `/var/lib/pingwaf` 与 `/etc/pingwaf`。没有 reload 信号：配置变更由控制面应用，二进制或单元变更需要 `systemctl restart pingwaf`。
+
+手动 tarball 安装时，`pingwaf.service` 与 `pingwaf.toml` 位于 `pingwaf-linux-<arch>/` 子目录。unit 已设置 `WorkingDirectory=/var/lib/pingwaf`，相对 `cache_dir` 才能持久化；否则 `ProtectSystem=strict` 会让缓存只读。数据库变量是 `PINGWAF_DB_URL`（不是 `PINGWAF_DATABASE_URL`）；首次启动前设置 `PINGWAF_SECRET_KEY` 和管理员口令；小于 4 GiB 的主机需固定 `MIMALLOC_ARENA_RESERVE`。把已有 agent 主机切换为 all-in-one 前，先移走 `/var/lib/pingwaf/cache`，因为 fail-open 快照可能包含另一个控制面的站点与证书。
 
 ## 控制面 TLS
 

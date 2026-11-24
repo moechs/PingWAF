@@ -11,12 +11,16 @@
 # Options:
 #   --version         Install a specific version (default: latest)
 #   --mode            Operating mode: all-in-one, server, agent (default: all-in-one)
+#                     Agent mode installs the agent-only build (no control plane
+#                     or dashboard) as /usr/local/bin/pingwaf
 #   --server-url      Control plane gRPC URL (agent mode)
 #   --api-key         Agent enrollment token (agent mode)
 #   --admin-email     Seed administrator e-mail (server / all-in-one)
 #   --admin-password  Seed administrator password (omit to generate a random one)
 #   --tls-sans        Comma separated names of the dashboard certificate
-#   --listen-public   Bind the admin API and gRPC on 0.0.0.0 instead of 127.0.0.1
+#   --listen-public   Also bind the agent gRPC endpoint on 0.0.0.0 (the admin
+#                     API already listens on every interface; gRPC defaults to
+#                     127.0.0.1 and only remote agents need it opened)
 #   --no-systemd      Skip systemd service creation
 #   --interactive     Prompt even when the flags would normally skip the questions
 #   --non-interactive Run with the given values and defaults, never prompt
@@ -173,7 +177,17 @@ is_loopback_host() {
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 REPO="shuaiZend/PingWAF"
+# Name the binary is installed under. It stays `pingwaf` in every mode so the
+# systemd unit, the config path and an in-place upgrade keep working; what
+# changes is which release asset is downloaded (see ASSET_PREFIX below).
 BINARY_NAME="pingwaf"
+# Release asset/binary name. Agent mode prefers the agent-only build, which
+# links the data plane without the control plane (PostgreSQL, REST API, the
+# embedded dashboard); server/all-in-one keep the full binary.
+ASSET_PREFIX="pingwaf"
+ARCHIVE_BINARY="pingwaf"
+# True once the agent-only archive was actually fetched (not the fallback).
+AGENT_ONLY_BUILD=false
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/pingwaf"
 DATA_DIR="/var/lib/pingwaf"
@@ -225,7 +239,10 @@ Pass options through the pipe with: bash -s -- <options>
 
 Options:
   --version VERSION        Install a specific version (default: latest release)
-  --mode MODE              Operating mode: all-in-one, server, agent
+  --mode MODE              Operating mode: all-in-one, server, agent.
+                           Agent mode downloads the agent-only build
+                           (pingwaf-agent) and installs it as
+                           /usr/local/bin/pingwaf.
   --server-url URL         Control plane gRPC URL (agent mode)
   --server-ca-cert PATH    PEM file with the CA that signed the control plane's
                            gRPC certificate (agent mode, https)
@@ -239,10 +256,11 @@ Options:
                            PINGWAF_ADMIN_PASSWORD) a random password is
                            generated and printed exactly once at the end.
   --tls-sans NAMES         Comma separated dashboard certificate names
-  --listen-public          Bind the dashboard/REST API (9080) and the agent
-                           gRPC endpoint (9090) on 0.0.0.0. The default is
-                           127.0.0.1: expose them only through a reverse proxy
-                           or after changing the administrator password.
+  --listen-public          Also bind the agent gRPC endpoint (9090) on
+                           0.0.0.0. The dashboard/REST API (9080) already
+                           listens on every interface; gRPC stays on
+                           127.0.0.1 unless this is given, and only remote
+                           agents need it.
   --no-systemd             Skip systemd service file creation
   --interactive            Ask the questions even when options were given
   --non-interactive, --yes Never prompt; use the given values and defaults
@@ -456,6 +474,90 @@ systemd_env() { # $1 variable name, $2 value -> Environment="NAME=value"
     printf 'Environment="%s=%s"' "$1" "$value"
 }
 
+# ─── mimalloc arena sizing ────────────────────────────────────────────────────
+# mimalloc creates its first arena at load time, before `allocator_tune::apply()`
+# can call `mi_option_set`; an arena that already exists cannot be shrunk. On a
+# small host the default 1 GiB reserve is therefore what the process keeps (and
+# what `pmap` shows), even though the startup log prints the adaptive value.
+# The unit must carry the reserve in its **process environment**, which mimalloc
+# parses in `_mi_options_init` before the first arena.
+#
+# The buckets mirror `src/allocator_tune.rs` (`arena_reserve_for` /
+# `eager_commit_for`) and use the same memory ceiling: cgroup v2 limit, then
+# cgroup v1, then host `MemTotal`. Unknown/failed detection takes the small-host
+# bucket (64 MiB, eager commit off), the safe direction.
+detect_memory_ceiling_bytes() {
+    local raw=""
+
+    # cgroup v2: "max" means no limit; fall through to the host total.
+    if [[ -r /sys/fs/cgroup/memory.max ]]; then
+        raw="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+        if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw > 0 )); then
+            printf '%s' "$raw"
+            return 0
+        fi
+    fi
+
+    # cgroup v1: "infinity" is the huge sentinel, not a real limit.
+    if [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+        raw="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true)"
+        if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw > 0 && raw < 1152921504606846976 )); then
+            printf '%s' "$raw"
+            return 0
+        fi
+    fi
+
+    # Host total. `MemAvailable` is deliberately not used here: it fluctuates
+    # with the install-time workload, while the arena is a virtual reserve that
+    # should follow the same ceiling `allocator_tune` reads at runtime.
+    if [[ -r /proc/meminfo ]]; then
+        local kb
+        kb="$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+        if [[ "$kb" =~ ^[0-9]+$ ]] && (( kb > 0 )); then
+            printf '%s' "$((kb * 1024))"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# 64 MiB below 1 GiB, 256 MiB below 4 GiB, 512 MiB up to 16 GiB, else 1 GiB.
+allocator_arena_reserve_for() {
+    local total="${1:-0}" mib
+    mib=$(( total / 1048576 ))
+    if (( mib < 1024 )); then
+        printf '%s' "$((64 * 1024 * 1024))"
+    elif (( mib < 4096 )); then
+        printf '%s' "$((256 * 1024 * 1024))"
+    elif (( mib < 16384 )); then
+        printf '%s' "$((512 * 1024 * 1024))"
+    else
+        printf '%s' "$((1024 * 1024 * 1024))"
+    fi
+}
+
+# Eager commit is only worth it when the ceiling is at least 4 GiB; below that
+# the reservation must not be committed up front.
+allocator_eager_commit_for() {
+    local total="${1:-0}"
+    if (( total / 1048576 >= 4096 )); then
+        printf '1'
+    else
+        printf '0'
+    fi
+}
+
+# Two `Environment=` lines for the unit, computed from the same ceiling.
+allocator_env_lines() {
+    local ceiling reserve eager
+    ceiling="$(detect_memory_ceiling_bytes || true)"
+    reserve="$(allocator_arena_reserve_for "$ceiling")"
+    eager="$(allocator_eager_commit_for "$ceiling")"
+    printf '%s\n' "$(systemd_env MIMALLOC_ARENA_RESERVE "$reserve")"
+    printf '%s\n' "$(systemd_env MIMALLOC_ARENA_EAGER_COMMIT "$eager")"
+}
+
 validate_install_values() {
     reject_control_chars "mode" "$MODE"
     reject_control_chars "--version" "$VERSION"
@@ -502,6 +604,17 @@ mask_db_url() {
     printf '%s' "$1" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/]*@#\1***@#'
 }
 
+# The release asset to fetch for a mode: agent mode has its own build, the
+# other modes share the full binary. Kept as a function so the dry-run summary
+# (which runs before the final mode validation) and the download agree.
+asset_prefix() {
+    if [[ "${1:-}" == "agent" ]]; then
+        printf 'pingwaf-agent'
+    else
+        printf 'pingwaf'
+    fi
+}
+
 print_plan_summary() {
     local systemd_state="no"
     local password_state="random (generated at install, printed once)"
@@ -527,21 +640,35 @@ print_plan_summary() {
         echo "  platform:    ${PLATFORM}"
     fi
     echo "  binary:      ${INSTALL_DIR}/${BINARY_NAME}"
+    if [[ -n "${PLATFORM:-}" ]]; then
+        echo "  asset:       $(asset_prefix "${MODE:-all-in-one}")-${OS}-${ARCH}.tar.xz"
+    fi
+    if [[ "${OS:-}" == "linux" ]]; then
+        local mem_ceiling mem_reserve mem_eager
+        mem_ceiling="$(detect_memory_ceiling_bytes || true)"
+        mem_reserve="$(allocator_arena_reserve_for "$mem_ceiling")"
+        mem_eager="$(allocator_eager_commit_for "$mem_ceiling")"
+        echo "  malloc:      arena_reserve=$((mem_reserve / 1048576))MiB eager_commit=${mem_eager} (ceiling=$(( ${mem_ceiling:-0} / 1048576 ))MiB)"
+    fi
     echo "  config:      ${CONFIG_DIR}/pingwaf.toml"
     echo "  data:        ${DATA_DIR}"
     echo "  systemd:     ${systemd_state}"
     if [[ "${MODE:-all-in-one}" == "agent" ]]; then
         echo "  control:     ${SERVER_URL}"
-        echo "  control CA:  ${SERVER_CA_CERT:-none (bundled webpki roots)}"
+        if [[ -n "$SERVER_CA_CERT" ]]; then
+            echo "  control CA:  ${SERVER_CA_CERT} -> ${CONFIG_DIR}/grpc-ca.pem"
+        else
+            echo "  control CA:  none (bundled webpki roots)"
+        fi
         echo "  tls name:    ${SERVER_TLS_NAME:-URL host}"
         echo "  api key:     ${api_key_state}"
     else
         echo "  database:    $(mask_db_url "${DB_URL:-postgres://pingwaf:pingwaf@localhost:5432/pingwaf}")"
         echo "  admin:       ${ADMIN_EMAIL:-admin@pingwaf.local} (password: ${password_state})"
         if [[ "$LISTEN_PUBLIC" == "true" ]]; then
-            echo "  listen:      0.0.0.0:9080 (admin) / 0.0.0.0:9090 (gRPC) — change the admin password before exposing"
+            echo "  listen:      0.0.0.0:9080 (admin) / 0.0.0.0:9090 (gRPC) — restrict 9080 to the admin network"
         else
-            echo "  listen:      127.0.0.1:9080 (admin) / 127.0.0.1:9090 (gRPC) — loopback only"
+            echo "  listen:      0.0.0.0:9080 (admin) / 127.0.0.1:9090 (gRPC) — gRPC loopback until --listen-public"
         fi
         echo "  tls sans:    ${TLS_SANS:-none (the generated certificate covers the hostname used to reach it)}"
     fi
@@ -630,6 +757,11 @@ case "$MODE" in
     all-in-one|server|agent) ;;
     *) fatal "Invalid mode: $MODE (must be: all-in-one, server, agent)" ;;
 esac
+
+# Agent mode installs the data-plane-only build; the binary keeps the name
+# `pingwaf` on disk so the unit and upgrade path do not change.
+ASSET_PREFIX="$(asset_prefix "$MODE")"
+ARCHIVE_BINARY="$ASSET_PREFIX"
 
 validate_install_values
 
@@ -765,7 +897,7 @@ verify_checksum() {
 # Rejects an archive that would write outside the temp directory (absolute
 # paths, `..` components) or that is not the expected single release directory.
 verify_archive_members() {
-    local archive="$1" list="${TMPDIR}/members.txt" prefix="pingwaf-${OS}-${ARCH}/"
+    local archive="$1" list="${TMPDIR}/members.txt" prefix="${ASSET_PREFIX}-${OS}-${ARCH}/"
     case "$archive" in
         *.tar.xz) tar -tJf "$archive" > "$list" ;;
         *.tar.gz) tar -tzf "$archive" > "$list" ;;
@@ -783,49 +915,66 @@ verify_archive_members() {
 }
 
 fetch_asset() {
-    local ext url checksum_url expected downloaded
-    for ext in tar.xz tar.gz; do
-        if [[ "$ext" == "tar.xz" ]] && ! has xz; then
-            info "xz(1) not found — falling back to the .tar.gz asset."
-            continue
-        fi
-        ASSET_NAME="pingwaf-${OS}-${ARCH}.${ext}"
-        url="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}"
-        checksum_url="${url}.sha256"
-        info "Downloading ${ASSET_NAME}..."
-        info "URL: ${url}"
-        downloaded=false
-        if has curl; then
-            if curl -fsSL --proto '=https' "$url" -o "${TMPDIR}/${ASSET_NAME}" \
-                && curl -fsSL --proto '=https' "$checksum_url" -o "${TMPDIR}/${ASSET_NAME}.sha256"; then
-                downloaded=true
+    local ext url checksum_url expected downloaded prefix
+    # Agent mode prefers the agent-only archive. Releases before it existed
+    # only shipped the full binary, so a pinned old version falls back to that
+    # (and says so): `--mode agent --version <old>` keeps working.
+    local prefixes=("$ASSET_PREFIX")
+    if [[ "$MODE" == "agent" && "$ASSET_PREFIX" != "pingwaf" ]]; then
+        prefixes+=("pingwaf")
+    fi
+    for prefix in "${prefixes[@]}"; do
+        for ext in tar.xz tar.gz; do
+            if [[ "$ext" == "tar.xz" ]] && ! has xz; then
+                info "xz(1) not found — falling back to the .tar.gz asset."
+                continue
             fi
-        elif has wget; then
-            if wget -q "$url" -O "${TMPDIR}/${ASSET_NAME}" \
-                && wget -q "$checksum_url" -O "${TMPDIR}/${ASSET_NAME}.sha256"; then
-                downloaded=true
+            ASSET_NAME="${prefix}-${OS}-${ARCH}.${ext}"
+            url="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}"
+            checksum_url="${url}.sha256"
+            info "Downloading ${ASSET_NAME}..."
+            info "URL: ${url}"
+            downloaded=false
+            if has curl; then
+                if curl -fsSL --proto '=https' "$url" -o "${TMPDIR}/${ASSET_NAME}" \
+                    && curl -fsSL --proto '=https' "$checksum_url" -o "${TMPDIR}/${ASSET_NAME}.sha256"; then
+                    downloaded=true
+                fi
+            elif has wget; then
+                if wget -q "$url" -O "${TMPDIR}/${ASSET_NAME}" \
+                    && wget -q "$checksum_url" -O "${TMPDIR}/${ASSET_NAME}.sha256"; then
+                    downloaded=true
+                fi
+            else
+                fatal "Neither curl nor wget found. Please install one of them."
             fi
-        else
-            fatal "Neither curl nor wget found. Please install one of them."
-        fi
-        if [[ "$downloaded" != "true" ]]; then
-            warn "Download failed for ${ASSET_NAME} (asset or its .sha256) — trying the next format."
-            continue
-        fi
-        # Every release ships a .sha256 sidecar; a missing, malformed or
-        # mismatching one is fatal. Nothing is extracted or executed before
-        # this check passes.
-        expected="$(awk 'NR == 1 { print $1 }' "${TMPDIR}/${ASSET_NAME}.sha256")"
-        if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
-            fatal "The .sha256 sidecar for ${ASSET_NAME} is missing or malformed; refusing to install."
-        fi
-        if ! verify_checksum "${TMPDIR}/${ASSET_NAME}" "${TMPDIR}/${ASSET_NAME}.sha256"; then
-            fatal "Checksum mismatch for ${ASSET_NAME} (published: ${expected}). Refusing to install."
-        fi
-        success "Verified the sha256 of ${ASSET_NAME}."
-        return 0
+            if [[ "$downloaded" != "true" ]]; then
+                warn "Download failed for ${ASSET_NAME} (asset or its .sha256) — trying the next format."
+                continue
+            fi
+            # Every release ships a .sha256 sidecar; a missing, malformed or
+            # mismatching one is fatal. Nothing is extracted or executed before
+            # this check passes.
+            expected="$(awk 'NR == 1 { print $1 }' "${TMPDIR}/${ASSET_NAME}.sha256")"
+            if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+                fatal "The .sha256 sidecar for ${ASSET_NAME} is missing or malformed; refusing to install."
+            fi
+            if ! verify_checksum "${TMPDIR}/${ASSET_NAME}" "${TMPDIR}/${ASSET_NAME}.sha256"; then
+                fatal "Checksum mismatch for ${ASSET_NAME} (published: ${expected}). Refusing to install."
+            fi
+            if [[ "$prefix" != "$ASSET_PREFIX" ]]; then
+                warn "No agent-only build in v${VERSION}; falling back to the full binary (larger footprint)."
+                ASSET_PREFIX="$prefix"
+                ARCHIVE_BINARY="$prefix"
+            fi
+            if [[ "$MODE" == "agent" && "$ASSET_PREFIX" == "pingwaf-agent" ]]; then
+                AGENT_ONLY_BUILD=true
+            fi
+            success "Verified the sha256 of ${ASSET_NAME}."
+            return 0
+        done
     done
-    fatal "Download failed. Check that version v${VERSION} exists and has a pingwaf-${OS}-${ARCH} asset."
+    fatal "Download failed. Check that version v${VERSION} exists and has a ${ASSET_PREFIX}-${OS}-${ARCH} asset."
 }
 
 TMPDIR="$(mktemp -d)"
@@ -849,9 +998,9 @@ esac
 # The release archive contains exactly one binary with this name. There is no
 # "first executable" fallback: an unexpected archive layout is an error, not an
 # invitation to install an arbitrary file.
-BINARY_PATH="$(find "${TMPDIR}/pingwaf-${OS}-${ARCH}" -name "$BINARY_NAME" -type f | head -n1)"
+BINARY_PATH="$(find "${TMPDIR}/${ASSET_PREFIX}-${OS}-${ARCH}" -name "$ARCHIVE_BINARY" -type f | head -n1)"
 if [[ -z "$BINARY_PATH" ]]; then
-    fatal "Binary '${BINARY_NAME}' not found in the verified archive."
+    fatal "Binary '${ARCHIVE_BINARY}' not found in the verified archive."
 fi
 
 chmod +x "$BINARY_PATH"
@@ -866,6 +1015,17 @@ if ! "$BINARY_PATH" --version >/dev/null 2>&1; then
        Release assets are built on Ubuntu 24.04 and need glibc 2.39 or newer.
        On older distributions (CentOS/RHEL, Debian 11, Ubuntu 20.04, Alpine,
        ...) build from source instead: https://github.com/${REPO}/blob/main/docs/quick-start.md#path-2-build-from-source"
+fi
+# The agent archive must actually contain the agent-only build. The version
+# banner marks it with `edge`; a wrongly packaged (or swapped) artifact would
+# otherwise be installed silently and bring the control plane back.
+if [[ "$AGENT_ONLY_BUILD" == "true" ]]; then
+    # stdout only: the allocator's startup notice goes to stderr and would
+    # otherwise be the first line captured here.
+    agent_version="$("$BINARY_PATH" --version 2>/dev/null | head -n1 || true)"
+    if [[ "$agent_version" != *"edge"* ]]; then
+        fatal "The agent-only archive does not contain an agent-only binary: ${agent_version}"
+    fi
 fi
 
 info "Installing binary to ${INSTALL_DIR}/${BINARY_NAME}..."
@@ -928,6 +1088,36 @@ if [[ "$OS" == "linux" ]]; then
     success "Created ${CONFIG_DIR} and ${DATA_DIR}"
 fi
 
+# Copies the control-plane CA the operator pointed at into /etc/pingwaf. The
+# generated unit and [agent] table must reference a durable path: a CA kept in
+# /tmp or a release download directory disappears on the next reboot, and the
+# agent then fails every gRPC handshake with an opaque certificate error.
+install_agent_ca() {
+    [[ "$MODE" == "agent" ]] || return 0
+    [[ -n "$SERVER_CA_CERT" ]] || return 0
+
+    local dest="${CONFIG_DIR}/grpc-ca.pem"
+    if [[ "$SERVER_CA_CERT" == "$dest" ]]; then
+        return 0
+    fi
+    if [[ "$(readlink -f "$SERVER_CA_CERT" 2>/dev/null || printf '%s' "$SERVER_CA_CERT")" == \
+          "$(readlink -f "$dest" 2>/dev/null || printf '%s' "$dest")" ]]; then
+        SERVER_CA_CERT="$dest"
+        return 0
+    fi
+
+    local cmd=""
+    [[ -w "$CONFIG_DIR" ]] || cmd="sudo"
+    $cmd cp "$SERVER_CA_CERT" "$dest" || \
+        fatal "Could not copy the control-plane CA to ${dest}."
+    $cmd chmod 0644 "$dest" 2>/dev/null || true
+    $cmd chown root:pingwaf "$dest" 2>/dev/null || true
+    SERVER_CA_CERT="$dest"
+    success "Control-plane CA installed at ${dest}"
+}
+
+install_agent_ca
+
 # ─── Write Default Configuration ─────────────────────────────────────────────
 write_config() {
     local config_file="${CONFIG_DIR}/pingwaf.toml"
@@ -976,13 +1166,18 @@ write_config() {
         fi
     fi
 
-    # Loopback by default: a fresh install still has the seeded administrator
-    # account, so the API/gRPC must not be reachable from the network until the
-    # password has been changed (or the operator opts into --listen-public /
-    # puts the console behind a reverse proxy).
-    local admin_addr="127.0.0.1:9080" grpc_addr="127.0.0.1:9090"
+    # The console listens on every interface. A loopback bind made a fresh
+    # install look unreachable from the operator's browser — nothing answered on
+    # the host's address, so the install itself appeared to have failed. The
+    # exposure is acceptable because the installer generates a random
+    # administrator password and a fresh database answers every write with 403
+    # `password_change_required` until it is changed; restricting 9080 to the
+    # admin network (or fronting it with a reverse proxy) is still recommended.
+    #
+    # gRPC stays on loopback: only remote agents need it, and they are the
+    # deployment that can actually firewall it (`--listen-public` opens it).
+    local admin_addr="0.0.0.0:9080" grpc_addr="127.0.0.1:9090"
     if [[ "$LISTEN_PUBLIC" == "true" ]]; then
-        admin_addr="0.0.0.0:9080"
         grpc_addr="0.0.0.0:9090"
     fi
 
@@ -1014,8 +1209,10 @@ write_config() {
 
 [server]
 db_url = "$(toml_string "$DB_URL")"
-# Admin API + gRPC listen on loopback unless --listen-public was given; agents
-# on other hosts and remote dashboards need an explicit choice (or a proxy).
+# The console listens on every interface so a fresh install is reachable from
+# the operator's browser; restrict 9080 to your admin network or put it behind
+# a reverse proxy. gRPC (agent connections) stays on loopback unless
+# --listen-public was given, which only remote agents need.
 admin_addr = "${admin_addr}"
 grpc_addr = "${grpc_addr}"
 # gRPC control plane TLS: "tls" (default) serves agents over TLS, reusing the
@@ -1221,6 +1418,13 @@ $(systemd_env PINGWAF_SERVER_TLS_NAME "$SERVER_TLS_NAME")"
 $(systemd_env PINGWAF_TLS_ENABLED "true")"
     fi
 
+    # mimalloc parses these in `_mi_options_init`, before the first arena is
+    # created; setting them from `allocator_tune::apply()` is too late on a
+    # small host (the default 1 GiB arena cannot be shrunk). The values mirror
+    # the Rust buckets, see `allocator_env_lines`.
+    local allocator_env
+    allocator_env="$(allocator_env_lines)"
+
     info "Creating systemd service..."
 
     local cmd=""
@@ -1244,6 +1448,10 @@ Restart=always
 RestartSec=5
 LimitNOFILE=65536
 ${agent_env}
+# mimalloc's first arena is created before allocator_tune::apply(); without
+# these a small host keeps the 1 GiB default even though the startup log
+# prints the adaptive value.
+${allocator_env}
 # Log level; the default keeps sqlx's per-statement log out of the way:
 Environment=RUST_LOG=info,sqlx=warn
 # Instance secrets (PINGWAF_SECRET_KEY) live in a 0600 file; the leading dash
@@ -1286,11 +1494,40 @@ EOF
     # first boot.
     if [[ "$MODE" == "agent" ]]; then
         info "Starting the agent service..."
-        if $cmd systemctl enable --now "$SERVICE_NAME"; then
-            success "Service enabled and started: ${SERVICE_NAME}"
+        # `enable --now` does not restart an already-running unit, so an
+        # upgrade would install the new binary and keep the old process (and
+        # the old config) alive until the next manual restart. Always restart.
+        if $cmd systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 && \
+           $cmd systemctl restart "$SERVICE_NAME"; then
+            success "Service enabled and restarted: ${SERVICE_NAME}"
         else
             warn "The service did not start — inspect: journalctl -u ${SERVICE_NAME} -e"
             warn "After fixing, start it with: sudo systemctl enable --now ${SERVICE_NAME}"
+            return 1
+        fi
+
+        # An active unit is not a working node: a wrong key, URL or CA leaves
+        # the agent retrying forever while the installer still prints success.
+        # Wait for the registration line before claiming the install worked.
+        info "Waiting for the agent to register..."
+        local start_epoch registered=false
+        start_epoch=$(( $(date +%s) - 2 ))
+        for _ in $(seq 1 60); do
+            if $cmd journalctl -u "$SERVICE_NAME" -b --no-pager \
+                --since "@${start_epoch}" 2>/dev/null \
+                | grep -q "Registered with control plane"; then
+                registered=true
+                break
+            fi
+            sleep 1
+        done
+        if [[ "$registered" == "true" ]]; then
+            success "Agent registered with the control plane."
+        else
+            warn "The agent service is active but did not register within 60s."
+            warn "Check the control-plane URL, API key and CA:"
+            warn "  journalctl -u ${SERVICE_NAME} -e"
+            return 1
         fi
         return
     fi
@@ -1300,7 +1537,10 @@ EOF
     echo "  sudo systemctl status ${SERVICE_NAME}"
 }
 
-install_systemd
+if ! install_systemd; then
+    error "Installation stopped before the node was verified."
+    exit 1
+fi
 
 # The package name moves with the distribution: Ubuntu 24.04 ships
 # postgresql-16, 26.04 ships 18, Debian tracks its own numbering. Printing the
@@ -1403,12 +1643,14 @@ print_firewall_hints() {
     info "Firewall ports:"
     echo "    80/tcp   — HTTP traffic (proxied sites)"
     echo "    443/tcp  — HTTPS traffic (proxied sites)"
-    echo "    9080/tcp — Admin dashboard & REST API (HTTPS) — management network only"
-    echo "    9090/tcp — gRPC control plane (agent connections) — only if agents are remote"
+    echo "    9080/tcp — Admin dashboard & REST API (HTTPS) — open by default; restrict it to the admin network"
+    echo "    9090/tcp — gRPC control plane (agent connections) — loopback unless --listen-public"
     echo ""
-    echo "  Do NOT expose 9080/9090 before the administrator password has been"
-    echo "  changed. The generated config binds both to 127.0.0.1 by default;"
-    echo "  reinstall with --listen-public only when a proxy/remote agents need it."
+    echo "  The console binds 0.0.0.0 so a fresh install is reachable. Its"
+    echo "  administrator password is generated at install time and a fresh"
+    echo "  database refuses every write until it is changed — but restrict 9080"
+    echo "  to your admin network (or front it with a reverse proxy), and change"
+    echo "  the password at the first sign-in."
     echo ""
     if has ufw; then
         echo "  With UFW (business ports):"
@@ -1429,6 +1671,9 @@ echo "${BOLD}${GREEN}  PingWAF v${VERSION} installed successfully!${NO_COLOR}"
 echo "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════${NO_COLOR}"
 echo ""
 echo "  Binary:    ${INSTALL_DIR}/${BINARY_NAME}"
+if [[ "$AGENT_ONLY_BUILD" == "true" ]]; then
+    echo "  Build:     agent-only (data plane; no control plane, REST API or dashboard)"
+fi
 if [[ "$OS" == "linux" ]]; then
     echo "  Config:    ${CONFIG_DIR}/pingwaf.toml"
     echo "  Secrets:   ${CONFIG_DIR}/pingwaf.env (0600, holds PINGWAF_SECRET_KEY)"
@@ -1452,11 +1697,14 @@ else
     echo "  Quick start:"
     echo "    ${BINARY_NAME} ${MODE} --db-url \"${DB_URL}\""
     echo ""
-    echo "  Dashboard: https://localhost:9080  (self-signed certificate)"
+    echo "  Dashboard: https://<this-host>:9080  (self-signed certificate)"
+    echo "  Listen:    admin 0.0.0.0:9080 — restrict it to your admin network"
     if [[ "$LISTEN_PUBLIC" == "true" ]]; then
-        echo "  ${YELLOW}⚠ Admin/gRPC listen on 0.0.0.0 — change the password and restrict 9080/9090 to an admin network before exposing them.${NO_COLOR}"
+        echo "             gRPC 0.0.0.0:9090 (remote agents enabled)"
+        echo "  ${YELLOW}⚠ Both ports are open: change the administrator password and firewall 9080/9090 to the admin and agent networks.${NO_COLOR}"
     else
-        echo "  Listen:    127.0.0.1 only (admin 9080 / gRPC 9090); use --listen-public for remote agents or a dashboard proxy"
+        echo "             gRPC 127.0.0.1:9090 — add --listen-public for remote agents"
+        echo "  ${YELLOW}⚠ The console is reachable from the network: change the administrator password at the first sign-in and firewall 9080 to your admin network.${NO_COLOR}"
     fi
     if [[ "$CONFIG_PRESENT" == "true" ]]; then
         echo "  Administrator: unchanged — ${CONFIG_DIR}/pingwaf.toml was left as it was."

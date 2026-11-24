@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::api::error::ApiError;
 use crate::auth::AuthUser;
-use crate::models::{acme_challenge, agent, site};
+use crate::models::{acme_challenge, agent, agent_sites, site};
 
 /// [`axum::Json`] with API-consistent rejection bodies.
 ///
@@ -389,6 +389,14 @@ pub(crate) async fn agent_may_touch_site(
     let Some(row) = agent::Entity::find_by_id(agent_id).one(db).await? else {
         return Ok(false);
     };
+    if row.site_scope == "selected" {
+        return Ok(agent_sites::Entity::find()
+            .filter(agent_sites::Column::AgentId.eq(agent_id))
+            .filter(agent_sites::Column::SiteId.eq(site_id))
+            .one(db)
+            .await?
+            .is_some());
+    }
     match row.site_id {
         Some(bound) => Ok(bound == site_id),
         // A global agent sees every site that exists; a stale id in an agent
@@ -410,13 +418,33 @@ pub(crate) async fn purge_target_agents(
     site_id: Option<Uuid>,
 ) -> Result<Vec<agent::Model>, ApiError> {
     let condition = match site_id {
-        Some(id) => Condition::any()
-            .add(agent::Column::SiteId.eq(id))
-            .add(agent::Column::SiteId.is_null()),
+        Some(id) => {
+            let assigned: Vec<Uuid> = agent_sites::Entity::find()
+                .filter(agent_sites::Column::SiteId.eq(id))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|row| row.agent_id)
+                .collect();
+            let mut condition =
+                Condition::any().add(agent::Column::SiteId.eq(id)).add(
+                    Condition::all()
+                        .add(agent::Column::SiteId.is_null())
+                        .add(agent::Column::SiteScope.eq("all")),
+                );
+            if !assigned.is_empty() {
+                condition = condition.add(agent::Column::Id.is_in(assigned));
+            }
+            condition
+        },
         // Reserved for a future global purge: no HTTP caller passes `None`
         // today (`POST /cache/purge` requires `site_id`). Kept because a
         // global endpoint would select exactly this set.
-        None => Condition::any().add(agent::Column::SiteId.is_null()),
+        None => Condition::any().add(
+            Condition::all()
+                .add(agent::Column::SiteId.is_null())
+                .add(agent::Column::SiteScope.eq("all")),
+        ),
     };
     Ok(agent::Entity::find().filter(condition).all(db).await?)
 }

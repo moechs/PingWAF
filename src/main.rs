@@ -64,10 +64,12 @@ use pingap_upstream::new_upstream_health_check_task;
 use pingora::server;
 use pingora::server::configuration::Opt;
 use pingora::services::background::background_service;
-use process::{
-    get_admin_addr, get_start_time, new_auto_restart_service,
-    new_observer_service, set_admin_addr,
-};
+#[cfg(not(feature = "edge"))]
+use process::get_admin_addr;
+use process::{get_start_time, set_admin_addr};
+#[cfg(not(feature = "edge"))]
+use process::{new_auto_restart_service, new_observer_service};
+#[cfg(not(feature = "edge"))]
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsString;
@@ -78,6 +80,9 @@ use sysinfo::System;
 
 use tracing::{error, info, warn};
 
+// The control-plane maintenance commands are server-only: an edge-agent build
+// has no database and no admin surface, so it compiles them out entirely.
+#[cfg(not(feature = "edge"))]
 mod admin;
 #[cfg(not(feature = "dhat"))]
 mod allocator_tune;
@@ -92,6 +97,7 @@ mod process;
 mod quick_start;
 mod server_locations;
 mod upstreams;
+mod version;
 mod webhook;
 
 // Default allocator: mimalloc on every platform.
@@ -135,33 +141,11 @@ locations = ["httpLocation"]
 addrs = ["127.0.0.1:5000"]
 "###;
 
-use std::sync::LazyLock;
-
 static LOG_TARGET: &str = "main";
 
-/// The commit this binary was built from, or "unknown" when the tree had no
-/// git metadata (a source export or a crates.io tarball; see build.rs).
-pub(crate) fn git_hash() -> &'static str {
-    match env!("VERGEN_GIT_SHA") {
-        "VERGEN_IDEMPOTENT_OUTPUT" => "unknown",
-        sha => sha,
-    }
-}
-
-static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "{} ({}, tls={})",
-        env!("CARGO_PKG_VERSION"),
-        git_hash(),
-        pingap_certificate::TLS_BACKEND,
-    )
-});
-
-/// The version banner: crate version, build commit and TLS backend. Shared
-/// by `--version` and the PingWAF-mode CLI, which answers the flag itself.
-pub(crate) fn version_banner() -> &'static str {
-    &LONG_VERSION
-}
+#[cfg(not(feature = "edge"))]
+pub(crate) use version::git_hash;
+pub(crate) use version::version_banner;
 
 /// Command line arguments structure for the pingap.
 /// A reverse proxy like nginx.
@@ -171,7 +155,7 @@ pub(crate) fn version_banner() -> &'static str {
     author,
     version,
     about,
-    long_version = LONG_VERSION.as_str(),
+    long_version = version::LONG_VERSION.as_str(),
     long_about = None
 )]
 struct Args {
@@ -484,6 +468,7 @@ fn new_access_logger(
     r
 }
 
+#[cfg(not(feature = "edge"))]
 fn run_admin_node(args: Args) -> Result<(), Box<dyn Error>> {
     pingap_logger::logger_try_init(pingap_logger::LoggerParams {
         ..Default::default()
@@ -650,8 +635,17 @@ fn run() -> Result<(), Box<dyn Error>> {
     if let Some(admin) = &args.admin {
         set_admin_addr(admin);
     }
+    #[cfg(not(feature = "edge"))]
     if args.cp && args.admin.is_some() {
         return run_admin_node(args);
+    }
+    #[cfg(feature = "edge")]
+    if args.cp {
+        return Err(
+            "the agent-only edge build has no pingap admin console; use the \
+             all-in-one pingwaf binary for --cp"
+                .into(),
+        );
     }
 
     let mut sys = System::new();
@@ -961,6 +955,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut server_conf_list: Vec<ServerConf> = parse_from_conf(config.clone());
 
+    #[cfg(not(feature = "edge"))]
     if let Some(addr) = &get_admin_addr() {
         let (server_conf, _, plugin_conf) = plugin::parse_admin_plugin(addr)?;
         let path = if let Some(path) = plugin_conf.get("path") {
@@ -1146,6 +1141,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         simple_background_service.add_task("log_flush", task);
     }
 
+    // The edge build compiles the auto-restart/observer services out (they
+    // belong to the pingap-mode runtime, not to the agent); the root binary is
+    // never shipped in that configuration, so skipping the setup is fine.
+    #[cfg(not(feature = "edge"))]
     if args.autorestart || args.autoreload {
         let only_hot_reload = !args.autorestart;
         if config_manager.support_observer() {
@@ -1231,8 +1230,20 @@ fn main() {
 
     // Check if PingWAF mode is requested (via subcommand or PINGWAF_MODE env)
     if cli::is_pingwaf_mode() {
-        pingwaf::main();
-        return;
+        #[cfg(not(feature = "edge"))]
+        {
+            pingwaf::main();
+            return;
+        }
+        // `edge` builds are only ever compiled as the `pingwaf-agent` target;
+        // this arm keeps `cargo check --all-targets --features edge` honest.
+        #[cfg(feature = "edge")]
+        {
+            eprintln!(
+                "this is the agent-only edge build; use the `pingwaf-agent` binary"
+            );
+            std::process::exit(2);
+        }
     }
 
     if let Err(e) = run() {

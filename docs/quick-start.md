@@ -168,10 +168,11 @@ postgres://pingwaf:pingwaf@localhost:5432/pingwaf
 >
 > The installer generates a random administrator password (printed **once**, at
 > the end) and a `PINGWAF_SECRET_KEY` in `.env` (mode `0600`), keeps the data
-> volumes on `--force`, and publishes the console (9080) / gRPC (9090) on
-> **`127.0.0.1` only** — set `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` to
-> `0.0.0.0` only behind a reverse proxy or for remote agents, after changing the
-> administrator password.
+> volumes on `--force`, and publishes the console (9080) on **`0.0.0.0`** so it
+> is reachable right after install — restrict it with `PINGWAF_ADMIN_BIND`, a
+> firewall or a reverse proxy, and change the administrator password at the
+> first sign-in. gRPC (9090) stays on **`127.0.0.1`**; set
+> `PINGWAF_GRPC_BIND=0.0.0.0` only for remote agents.
 >
 > Use the steps below when you want to inspect or edit the compose file first.
 > The command generator on the [install page](https://www.pingwaf.com/install/) writes the same flags.
@@ -232,7 +233,7 @@ Compose variables you can set:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `POSTGRES_PASSWORD` | `pingwaf` (development fallback) | PostgreSQL password (also used to build the DSN). Set a random value for any real deployment |
-| `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` | `127.0.0.1` | Host address the console (9080) / gRPC (9090) publish on; loopback by default |
+| `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` | `0.0.0.0` / `127.0.0.1` | Host address the console (9080) / gRPC (9090) publish on. The console is reachable from the network so a fresh install is usable — restrict it, or set a specific admin IP. gRPC stays loopback until remote agents need it |
 | `JWT_SECRET` | `change-me-in-production-use-32-chars` | JWT signing secret, **32 random bytes** (`openssl rand -hex 32`; server floor 16 chars) |
 | `PINGWAF_SECRET_KEY` | unset (required for sealing) | Instance key for sealed secrets (channels, AI key, backup targets); **set 32 random bytes**, unset = clear text. The installer generates it into `.env` |
 | `ADMIN_EMAIL` | `admin@pingwaf.local` | Seeded administrator email |
@@ -469,9 +470,12 @@ docker run -d --name pingwaf-postgres \
 **Option B — local install (Debian/Ubuntu):**
 
 ```bash
-sudo apt install -y postgresql-16
-sudo -u postgres createuser pingwaf
-sudo -u postgres createdb -O pingwaf pingwaf
+# Use the distribution's default PostgreSQL package. Ubuntu 26.04 ships 18;
+# `postgresql-16` does not exist there. Anything 14+ works.
+sudo apt install -y postgresql
+# Idempotent: a reinstall or a host that already has the role/database is fine.
+sudo -u postgres createuser pingwaf 2>/dev/null || true
+sudo -u postgres createdb -O pingwaf pingwaf 2>/dev/null || true
 sudo -u postgres psql -c "ALTER USER pingwaf PASSWORD 'pingwaf';"
 ```
 
@@ -537,8 +541,11 @@ curl -sf http://localhost:9080/healthz
 The health endpoint answers on both schemes, so a plain-HTTP probe keeps
 working; everything else is served over HTTPS and redirects otherwise.
 
-Then open <https://localhost:9080> and log in with `admin@pingwaf.local` /
-the `--admin-password` you passed, or the random password the installer printed once at the end (there is no built-in default).
+Then open <https://localhost:9080> and log in with `admin@pingwaf.local`.
+For a manual install that copied the example config, the seeded password is
+`pingwaf123` unless you changed it; for an `install.sh` install it is the
+`--admin-password` you passed, or the random password printed once at the end.
+Change it before exposing the console.
 
 Stop with `Ctrl-C` in the foreground, or `kill <pid>` when backgrounded.
 
@@ -569,11 +576,12 @@ also ships a hardened unit file, [`pingwaf.service`](../pingwaf.service).
 > The installer is fail-closed: it **verifies the release `.sha256`** and aborts
 > on a missing/mismatched checksum; it **generates `PINGWAF_SECRET_KEY`** and
 > writes it to `/etc/pingwaf/pingwaf.env` (mode `0600`, read by the systemd
-> unit), keeping an existing key on upgrade. The dashboard (9080) and gRPC
-> (9090) bind to **`127.0.0.1`** by default; `--listen-public` (or
-> `PINGWAF_LISTEN_PUBLIC=1`) publishes them on `0.0.0.0` — use that only behind
-> a reverse proxy or for remote agents, and change the administrator password
-> first.
+> unit), keeping an existing key on upgrade. The dashboard (9080) binds
+> **`0.0.0.0`** so the console is reachable right after install — restrict the
+> port to your admin network (firewall or a reverse proxy) and change the
+> administrator password at the first sign-in. gRPC (9090) stays on
+> **`127.0.0.1`**; `--listen-public` (or `PINGWAF_LISTEN_PUBLIC=1`) opens it for
+> remote agents.
 >
 > On macOS there are no release binaries — build via
 > [Path 2](#path-2-build-from-source), then follow the steps below.
@@ -589,13 +597,16 @@ tar xzf pingwaf-linux-amd64.tar.gz
 sudo install -m 0755 pingwaf-linux-amd64/pingwaf /usr/local/bin/pingwaf
 # on arm64 use pingwaf-linux-arm64.tar.gz
 
-# 2. Create the service user and directories
-sudo useradd --system --home-dir /var/lib/pingwaf --shell /usr/sbin/nologin pingwaf
+# 2. Create the service user and directories (idempotent: an upgrade or a
+#    host that already ran an agent install has the user)
+id -u pingwaf >/dev/null 2>&1 || \
+  sudo useradd --system --home-dir /var/lib/pingwaf --shell /usr/sbin/nologin pingwaf
 sudo mkdir -p /var/lib/pingwaf /etc/pingwaf
 sudo chown -R pingwaf:pingwaf /var/lib/pingwaf /etc/pingwaf
 
-# 3. Install the systemd unit
-sudo cp pingwaf.service /etc/systemd/system/pingwaf.service
+# 3. Install the systemd unit (it lives inside the extracted directory, not at
+#    the top of /tmp/pingwaf-rel)
+sudo cp pingwaf-linux-amd64/pingwaf.service /etc/systemd/system/pingwaf.service
 sudo systemctl daemon-reload
 
 # 4. Provide the configuration (a file, environment, or both)
@@ -614,13 +625,41 @@ command line wins over both:
 
 ```ini
 [Service]
+WorkingDirectory=/var/lib/pingwaf
 Environment=PINGWAF_CONFIG=/etc/pingwaf/pingwaf.toml
 Environment=PINGWAF_JWT_SECRET=RANDOM_32_BYTE_HEX
+Environment=PINGWAF_ADMIN_PASSWORD=RANDOM_ADMIN_PASSWORD
 Environment=PINGWAF_ALLOW_REGISTRATION=false
 Environment=RUST_LOG=info,sqlx=warn
 # Only needed when the database is not the default pingwaf/pingwaf@localhost:5432/pingwaf
-Environment=PINGWAF_DATABASE_URL=postgres://pingwaf:CHANGE_ME@localhost:5432/pingwaf
+Environment=PINGWAF_DB_URL=postgres://pingwaf:CHANGE_ME@localhost:5432/pingwaf
+# Manual units have no memory probe; on a host below 4 GiB pin the first arena:
+# Environment=MIMALLOC_ARENA_RESERVE=268435456
+# Environment=MIMALLOC_ARENA_EAGER_COMMIT=0
 ```
+
+`PINGWAF_DB_URL` is the database variable; `PINGWAF_DATABASE_URL` is not read.
+The example config ships `admin_password = "pingwaf123"` and `jwt_secret =
+"change-me-in-production"`; change both before the first start, or set the
+environment variables above. The fresh database rejects every write with `403
+password_change_required` until the admin password is changed, but the seeded
+password is known, so do not expose the console before changing it.
+
+The unit now sets `WorkingDirectory=/var/lib/pingwaf`; without it systemd starts
+in `/`, the relative `cache_dir = "./data/cache"` resolves to `/data/cache`, and
+`ProtectSystem=strict` makes it read-only (`Failed to create cache directory ...
+Read-only file system`). If you use an older unit, set the working directory or
+an absolute `cache_dir` yourself.
+
+If `/var/lib/pingwaf/cache` was left by a previous **agent** install, move it
+aside before starting all-in-one. The agent cache is fail-open and can contain
+another control plane's sites and certificates; the all-in-one would serve that
+snapshot until its own control plane pushes a new bundle.
+
+The example config binds the dashboard and gRPC to `127.0.0.1`. For a remote
+dashboard or remote agents, set `admin_addr`/`grpc_addr` to `0.0.0.0` (or use
+`--listen-public` with the installer) only behind a reverse proxy or trusted
+network, and change the admin password first.
 
 The file is optional: without it, the `Environment=` lines below are the whole
 configuration. If you point `PINGWAF_CONFIG` at a path, start from the example —
@@ -629,6 +668,16 @@ for you) — and remember that an unreadable path stops startup rather than bein
 ignored. Its `[server]` and `[agent]` tables take the flag names with
 underscores (`admin_addr`, `max_body_log_size`, …) as described in the
 [configuration cheat sheet](#configuration-cheat-sheet).
+
+Generate the instance key the unit's `EnvironmentFile` reads (a manual install
+does not create it; without it sealed notification/AI/backup credentials are
+stored in clear text):
+
+```bash
+sudo install -m 0600 -o pingwaf -g pingwaf /dev/null /etc/pingwaf/pingwaf.env
+echo "PINGWAF_SECRET_KEY=$(openssl rand -hex 32)" | \
+  sudo tee -a /etc/pingwaf/pingwaf.env >/dev/null
+```
 
 ```bash
 # 5. Start and enable
@@ -759,15 +808,35 @@ pingwaf server \
   --grpc-addr 0.0.0.0:9090 \
   --jwt-secret "$(openssl rand -hex 32)"
 
-# Each edge node — create the API key in Settings → API Keys → Create Key.
-# Point --server-ca-cert at the CA the server generated
-# (e.g. /var/lib/pingwaf/data/grpc-ca.pem on the control plane)
+# Each edge node — use the console's Nodes → Add node flow (or
+# POST /api/v1/agents/enroll) to mint the enrollment key and command.
+# The generated command does not include the control plane's CA; add it
+# when the control plane uses its self-signed certificate.
 pingwaf agent \
   --server-url "https://control-plane:9090" \
   --server-ca-cert /etc/pingwaf/grpc-ca.pem \
   --api-key "YOUR_AGENT_KEY" \
   --cache-dir /var/lib/pingwaf/cache
 ```
+
+> **Agent scope and certificate source.** Agent nodes are currently
+> **unbound**: an agent receives every site owned by the API key's owner, not
+> just one site. The control plane's own dashboard site (typically
+> `waf.<domain>` with upstream `127.0.0.1:9080`) is included too; on an edge
+> that loopback has no dashboard and the site returns 502. There is no
+> per-node site binding yet — use a dedicated control plane or remove sites an
+> edge must not run. For ACME, the control plane must be **0.32.40 or newer**
+> so the PEMs issued by its embedded data plane are synced into
+> `site_certificates` and pushed to agents. An older control plane sends
+> `acme_email` without a PEM, so each agent starts its own HTTP-01 order; the
+> CA validation request reaches the host that owns port 80 (usually the
+> control plane), not the agent, and fails with `acme_failed`. If the control
+> plane cannot be upgraded yet, set `PINGAP_DISABLE_ACME=true` in the agent
+> unit to stop the retry loop and upload certificates instead.
+
+A node installed with `install.sh --mode agent` runs the agent-only build
+(`pingwaf-agent`) under the same `/usr/local/bin/pingwaf` name and command, so
+nothing above changes; see [cli.md → the agent-only build](cli.md#the-agent-only-build-pingwaf-agent).
 
 Choose it when sites span multiple hosts or regions, when you need central
 visibility and one-click rule rollout, or when the management plane must be
@@ -940,8 +1009,9 @@ privileges. Migrations run automatically on startup and need `CREATE TABLE`.
 1. Check the health endpoint first — if `/healthz` fails, the server is not up:
    `curl -sf http://localhost:9080/healthz` (the health endpoint answers on both
    schemes, so this works even with TLS on).
-2. Confirm the bind address. `--admin-addr 127.0.0.1:9080` is unreachable from
-   another machine; use `0.0.0.0:9080` and open the firewall port.
+2. Confirm the bind address. The installer writes `admin_addr = "0.0.0.0:9080"`;
+   if the file was edited to `127.0.0.1:9080`, the console is unreachable from
+   another machine — set `0.0.0.0:9080` back and open the firewall port.
 3. Building from source? The dashboard is embedded from `web/dist` **at compile
    time**. If you skipped `cd web && npm ci && npm run build`, or rebuilt the
    frontend after compiling Rust, rebuild the binary.

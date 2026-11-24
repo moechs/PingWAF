@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-PingWAF is a distributed, centrally-controlled Web Application Firewall built on `pingap`, a Cloudflare-Pingora-based reverse proxy. The `pingap` proxy engine plus all reusable logic lives in the `pingap-*` workspace crates; the WAF layer adds seven `pingwaf-*` crates (`proto`, `server`, `agent`, `waf`, `challenge`, `profiler`, `system`). The binary lives in `src/`; the top-level `src/pingwaf.rs` translates the DB-backed control-plane model into a `pingap` config. MSRV is `1.96.0` (Rust edition 2024). Pingora is `0.9.1` from crates.io; only the `lb`/`cache` features are enabled there, and the TLS backend feature (pingora's `openssl` or `rustls`) is added by pingap's own top-level `openssl` / `tls-rustls` features. The three `pingora*` entries in `[workspace.dependencies]` must always name the same version, or cargo resolves two copies of `pingora-core`.
+PingWAF is a distributed, centrally-controlled Web Application Firewall built on `pingap`, a Cloudflare-Pingora-based reverse proxy. The `pingap` proxy engine plus all reusable logic lives in the `pingap-*` workspace crates; the WAF layer adds seven `pingwaf-*` crates (`proto`, `server`, `agent`, `waf`, `challenge`, `profiler`, `system`). The binary lives in `src/`; the top-level `src/pingwaf.rs` translates the DB-backed control-plane model into a `pingap` config. `src/main.rs` is the pingap-compatible entry point (bins `pingap`/`pingwaf`), `src/edge_main.rs` is the agent-only `pingwaf-agent` entry point (bin gated on the `edge` feature), and both share `src/version.rs` for the `--version` banner. MSRV is `1.96.0` (Rust edition 2024). Pingora is `0.9.1` from crates.io; only the `lb`/`cache` features are enabled there, and the TLS backend feature (pingora's `openssl` or `rustls`) is added by pingap's own top-level `openssl` / `tls-rustls` features. The three `pingora*` entries in `[workspace.dependencies]` must always name the same version, or cargo resolves two copies of `pingora-core`.
 
 The workspace is a **hard fork** of upstream `pingap`: inherited crates are maintained here, synced from upstream manually per fix. Ownership, sync procedure and test ownership are documented in [UPSTREAM.md](./UPSTREAM.md).
 
@@ -22,7 +22,7 @@ The binary and every crate share one version, declared once in `[workspace.packa
 # Bacon-driven dev loop (uses --autoreload + admin UI on :3018)
 make dev                 # bacon run -- --features=full -- -c=... --admin=...
 
-# Lint (CI gate — runs typos + clippy --features=full --all-targets -- -D warnings)
+# Lint (CI gate — typos + clippy --features=full --all-targets + the edge bin)
 make lint
 
 # Format
@@ -136,6 +136,7 @@ The top-level `[features]` block in `Cargo.toml`:
 - `tracing` — turns on `pingap-otel` + `pingap-sentry`, and the `tracing` feature on `pingap-cache`, `pingap-core`, `pingap-performance`, `pingap-proxy`, and pingora's `sentry`. **`pingap-cache/tracing` also pulls in `prometheus`** — needed for any code touching cache metrics.
 - `imageoptim` — `pingap-imageoptim` (png/jpeg/webp/avif).
 - `full` = `tracing` + `imageoptim`. Required by `make test` and `make lint`.
+- `edge` — code-gating only, no dependencies. It compiles the control-plane modules and the dashboard-embedding pingap admin plugin out for the `pingwaf-agent` bin (`required-features = ["edge"]`); `cargo build --bin pingwaf-agent` without it is rejected, so an agent artifact cannot accidentally include the control plane. It changes no dependency, which keeps the release build's cargo cache warm for both binaries. `make release-agent` is its local build.
 - `pyro` — pyroscope agent.
 - `perf` = `pyro` + `full`, paired with the `release-perf` profile (keeps debug info, no strip).
 
@@ -150,7 +151,7 @@ CLI flags worth knowing: `-c/--conf <url>`, `-d/--daemon`, `-u/--upgrade` (hot u
 ## Lint and code style notes
 
 - `clippy.toml` denies unwrap outside tests, sets `cognitive-complexity-threshold = 10`, and pins `msrv = "1.96.0"`. The root `Cargo.toml` adds `unwrap_used = "deny"`.
-- CI runs `cargo clippy --features=full --all-targets --all -- --deny=warnings` plus `typos`. Run `make lint` before pushing.
+- CI runs `cargo clippy --features=full --all-targets --all -- --deny=warnings` plus `typos`, and lints the agent-only target separately (`--bin pingwaf-agent --features full,edge`) because `required-features` keeps `--all-targets` from building it. Run `make lint` before pushing.
 - The git pre-commit hook (installed via `make hooks`) just runs `make lint`.
 - `typos.toml` excludes `*.md` and `*.toml` from the spell check — typos in those file types will not be caught by `make lint`.
 
@@ -183,6 +184,7 @@ Note that CI and the release pipeline build `Dockerfile.runtime` from a prebuilt
 | `cargo msrv list` (local only — no workflow runs it) | `cargo install cargo-msrv --version 0.18.4 && cargo msrv list` |
 | `cargo llvm-cov` (local only — no workflow runs it) | `make cov` |
 | `cargo build --release --bin pingwaf --features full` (`release-binary` job) | `make release-full` |
+| `cargo clippy --bin pingwaf-agent --features full,edge -- -D warnings` (`rust` job, stable leg) + `cargo build --release --bin pingwaf-agent --features full,edge` (`release-binary` job) | `make release-agent` |
 | `make release-all` (builds `pingwaf-full`, then `pingwaf`) | `make release-all` |
 | `make build-web` (web assets; the `web` job runs the same npm steps in `web/`, without the copy to the repo root) | `make build-web` |
 
@@ -190,7 +192,7 @@ Note that CI and the release pipeline build `Dockerfile.runtime` from a prebuilt
 
 The MSRV (`rust-version` in `Cargo.toml`, `msrv` in `clippy.toml`) is a floor that CI proves on `stable`. Release binaries are built with a **pinned recent stable**, deliberately newer: the `dtolnay/rust-toolchain@1.98.1` pin in `.github/workflows/release.yml` and the `FROM rust:1.98.1-bookworm` line in the `Dockerfile` are one setting and move together.
 
-`release.yml` triggers on a `v*` tag and releases **Linux only** (`shuaiZend/PingWAF` does not ship macOS or Windows binaries). Two matrix legs (`linux/amd64`, `linux/arm64`) each build `--features tracing` with the default OpenSSL backend and publish **two archives per arch**: `pingwaf-linux-<arch>.tar.xz` (primary, smaller) and `pingwaf-linux-<arch>.tar.gz` (legacy fallback), each with a `.sha256` sidecar. `install.sh` resolves `pingwaf-${OS}-${ARCH}.${ext}` for `ext` in `tar.xz` then `tar.gz` from the release URL — the names must not drift. There is no rustls tarball and no `PINGAP_TLS` selection in `install.sh`.
+`release.yml` triggers on a `v*` tag and releases **Linux only** (`shuaiZend/PingWAF` does not ship macOS or Windows binaries). Two matrix legs (`linux/amd64`, `linux/arm64`) each build `--features tracing` with the default OpenSSL backend and publish **four archives per arch**: `pingwaf-linux-<arch>.tar.xz` / `.tar.gz` for the full binary and `pingwaf-agent-linux-<arch>.tar.xz` / `.tar.gz` for the agent-only build (`--bin pingwaf-agent --features tracing,edge`), each with a `.sha256` sidecar and build-provenance attestation. `install.sh` resolves `pingwaf-${OS}-${ARCH}.${ext}` (or `pingwaf-agent-…` in `--mode agent`) for `ext` in `tar.xz` then `tar.gz` from the release URL — the names must not drift. There is no rustls tarball and no `PINGAP_TLS` selection in `install.sh`.
 
 The `docker` and `docker-manifest` jobs then build per-arch images from `Dockerfile.runtime` and merge them into `ghcr.io/shuaizend/pingwaf:{<version>,<major.minor>,latest}`.
 

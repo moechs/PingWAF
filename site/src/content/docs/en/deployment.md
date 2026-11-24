@@ -17,7 +17,7 @@ minutes: 10
 | `9080` | REST API + dashboard | HTTPS with a self-signed certificate until you replace it; keep it private |
 | `9090` | gRPC control plane | Agents connect here; TLS by default, `grpc_tls_mode = "off"` downgrades to plaintext |
 | `80` | Proxied traffic | Bound once the first site exists |
-| `443` | Proxied traffic | Opens only after a certificate is issued or uploaded |
+| `443` | Proxied traffic | Bound once the first site exists; a new site is issued a self-signed certificate automatically |
 
 `GET /healthz` answers on both HTTP and HTTPS, which is what the compose health check and most load balancers should probe. Everything else redirects to HTTPS.
 
@@ -69,7 +69,7 @@ curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh -
 curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh | bash -s -- --mode all-in-one
 ```
 
-Flags: `--mode all-in-one|server|agent`, `--no-systemd` to skip the unit, `--admin-email` / `--admin-password` / `--tls-sans` (or the matching `PINGWAF_*` environment variables) to seed settings without prompts, and `--dry-run` to preview the plan without installing.
+In agent mode the installer downloads the agent-only archive (`pingwaf-agent-<os>-<arch>`, the data plane without PostgreSQL, the REST API or the dashboard) and installs it as `/usr/local/bin/pingwaf`, so the unit and commands stay the same. The generated unit also pins mimalloc's first arena from the memory ceiling (64 MiB below 1 GiB, 256 MiB below 4 GiB, 512 MiB up to 16 GiB, else 1 GiB; eager commit only at 4 GiB and above), because mimalloc creates that arena before the runtime can set the option. Flags: `--mode all-in-one|server|agent`, `--no-systemd` to skip the unit, `--admin-email` / `--admin-password` / `--tls-sans` (or the matching `PINGWAF_*` environment variables) to seed settings without prompts, and `--dry-run` to preview the plan without installing.
 
 ## Configuration precedence
 
@@ -95,9 +95,17 @@ pingwaf agent
 
 Enrollment keys are created from the console (`POST /api/v1/agents/enroll` returns an install command). An empty `PINGWAF_API_KEY` is only valid for loopback auto-registration in all-in-one mode.
 
+Agents are currently **unbound**: an agent receives every site owned by the API key's owner, not one site. The control plane's own dashboard site (typically `waf.<domain>` with upstream `127.0.0.1:9080`) is included; on an edge that loopback has no dashboard and the site returns 502. There is no per-node site binding yet — use a dedicated control plane or remove sites an edge must not run.
+
+For ACME, the control plane must be **0.32.40 or newer** so the PEMs issued by its embedded data plane are synced into `site_certificates` and pushed to agents. An older control plane sends `acme_email` without a PEM, so each agent starts its own HTTP-01 order; the CA validation request reaches the host that owns port 80 (usually the control plane), not the agent, and fails. If the control plane cannot be upgraded yet, set `PINGAP_DISABLE_ACME=true` in the agent unit and upload certificates instead.
+
+The installer copies `--server-ca-cert` to `/etc/pingwaf/grpc-ca.pem` and references that durable path; the console's generated command does not include the CA or `--server-tls-name`, so add them for a self-signed control plane.
+
 ## systemd
 
 The shipped `pingwaf.service` runs as the `pingwaf` user with `Restart=always`, `LimitNOFILE=65536`, `ProtectSystem=strict` and write access limited to `/var/lib/pingwaf` and `/etc/pingwaf`. There is no reload signal: configuration changes are applied by the control plane, and a binary or unit change needs `systemctl restart pingwaf`.
+
+For a manual tarball install, `pingwaf.service` and `pingwaf.toml` are inside `pingwaf-linux-<arch>/`. The unit sets `WorkingDirectory=/var/lib/pingwaf` so the relative `cache_dir` persists; without it `ProtectSystem=strict` makes the cache read-only. Use `PINGWAF_DB_URL` (not `PINGWAF_DATABASE_URL`), set `PINGWAF_SECRET_KEY` and an admin password before the first start, and pin `MIMALLOC_ARENA_RESERVE` on hosts below 4 GiB. When switching an existing agent host to all-in-one, move `/var/lib/pingwaf/cache` aside first: the fail-open snapshot can contain another control plane's sites and certificates.
 
 ## TLS on the control plane
 

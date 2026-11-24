@@ -33,7 +33,7 @@ use crate::api::agents::command_type;
 use crate::api::state::AppState;
 use crate::config_history::{self, VersionScope};
 use crate::grpc::config::{build_site_config, now_timestamp};
-use crate::models::{agent, api_key, config_version, site};
+use crate::models::{agent, agent_sites, api_key, config_version, site};
 
 /// The sites an agent serves: its binding when it has one, otherwise every
 /// site owned by its API key's user. Mirrors the gRPC `visible_sites`, and is
@@ -46,6 +46,34 @@ pub(crate) async fn agent_visible_site_ids<C>(
 where
     C: sea_orm::ConnectionTrait,
 {
+    if agent_row.site_scope == "selected" {
+        let Some(key_id) = agent_row.api_key_id else {
+            return Ok(Vec::new());
+        };
+        let Some(key) = api_key::Entity::find_by_id(key_id).one(db).await?
+        else {
+            return Ok(Vec::new());
+        };
+        let assigned: Vec<Uuid> = agent_sites::Entity::find()
+            .filter(agent_sites::Column::AgentId.eq(agent_row.id))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|row| row.site_id)
+            .collect();
+        if assigned.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The assignment table is operator-managed, but ownership still
+        // decides what the key's user may see: an assignment of somebody
+        // else's site is ignored rather than leaked.
+        let sites = site::Entity::find()
+            .filter(site::Column::Id.is_in(assigned))
+            .filter(site::Column::UserId.eq(key.user_id))
+            .all(db)
+            .await?;
+        return Ok(sites.iter().map(|row| row.id).collect());
+    }
     if let Some(site_id) = agent_row.site_id {
         return Ok(vec![site_id]);
     }
@@ -75,11 +103,15 @@ async fn update_payload_for_agent(
     if !visible.contains(&site_id) {
         return Ok(None);
     }
-    if agent_row.site_id.is_some() {
+    if agent_row.site_scope != "selected"
+        && visible.len() == 1
+        && agent_row.site_id == Some(site_id)
+    {
         return Ok(Some(changed_site_config.clone()));
     }
-    // An unbound agent runs every site its owner has: the payload must list
-    // them all or the agent would drop the sites it does not carry.
+    // A selected or unbound agent carries every visible site: the payload is
+    // authoritative, so it must list them all or the agent would drop the
+    // sites it does not carry.
     let config = build_site_config(db, Some(&visible)).await?;
     Ok(Some(config))
 }

@@ -44,6 +44,36 @@ for) with `PINGWAF_CONFIG=/etc/pingwaf/pingwaf.toml` set in the unit;
 `systemctl restart pingwaf` applies any configuration change, and
 `journalctl -u pingwaf -e` shows the service logs.
 
+### The agent-only build (`pingwaf-agent`)
+
+Releases also ship `pingwaf-agent`, built from the same source with the
+control plane compiled out (`--bin pingwaf-agent --features edge`). It is the
+data plane and nothing else: no PostgreSQL, no REST API, no embedded
+dashboard, so an edge node downloads and maps far less code. `install.sh
+--mode agent` fetches that archive and installs it as `/usr/local/bin/pingwaf`,
+so the unit and every command below stay unchanged; `pingwaf --version` marks
+it with `edge`. Both spellings work:
+
+```bash
+pingwaf-agent agent --server-url https://control-plane:9090 --api-key KEY
+pingwaf-agent --server-url https://control-plane:9090 --api-key KEY
+```
+
+The `agent` subcommand is accepted because a self-upgrade replaces the file
+with the control plane's all-in-one build, which still needs it. That also
+means `auto_upgrade` trades the smaller build for the full one: it follows the
+control plane's executable, so re-run the installer in agent mode to get the
+agent-only artifact back. The agent-only build has no
+`server`/`all-in-one`/maintenance subcommands; run those from the full
+`pingwaf` binary.
+
+> An agent-only node is currently **unbound**: it receives every site owned by
+> the API key's owner, not one site. The control plane must be **0.32.40 or
+> newer** when it is the ACME issuer, so issued PEMs are synced and pushed;
+> otherwise each agent starts its own HTTP-01 order and fails behind the
+> control plane. See [deployment.md → Edge Agent](deployment.md#edge-agent)
+> for the CA, `server_tls_name`, and `PINGAP_DISABLE_ACME` details.
+
 ## Global options
 
 `server` and `all-in-one` accept these options (the `agent` has its own set,
@@ -145,10 +175,11 @@ the instance secrets. Its security-relevant behaviour:
   reads it via `EnvironmentFile=-/etc/pingwaf/pingwaf.env`. An existing key is
   kept on upgrade — rotating it silently would make sealed channel/AI/backup
   credentials unreadable.
-- **Listen addresses** — `--listen-public` (`PINGWAF_LISTEN_PUBLIC=1`) binds the
-  dashboard (`9080`) and gRPC (`9090`) on `0.0.0.0`; **without it both bind
-  `127.0.0.1` only**. Expose them through a TLS reverse proxy (or a private
-  interface plus firewall) and change the administrator password first.
+- **Listen addresses** — the dashboard (`9080`) binds **`0.0.0.0`** so a fresh
+  install is reachable; restrict it with a firewall or a TLS reverse proxy and
+  change the administrator password at the first sign-in. gRPC (`9090`) binds
+  **`127.0.0.1`**; `--listen-public` (`PINGWAF_LISTEN_PUBLIC=1`) opens it on
+  `0.0.0.0`, which only remote agents need.
 
 See [deployment.md → Manual Installation](./deployment.md#manual-installation-binary--systemd)
 for the full option table.

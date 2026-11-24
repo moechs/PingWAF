@@ -43,22 +43,57 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # 期
 
 两个官方安装器都已按安全默认值加固：
 
-- **默认只监听环回**：二进制安装器默认把控制台 `127.0.0.1:9080`、gRPC `127.0.0.1:9090` 绑定；compose 通过
-  `PINGWAF_ADMIN_BIND`/`PINGWAF_GRPC_BIND` 也默认发布在 `127.0.0.1`。只有需要反向代理或远程 agent 时才显式改为
-  `0.0.0.0`（或私网地址），并且**先修改管理员口令**；更推荐用 TLS 反向代理暴露，而不是直接公网。
+- **控制台对外开放、gRPC 只监听环回**：二进制安装器把控制台绑在 `0.0.0.0:9080`（装完即可从浏览器访问，避免"装完打不开"），
+  gRPC 仍是 `127.0.0.1:9090`；compose 通过 `PINGWAF_ADMIN_BIND` 默认发布在 `0.0.0.0`、`PINGWAF_GRPC_BIND` 默认在 `127.0.0.1`。
+  管理员口令由安装器随机生成，且全新数据库在改密前拒绝一切写操作；仍建议用防火墙把 9080 限制在管理网，或用 TLS 反向代理暴露。
+  `--listen-public` 只用于远程 agent 场景开放 9090。
 - **校验 release 校验和**：每个发布资产都有 `.sha256`；缺失、格式错误或不匹配时安装器直接退出，不会安装被篡改/截断的包。
+- **Agent 模式下载专用构建**：`--mode agent` 优先下载 `pingwaf-agent-<os>-<arch>.tar.xz`
+  （仅数据面，不含 PostgreSQL / REST API / 控制台），并以 `/usr/local/bin/pingwaf`
+  名称安装，单元与升级路径不变；更早的 release 没有该资产时回退到完整二进制并告警。
 - **随机管理员口令**：未提供 `--admin-password`/`PINGWAF_ADMIN_PASSWORD` 时生成随机口令并**只打印一次**（结束前保存好）；不再有内置默认口令。
 - **生成 `PINGWAF_SECRET_KEY`**：二进制安装器写入 `/etc/pingwaf/pingwaf.env`（`0600`，属主 `pingwaf`，systemd 通过
   `EnvironmentFile=-/etc/pingwaf/pingwaf.env` 读取）；compose 安装器写入 `.env`（`0600`）。升级时保留已有主密钥——静默轮换会使已密封的渠道/AI/备份凭据无法解密。
+- **mimalloc arena**：生成的 systemd 单元会根据内存上限（cgroup v2/v1 限制，否则 `MemTotal`）写入
+  `MIMALLOC_ARENA_RESERVE` 与 `MIMALLOC_ARENA_EAGER_COMMIT`：小于 1 GiB 用 64 MiB，小于 4 GiB 用 256 MiB，
+  不超过 16 GiB 用 512 MiB，否则 1 GiB；仅 4 GiB 及以上开启 eager commit。原因是 mimalloc 在
+  `allocator_tune::apply()` 之前就创建了第一个 arena，已存在的 arena 无法缩小。主机内存布局特殊时可用
+  `systemctl edit pingwaf` 覆盖。
+- **已有配置优先**：如果 `/etc/pingwaf/pingwaf.toml` 已存在，安装器不会改写它，`--server-url` / `--api-key`
+  不会生效；agent 模式以文件为准。以启动日志里的 `server_url=...` 为准，需要变更时编辑 `[agent]` 后重启。
+- **Agent 未绑定站点**：当前 agent 会收到 API key 属主的**全部站点**，而不是单个站点；控制面自身的控制台站点
+  （通常上游为 `127.0.0.1:9080`）也会被下发，在边缘节点上该回环地址没有控制台，站点会 502。尚无按节点绑定站点的
+  API，部署边缘时应使用专用控制面，或删除边缘不应运行的站点。
+- **控制面版本要求**：如果控制面是 ACME 签发者（常见 all-in-one），需 **0.32.40+** 才会把内嵌数据面签发的 PEM
+  同步到 `site_certificates` 并推送给 agent。旧控制面只下发 `acme_email`、没有 PEM，每个 agent 会自己发起
+  HTTP-01；验证请求落到 80 端口所属实例（通常是控制面）而不是 agent，最终 `acme_failed`。暂不能升级控制面时，
+  可在 agent 单元设置 `PINGAP_DISABLE_ACME=true` 停止重试，并改用上传证书。
+- **CA 持久化**：安装器会把 `--server-ca-cert` 复制到 `/etc/pingwaf/grpc-ca.pem`，配置和单元引用该持久路径；
+  源文件可以放在临时目录。控制台生成的安装命令不含 CA / `--server-tls-name`，自签控制面需要手动补上。
+- **重启与注册校验**：安装器会重启已运行的 agent 单元（`enable --now` 不会重启），并在 60 秒内等待
+  `Registered with control plane`；未注册会以非零退出，而不是只打印 “installed successfully”。
+- **手动 tarball 安装（all-in-one）**：归档内的 `pingwaf.service` / `pingwaf.toml` 在
+  `pingwaf-linux-<arch>/` 子目录；unit 需要 `WorkingDirectory=/var/lib/pingwaf`（仓库已加），否则相对
+  `cache_dir = "./data/cache"` 会落到 `/data/cache`，被 `ProtectSystem=strict` 拒绝并导致缓存/ACME 状态无法持久化。
+  非默认数据库使用 `PINGWAF_DB_URL`（**不是** `PINGWAF_DATABASE_URL`）；首次启动前设置 `PINGWAF_SECRET_KEY`
+  和管理员口令；小于 4 GiB 的主机需固定 `MIMALLOC_ARENA_RESERVE`。从 agent 切换为 all-in-one 前，先移走旧的
+  `/var/lib/pingwaf/cache`，否则会加载另一个控制面的站点/证书快照。
+- **443 的 `wrong version number`**：这是客户端用明文 HTTP 访问 TLS 端口（扫描器/误配客户端），不是 agent
+  连控制面的错误；公网边缘会持续出现，建议在日志采集侧过滤或限速，而不是关闭该监听目标的错误日志。
 - **不删数据卷**：compose 安装器 `--force` 只重写 `.env`，保留 `postgres-data`/`pingwaf-data`/`pingwaf-certs`；
   清理主机磁盘只能显式运行 `scripts/sweep-host-storage.sh --prune-volumes`，且它**永不删除 `waf_*`** 数据卷。
 - **旧 tag 提示**：安装器从 release tag 下载 compose 文件；若该 tag 的 compose 还没有上述加固（没有 `PINGWAF_SECRET_KEY` 透传、9080/9090 公网绑定、默认管理员口令），安装器会告警——请升级到包含这些改动的版本，而不要假定加固已生效。
 
 ## 5. 关键环境变量
 
+> **挑战页模板**：在 **设置 → 自定义页面 → 挑战页**（`scope=challenge`，固定 503）编辑。模板是全局
+> Tera 模板，只控制展示；编译进二进制的挑战 JS 通过 `{{ challenge_scripts | safe }}` 注入，必须保留
+> `countdown`、`title`、`subtitle`、`status`、`spinnerWrap`、`progressBar`、`progressFill` 这些 DOM id，
+> 且不能包含 `<script>`。模板渲染失败、缺少 `| safe`、缺少 DOM id 或包含脚本标签时回退内置页面。
+
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` | `127.0.0.1` | 控制台（9080）/gRPC（9090）发布地址；默认仅环回。需要反代或远程 agent 时才改 `0.0.0.0`，并先改管理员口令 |
+| `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` | `0.0.0.0` / `127.0.0.1` | 控制台（9080）/gRPC（9090）发布地址。控制台默认发布到所有网卡，装完即可访问；请改为指定管理网地址，或用防火墙/反向代理限制，并在首次登录时改管理员口令。gRPC 默认仅环回，远程 agent 才需放开 |
 | `ADMIN_PASSWORD` | **无默认值（新库必填）** | 初始管理员口令；为空会让首次启动失败，而不是播种已知口令。安装器会生成随机口令并只打印一次；首次登录强制改密 |
 | `POSTGRES_PASSWORD` | `pingwaf`（开发回退） | PostgreSQL 口令；正式部署务必在 `.env` 设置随机值（compose 仍会回退到 `pingwaf`，安装器不生成该项） |
 | `PINGWAF_SECRET_KEY` | 未设置（密封功能必需） | 静态加密主密钥：加密通知渠道口令、AI Provider Key、备份目标凭据。**必须设为 32 字节随机值**；不设置则这些字段明文入库。安装器会生成（compose → `.env`；二进制 → `/etc/pingwaf/pingwaf.env` 0600）。无在线轮换，备份与轮换步骤见 [SECURITY.md](../../SECURITY.md#credentials-and-secrets) |
@@ -73,7 +108,10 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # 期
 ## 6. TLS
 
 - **控制面 9080**：首启自动生成自签名证书；生产建议在 **Settings → Control plane HTTPS** 上传正式证书，并用 `PINGWAF_TLS_SANS` 指定主机名。
-- **业务站点**：使用 ACME（Let's Encrypt）或上传证书，启用 HSTS 并强制 HTTPS。
+- **业务站点**：使用 ACME（Let's Encrypt）或上传证书，启用 HSTS 并强制 HTTPS。all-in-one 模式下由内嵌数据面签发，
+  控制面每 30 秒把 `acme_state.toml` 中签发的 PEM 同步到 `site_certificates` 并下发给所有 agent；这样 80 端口
+  指向控制面的 edge agent 不必自己发起（也必然失败的）HTTP-01 订单。路径可用 `PINGWAF_ACME_STATE` 覆盖。
+  远程 agent 若不是该域名 80 端口的落点，应改用 **DNS-01**。
 - **gRPC 9090**：默认 TLS（首启生成自签 CA）；仅在完全受控的环回 all-in-one 场景才考虑 `grpc_tls_mode = "off"`。
 
 ## 7. 安全加固清单
@@ -115,6 +153,8 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz
 ```
 
 **回滚**：把 `PINGWAF_TAG` 改回旧版本并 `docker compose up -d pingwaf`。数据库迁移**只向前**——若旧版本拒绝启动，需用 `pre-upgrade.dump` 恢复数据库后再启动旧版本。生产环境请固定版本 tag，不要使用 `:latest`。
+
+> **控制台监听地址**：新装默认把控制台绑在 `0.0.0.0:9080`。升级不会改写已有配置，因此本次改动之前装的实例仍保留 `admin_addr = "127.0.0.1:9080"`（compose 沿用 `.env` 里的旧值），只能从本机访问。想改成新默认值就显式设置 `admin_addr = "0.0.0.0:9080"`（或 `.env` 里 `PINGWAF_ADMIN_BIND=0.0.0.0`），并用防火墙/反向代理限制该端口。
 
 > 安装器升级会保留密钥与数据卷：compose 安装器 `--force` 复用已有管理员口令与 `PINGWAF_SECRET_KEY`，二进制安装器保留
 > `/etc/pingwaf/pingwaf.env`；两者都不会删除 `postgres-data`/`pingwaf-data`/`pingwaf-certs`。需要清理主机磁盘时只能显式运行

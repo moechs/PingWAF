@@ -14,6 +14,7 @@ import {
   Plus,
   PencilSimple,
   Warning,
+  Globe,
 } from '@phosphor-icons/react'
 import { PageHeader } from '@/components/PageHeader'
 import { Card, CardBody } from '@/components/ui/Card'
@@ -74,6 +75,9 @@ export function AgentsPage() {
   const [pendingDelete, setPendingDelete] = useState<Agent | null>(null)
   const [renameAgent, setRenameAgent] = useState<Agent | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  const [sitesAgent, setSitesAgent] = useState<Agent | null>(null)
+  const [siteScope, setSiteScope] = useState<'all' | 'selected'>('all')
+  const [selectedSiteIds, setSelectedSiteIds] = useState<string[]>([])
   const [pendingCommand, setPendingCommand] = useState<{ agent: Agent; command: AgentCommand } | null>(null)
   const [enrollOpen, setEnrollOpen] = useState(false)
   const [enrollName, setEnrollName] = useState('')
@@ -157,6 +161,37 @@ export function AgentsPage() {
   const openRename = (agent: Agent) => {
     setRenameAgent(agent)
     setRenameValue(agent.display_name ?? '')
+  }
+
+  const openSites = (agent: Agent) => {
+    setSitesAgent(agent)
+    setSiteScope(agent.site_scope === 'selected' ? 'selected' : 'all')
+    setSelectedSiteIds(agent.site_ids ?? [])
+  }
+
+  const saveSites = useMutation({
+    mutationFn: () => {
+      if (!sitesAgent) throw new Error('no agent selected')
+      return agentsApi.updateSites(sitesAgent.id, {
+        scope: siteScope,
+        site_ids: siteScope === 'selected' ? selectedSiteIds : [],
+      })
+    },
+    onSuccess: (agent) => {
+      toast.success(t('pages.agents.sitesSaved'), displayName(agent))
+      setSitesAgent(null)
+      setDetail((prev) => (prev?.id === agent.id ? agent : prev))
+      invalidate()
+    },
+    onError: (error) => {
+      toast.error(t('pages.agents.sitesFailed'), errorMessage(error))
+    },
+  })
+
+  const toggleSite = (siteId: string) => {
+    setSelectedSiteIds((prev) =>
+      prev.includes(siteId) ? prev.filter((id) => id !== siteId) : [...prev, siteId],
+    )
   }
 
   const rename = useMutation({
@@ -282,19 +317,30 @@ export function AgentsPage() {
       key: 'site',
       header: t('pages.agents.site'),
       accessor: (a) => a.site_domain ?? '',
-      cell: (a) =>
-        a.site_domain ? (
-          <span className="pw-mono truncate text-[13px] text-fg">{a.site_domain}</span>
-        ) : (
-          // Unbound agents serve every site of their owner (config-push
-          // visibility) — "all sites", not "unassigned".
-          <span
-            className="text-[13px] text-fg-subtle"
-            title={t('pages.agents.allSitesHint')}
-          >
+      cell: (a) => {
+        const domains = a.site_domains ?? []
+        if (a.site_scope === 'selected' && domains.length === 0) {
+          return (
+            <span className="text-[13px] text-fg-subtle" title={t('pages.agents.noSitesHint')}>
+              {t('pages.agents.noSites')}
+            </span>
+          )
+        }
+        if (domains.length > 0) {
+          return (
+            <span className="pw-mono truncate text-[13px] text-fg" title={domains.join(', ')}>
+              {domains.join(', ')}
+            </span>
+          )
+        }
+        // `all` agents serve every site of their owner (config-push
+        // visibility) — "all sites", not "unassigned".
+        return (
+          <span className="text-[13px] text-fg-subtle" title={t('pages.agents.allSitesHint')}>
             {t('pages.agents.allSites')}
           </span>
-        ),
+        )
+      },
     },
     {
       key: 'version',
@@ -389,6 +435,14 @@ export function AgentsPage() {
       width: '1%',
       cell: (a) => (
         <div className="flex items-center justify-end gap-1" onClick={(e) => e.stopPropagation()}>
+          <Button
+            size="icon"
+            variant="ghost"
+            aria-label={t('pages.agents.manageSites')}
+            disabled={!canWrite}
+            onClick={() => openSites(a)}
+            icon={<Globe weight="duotone" className="h-4 w-4" />}
+          />
           <Button
             size="icon"
             variant="ghost"
@@ -628,6 +682,14 @@ export function AgentsPage() {
                 <Button
                   size="sm"
                   variant="secondary"
+                  onClick={() => openSites(detail)}
+                  icon={<Globe weight="duotone" className="h-3.5 w-3.5" />}
+                >
+                  {t('pages.agents.manageSites')}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
                   onClick={() => openRename(detail)}
                   icon={<PencilSimple weight="duotone" className="h-3.5 w-3.5" />}
                 >
@@ -718,7 +780,16 @@ export function AgentsPage() {
             </div>
 
             <dl className="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
-              <DetailRow label={t('pages.agents.site')} value={detail.site_domain ?? t('pages.agents.allSites')} />
+              <DetailRow
+                label={t('pages.agents.site')}
+                value={
+                  detail.site_scope === 'selected'
+                    ? detail.site_domains.length > 0
+                      ? detail.site_domains.join(', ')
+                      : t('pages.agents.noSites')
+                    : t('pages.agents.allSites')
+                }
+              />
               <DetailRow label={t('pages.agents.publicIp')} value={detail.public_ip} mono />
               <DetailRow label={t('pages.agents.privateIp')} value={detail.private_ip} mono />
               <DetailRow label={t('pages.agents.ipAddress')} value={detail.ip_address} />
@@ -786,6 +857,135 @@ export function AgentsPage() {
         )}
       </Dialog>
 
+      {/* Site scope */}
+      <Dialog
+        open={sitesAgent !== null}
+        onClose={() => setSitesAgent(null)}
+        size="md"
+        title={
+          sitesAgent
+            ? t('pages.agents.sitesTitle', { name: displayName(sitesAgent) })
+            : undefined
+        }
+        description={t('pages.agents.sitesDescription')}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setSitesAgent(null)}>
+              {t('common.cancel')}
+            </Button>
+            <Button
+              variant="primary"
+              loading={saveSites.isPending}
+              onClick={() => saveSites.mutate()}
+            >
+              {t('common.save')}
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-4">
+          <div
+            className="inline-flex rounded-lg border border-line bg-recessed p-0.5"
+            role="radiogroup"
+            aria-label={t('pages.agents.siteScope')}
+          >
+            {(
+              [
+                { value: 'all', label: t('pages.agents.siteScopeAll') },
+                { value: 'selected', label: t('pages.agents.siteScopeSelected') },
+              ] as const
+            ).map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                role="radio"
+                aria-checked={siteScope === option.value}
+                onClick={() => setSiteScope(option.value)}
+                className={cn(
+                  'rounded-md px-3 py-1.5 text-[13px] font-medium transition-colors',
+                  siteScope === option.value
+                    ? 'bg-elevated text-fg shadow-sm'
+                    : 'text-fg-subtle hover:text-fg',
+                )}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+
+          <p className="text-xs leading-relaxed text-fg-subtle">
+            {siteScope === 'all'
+              ? t('pages.agents.siteScopeAllHint')
+              : t('pages.agents.siteScopeSelectedHint')}
+          </p>
+
+          {siteScope === 'selected' && (
+            <>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-[13px] font-medium text-fg">
+                  {t('pages.agents.siteScopeSelected')}
+                </span>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() =>
+                      setSelectedSiteIds((sites ?? []).map((site) => site.id))
+                    }
+                  >
+                    {t('pages.agents.selectAllSites')}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setSelectedSiteIds([])}
+                  >
+                    {t('pages.agents.clearSites')}
+                  </Button>
+                </div>
+              </div>
+              <div className="max-h-64 overflow-y-auto rounded-md border border-line">
+                {(sites ?? []).length === 0 ? (
+                  <p className="px-3 py-4 text-xs text-fg-subtle">
+                    {t('pages.agents.noSitesAvailable')}
+                  </p>
+                ) : (
+                  (sites ?? []).map((site) => (
+                    <label
+                      key={site.id}
+                      className="flex cursor-pointer items-center gap-3 border-b border-line px-3 py-2 last:border-b-0 hover:bg-recessed"
+                    >
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 accent-[var(--color-brand)]"
+                        checked={selectedSiteIds.includes(site.id)}
+                        onChange={() => toggleSite(site.id)}
+                      />
+                      <span className="min-w-0">
+                        <span className="pw-mono block truncate text-[13px] text-fg">
+                          {site.domain}
+                        </span>
+                        {site.name && site.name !== site.domain && (
+                          <span className="block truncate text-xs text-fg-subtle">
+                            {site.name}
+                          </span>
+                        )}
+                      </span>
+                    </label>
+                  ))
+                )}
+              </div>
+              {selectedSiteIds.length === 0 && (
+                <p className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/8 px-3 py-2 text-xs text-fg">
+                  <Warning weight="duotone" className="mt-0.5 h-4 w-4 shrink-0 text-fg-warning" />
+                  {t('pages.agents.siteScopeEmptyHint')}
+                </p>
+              )}
+            </>
+          )}
+        </div>
+      </Dialog>
+
       {/* Command confirmation */}
       <ConfirmDialog
         open={pendingCommand !== null}
@@ -832,8 +1032,10 @@ export function AgentsPage() {
               {pendingDelete.hostname} · {pendingDelete.ip_address}
             </p>
             <p className="mt-1.5 text-xs text-fg-subtle">
-              {pendingDelete.site_domain
-                ? t('pages.agents.removeSiteNote', { domain: pendingDelete.site_domain })
+              {pendingDelete.site_domains.length > 0
+                ? t('pages.agents.removeSiteNote', {
+                    domain: pendingDelete.site_domains.join(', '),
+                  })
                 : t('pages.agents.removeUnassignedNote')}
             </p>
           </div>

@@ -545,6 +545,8 @@ List sites (paginated).
 
 Create a new site. `upstream_address` is required: a site without an origin cannot serve traffic. The site is created with a `default` origin pool containing that origin.
 
+A new site starts with HTTPS enabled and a **self-signed certificate** the control plane issues for its `domain` and `alternate_domains` (see [PUT /sites/{site_id}/ssl](#put-sitessite_idssl)); upload a certificate, select one, or configure ACME to replace it.
+
 **Request:**
 ```json
 {
@@ -1052,6 +1054,24 @@ Create or update SSL settings. `domain` is required; TLS switches (https, HSTS, 
   "hsts_max_age": 31536000
 }
 ```
+
+A site is served over TLS by exactly one certificate source, in this order of
+precedence:
+
+1. a selected `certificate_id` (an uploaded or shared certificate),
+2. an uploaded `cert_pem` / `key_pem` pair,
+3. an ACME order (`acme_email`),
+4. `self_signed: true` — the control plane issues a leaf covering the site's
+   `domain` and `alternate_domains`, records `issuer: "PingWAF Self-Signed"` and
+   renews it before expiry. New sites start in this mode.
+
+Setting `self_signed` clears `certificate_id` and turns HTTPS on; selecting a
+certificate, uploading a pair or configuring ACME turns `self_signed` off, and
+the generated material is removed so the new source is what the edge serves. A
+certificate delivered by ACME takes the site over the same way. `https_enabled:
+true` with none of the four sources is rejected with `400` (`HTTPS is enabled
+but the site has no certificate: ...`) instead of pushing a listener that cannot
+complete a handshake.
 
 ### DELETE /sites/{site_id}/ssl
 
@@ -1815,8 +1835,11 @@ List registered agents.
   "items": [
     {
       "id": "uuid",
-      "site_id": "uuid",
-      "site_domain": "example.com",
+      "site_id": null,
+      "site_domain": null,
+      "site_scope": "selected",
+      "site_ids": ["uuid-a", "uuid-b"],
+      "site_domains": ["a.example.com", "b.example.com"],
       "hostname": "edge-01",
       "display_name": "edge-01 (backup)",
       "name": "edge-01",
@@ -1876,6 +1899,20 @@ node, and the node view (`GET /system/nodes`) names it `name`; carrying both
 keeps one shape for the console without breaking callers that read
 `hostname`. `last_seen` is likewise an alias of `last_heartbeat`
 (`null` = the agent has never heartbeated).
+
+`site_scope` controls which site configurations the agent receives:
+
+- **`all`** (legacy default) — every site owned by the agent's API key. This is
+  the highest-memory mode and the behaviour before per-agent assignment.
+- **`selected`** — only the sites in `site_ids` / `site_domains`. An empty
+  list is valid and leaves the agent with no site configuration (an idle
+  node); it still heartbeats and can be assigned later.
+
+`site_id` / `site_domain` are the legacy single-binding fields and are `null`
+for a selected agent; use `site_ids` / `site_domains`. Assignments are
+validated against the API key's owner, so one tenant's agent can never receive
+another tenant's site. `PUT /agents/{agent_id}/sites` changes the scope and
+immediately re-pushes the agent's configuration.
 
 Three address fields describe a node from different vantage points, and they
 answer different questions:
@@ -1997,6 +2034,28 @@ Rules:
   registration still matches on `hostname` + API key, and renaming never
   produces a duplicate node.
 - `404` when the agent does not exist.
+
+### PUT /agents/{agent_id}/sites
+
+Set the agent's site scope and replace its assignments. Requires write access.
+
+**Request:**
+```json
+{
+  "scope": "selected",
+  "site_ids": ["uuid-a", "uuid-b"]
+}
+```
+
+- `scope` is `all` or `selected`; anything else answers `400`.
+- `all` clears the assignment rows and the legacy single binding, restoring
+  "every site owned by the API key".
+- `selected` replaces the assignment set; duplicate ids are ignored, an empty
+  list is allowed, and every site must belong to the agent API key's owner
+  (otherwise `400`). Non-admin callers also need read access to each site.
+- The response is the updated agent object (same shape as the list item). The
+  control plane pushes the new configuration to a connected agent immediately;
+  an offline agent receives it on reconnect.
 
 ### GET /agents/{agent_id}/samples
 
@@ -3204,6 +3263,14 @@ Time-series request data.
 
 **Query Parameters:** `site_id`, `from`, `to`, `interval` (`minute`, `hour` (default), `day` or `week`), `limit`
 
+**Response (200):** one object per bucket with `bucket`, `requests`,
+`cache_hits`, `cache_saved_bytes`, `client_errors`, `server_errors`,
+`avg_latency_ms`, `blocked`, and the total-latency percentiles
+`p50_latency_ms` / `p90_latency_ms` / `p99_latency_ms`
+(`PERCENTILE_CONT` over the rows in the bucket). The latency chart plots the
+three percentiles because a mean hides the tail users actually feel; a bucket
+with no rows reports `0` for each.
+
 ### GET /analytics/traffic
 
 Egress bandwidth per fixed-width bucket — response bytes streamed to clients only; origin-pull traffic is never counted. Without `site_id` the call covers every site the caller may see.
@@ -3266,6 +3333,68 @@ rather than silently falling back to `false`, so a typo cannot quietly change
 the ranking. A present-but-empty value (`?blocked_only=`) is rejected too; omit
 the parameter for the default. `blocked_only=false` is byte-for-byte the statement the endpoint
 served before the parameter existed.
+
+**Response:** one row per client IP — `client_ip`, `country_code` (nullable),
+`requests`, `blocked`, `top_site_id` (nullable; the site the address last hit,
+which the console uses as the target of its one-click block/challenge) and the
+network the address belongs to: `asn` (nullable AS number) plus `asn_name`, the
+organization the control plane's ASN table maps it to (`Unknown (AS<n>)` when it
+has no entry). `asn` is `NULL` for private addresses, for deployments whose
+agents carry no GeoIP ASN data and for rows written before the column existed —
+the dashboard then shows `—` instead of guessing a network.
+
+### GET /analytics/top-asns
+
+Networks ranked by request count — the ASN table on the traffic and
+site-detail pages. Same window and tenant scoping as every other analytics
+endpoint: `site_id` scopes one site (the caller must be able to read it);
+without it an administrator sees every site, while a non-administrator is
+scoped to their own sites (their single site automatically, several sites
+requires naming one).
+
+**Query Parameters:** `site_id`, `from`, `to`, `range` (`24h` | `7d` | `30d`),
+`interval`, `limit` (default 10, capped at 100; the cap applies to networks
+that have a resolved ASN, so a window that also holds unresolved rows still
+returns up to `limit` ranked networks). Rows are ordered by `requests`
+descending with the AS number as the tie-break, so polling the same window
+twice returns the same order.
+
+**Response (200):**
+```json
+[
+  {"asn": 13335, "asn_name": "Cloudflare, Inc.", "requests": 1520},
+  {"asn": 64512, "asn_name": "Unknown (AS64512)", "requests": 12}
+]
+```
+
+`asn_name` is resolved by the control plane, not by a lookup service: a
+bundled snapshot of ASN → organization names
+(`pingwaf-server/assets/asn_names.tsv`, the major CDN / hyperscaler / ISP /
+hosting networks) is compiled into the binary and read once per process. An AS
+number with no entry is returned as `Unknown (AS<number>)` — never as a bare
+number — so the number stays visible and a missing name cannot be mistaken for
+a name.
+
+To extend or correct the names, export a two-column TSV
+(`<asn><TAB><organization>`; an `AS` prefix, blank lines and `#` comments are
+accepted) and point **`PINGWAF_ASN_NAMES_FILE`** at it. The file is read once,
+on first use, so restart the control plane after replacing it; its entries
+override the bundled ones. A missing, unreadable or oversized file only logs a
+warning and the bundled snapshot keeps serving, and an unparsable line is
+skipped with a warning that names the line — never a startup failure.
+
+Rows whose client address has no known AS number are **excluded** from the
+ranking rather than bucketed under an "unknown" network: a request written
+before the `asn` column existed, a private or reserved address, and a request
+whose address no database could map all store NULL. A window with no resolved
+network therefore answers `[]`, not an error.
+
+`access_logs.asn` is filled from the AS number the agent reports with each log
+entry (`LogEntry.asn`, field 82). The edge's GeoIP snapshot carries country
+ranges only, so an agent normally reports `0`; the control plane then fills the
+number from a local MaxMind ASN database — see [ASN data source](#asn-data-source).
+Without such a database the column stays NULL and the ranking is empty, which is
+the documented behaviour rather than a guessed value.
 
 ### GET /analytics/top-paths
 
@@ -3330,6 +3459,89 @@ zero.
   "desktop_share": 0.6897, "mobile_share": 0.2759, "ai_bots_share": 0.0207,
   "other_share": 0.0138 }
 ```
+
+---
+
+## ASN data source
+
+The ASN ranking needs the client's autonomous system number, and the edge's
+embedded GeoIP data does not carry ASN ranges. The control plane therefore
+enriches `access_logs.asn` at ingestion from a **MaxMind ASN database** it
+reads locally: a lookup is a binary search in process memory, so no request
+performs a network call, and nothing is downloaded at runtime.
+
+Accepted databases: `GeoLite2-ASN`, `GeoIP2-ISP` and `GeoIP2-Enterprise` (all
+carry `autonomous_system_number`). A country or city database is rejected with
+`400` rather than silently producing an empty ranking.
+
+**Two ways to install one — pick either:**
+
+| Source | How | Persists across restarts |
+|--------|-----|--------------------------|
+| Upload | `POST /api/v1/asn/database` (administrator) | Yes — written to `/var/lib/pingwaf/asn.mmdb`, the `pingwaf-data` volume of the shipped compose file |
+| Configured path | Set `PINGWAF_ASN_MMDB=/path/to/GeoLite2-ASN.mmdb` (mounted into the container) | Yes, the file is the operator's |
+
+An upload wins over the configured path only in the sense that it writes to
+`PINGWAF_ASN_MMDB` when that variable is set (the upload refuses to write a
+read-only mount with a `500`). With neither, the ranking stays empty.
+
+**Licensing and where to get the file.** MaxMind's GeoLite2 databases are free
+of charge but require a (free) MaxMind account and acceptance of the GeoLite2
+End User License Agreement; the download is licensed under CC BY-SA 4.0 and
+must be attributed to MaxMind. PingWAF does **not** download or redistribute
+the database: the operator fetches it once (`https://www.maxmind.com/en/geolite2/signup`,
+then *Download Databases → GeoLite2 ASN → MaxMind DB binary (.mmdb.gz)*),
+decompresses it, and installs it through one of the two rows above. Re-download
+monthly to pick up reallocated networks; re-upload (or restart) after replacing
+the file.
+
+### GET /asn/database
+
+Status of the data source. Administrators only. When no database is active
+but the configured file exists, this call loads it, so a database copied in
+after startup becomes visible without a restart (and without waiting for
+traffic).
+
+```json
+{
+  "path": "/var/lib/pingwaf/asn.mmdb",
+  "path_from_env": false,
+  "configured": true,
+  "active": true,
+  "database_type": "GeoLite2-ASN",
+  "build_time": "2026-11-15T00:00:00Z",
+  "error": null
+}
+```
+
+`active` is the flag that matters: when it is `false`, `error` says why (no
+file, unreadable, not a MaxMind database, wrong database type) and the ASN
+ranking is empty. `path_from_env` distinguishes an operator-mounted file from
+the upload default.
+
+### POST /asn/database
+
+Upload a database. Administrators only; `multipart/form-data` with a field
+named `file`. The file is validated (MaxMind format **and** ASN type) before it
+replaces the previous database, so a wrong or truncated download answers `400`
+and the working database keeps serving. Body limit: 64 MiB.
+
+```bash
+curl -X POST https://waf.example.com:9080/api/v1/asn/database \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@GeoLite2-ASN.mmdb"
+```
+
+**Response (200):** the same object `GET /asn/database` returns, with
+`active: true` and the new `database_type` / `build_time`.
+
+### DELETE /asn/database
+
+Remove the uploaded database and clear the in-memory copy; the ranking returns
+to empty. Administrators only. Answers `409` when `PINGWAF_ASN_MMDB` names the
+file — that path belongs to the operator, so delete it on the host instead.
+
+**Response (200):** the status object with `active: false`.
 
 ---
 
@@ -3909,8 +4121,8 @@ Requests per country over the last 24 hours (up to 20 countries), for the bar ch
 **Response (200):**
 ```json
 [
-  {"country_code": "CN", "requests": 5210},
-  {"country_code": "US", "requests": 1240}
+  {"country_code": "CN", "requests": 5210, "blocked": 610},
+  {"country_code": "US", "requests": 1240, "blocked": 12}
 ]
 ```
 
@@ -3918,8 +4130,8 @@ Requests per country over the last 24 hours (up to 20 countries), for the bar ch
 
 Requests per country aggregated across every site the caller may see
 (administrators: all sites; other accounts: the sites they own) — drives the
-world map on the global traffic page. Traffic whose country could not be
-resolved is skipped.
+globe and the country ranking on the traffic pages. Traffic whose country could
+not be resolved is skipped.
 
 **Query Parameters:**
 | Param | Type | Description |
@@ -3928,11 +4140,13 @@ resolved is skipped.
 | `limit` | int | Maximum countries returned (default: 100, clamped to 1-250) |
 
 **Response (200):** the same shape as the per-site stats, sorted by requests
-descending:
+descending (`blocked` is the number of requests the WAF refused in the same
+window — HTTP 403/429, the same definition `/analytics/top-ips` uses — which is
+what the globe's red threat bubbles are sized and shaded by). Rows:
 ```json
 [
-  {"country_code": "CN", "requests": 5210},
-  {"country_code": "US", "requests": 1240}
+  {"country_code": "CN", "requests": 5210, "blocked": 610},
+  {"country_code": "US", "requests": 1240, "blocked": 12}
 ]
 ```
 
@@ -4277,6 +4491,10 @@ saved one.
   "exempt_paths": [],
   "browser_integrity_check": true,
   "tls_fingerprint_check": false,
+  "base_difficulty": 20,
+  "max_difficulty": 24,
+  "issue_limit_per_min": 120,
+  "verify_limit_per_min": 300,
   "updated_at": "2026-09-30T09:00:00Z"
 }
 ```
@@ -4300,7 +4518,11 @@ plain-text rejection into the unified JSON error envelope with the
   "rate_threshold": 100,
   "exempt_paths": ["/health", "/static/"],
   "browser_integrity_check": true,
-  "tls_fingerprint_check": false
+  "tls_fingerprint_check": false,
+  "base_difficulty": 20,
+  "max_difficulty": 24,
+  "issue_limit_per_min": 120,
+  "verify_limit_per_min": 300
 }
 ```
 
@@ -4314,6 +4536,19 @@ plain-text rejection into the unified JSON error envelope with the
 | `exempt_paths` | Bypass list; see validation rules below |
 | `browser_integrity_check` | Browser fingerprint heuristic |
 | `tls_fingerprint_check` | TLS fingerprint check |
+| `base_difficulty` | Proof-of-work difficulty (leading zero bits) a quiet visitor solves, 4–28; default `20` |
+| `max_difficulty` | Ceiling the difficulty rises to under request/failure pressure, 4–28 and `>= base_difficulty`; default `24` |
+| `issue_limit_per_min` | Challenge pages issued per host+IP per 60-second window, 1–1000000; default `120`. Over it the edge answers `429` with `x-pingwaf-mitigated: block` |
+| `verify_limit_per_min` | Solution submissions accepted per host+IP per 60-second window, 1–1000000; default `300`. Over it verification fails closed with `429` and the pending nonce is left untouched |
+
+`base_difficulty`/`max_difficulty` drive adaptive proof of work: the difficulty
+starts at the base and rises per host+IP with failed verifications and with
+request volume above `rate_threshold`, capped at the max and reset by a
+successful verification. The difficulty issued with a challenge is stored with
+it and is the value the submission is verified against, so a settings change
+never invalidates pages already in flight. Difficulty values outside 4–28, a
+`max_difficulty` below `base_difficulty`, or a limit outside 1–1000000 are
+rejected with `400`.
 
 `exempt_paths` is an optional bypass list of path prefixes served without a
 challenge. Each entry must start with `/`, contain no whitespace or control
@@ -4391,9 +4626,9 @@ Delete a rewrite rule.
 
 ---
 
-## Error Pages
+## Custom Pages
 
-A custom error page replaces the body of any response with a matching status
+A custom page replaces the body of any response with a matching status
 code — including responses the edge itself produces (a WAF block, a rate limit,
 a paused site), not only ones that came from the origin. At most one page per
 `(scope, status_code)` combination, and the pages are global: every site is
@@ -4403,6 +4638,9 @@ the dashboard.
 A write pushes the new templates to every registered agent's next configuration
 update, so no per-site publish is involved.
 
+The API and database keep the historical `error-pages` / `error_pages` names
+for compatibility; the console calls the feature **Custom Pages**.
+
 ### Scopes
 
 Every error page carries a `scope`:
@@ -4411,10 +4649,11 @@ Every error page carries a `scope`:
 |-------|--------|--------------|
 | `site` (default) | Error responses of **matched** sites — WAF blocks, rate limits, paused sites, origin errors | 400–599 |
 | `unmatched_host` | Requests whose `Host` header matches **no** configured site, e.g. someone reaching the gateway by bare IP + port, or an unknown/expired hostname | 404, 421, 503 only (the dashboard defaults to 404) |
+| `challenge` | The JS / managed / interactive challenge page. Presentation only: the compiled challenge scripts are injected by the edge. This is a separate scope from the site/unmatched-host 503 error pages; editing it does not change them | 503 only |
 
-The two scopes serve disjoint request paths, so a `site` 404 page and an
-`unmatched_host` 404 page can coexist; creating a second page with the same
-`(scope, status_code)` answers `409 conflict`.
+The scopes serve disjoint request paths, so a `site` 404 page, an
+`unmatched_host` 404 page and the `challenge` 503 page can coexist; creating a
+second page with the same `(scope, status_code)` answers `409 conflict`.
 
 `site` pages render with `request_id`, `error_code`, `error_message`,
 `site_name`, `client_ip`, `timestamp`, `method`, `path` (aliased as
@@ -4422,6 +4661,15 @@ The two scopes serve disjoint request paths, so a `site` 404 page and an
 `unmatched_host` pages render with only `{{ host }}` (HTML-escaped before it
 enters the template, so it is always safe to interpolate) and
 `{{ request_id }}` — no request header is ever reflected into the template.
+`challenge` pages render with `challenge_scripts` (the compiled fingerprint,
+proof-of-work, verification and redirect scripts; use
+`{{ challenge_scripts | safe }}`), `brand_name`, `request_id`, `difficulty`,
+`verify_endpoint` and `original_url`. The page must keep the DOM ids
+`countdown`, `title`, `subtitle`, `status`, `spinnerWrap`, `progressBar` and
+`progressFill`, and must not contain its own `<script>` tags. A template that
+omits the safe filter, loses an id or contains a script tag falls back to the
+built-in challenge page.
+
 A template that fails to render (or renders past 256 KiB) falls back to a
 plain-text body, so a typo cannot turn an error page into a `500`. Fallback
 responses carry `Cache-Control: no-store`.
@@ -4435,7 +4683,7 @@ With no `unmatched_host` page configured the edge keeps its plain default 404.
 ### GET /error-pages
 
 List custom error pages (paginated), ordered by scope, then status code.
-Optional `?scope=site|unmatched_host` filters by scope.
+Optional `?scope=site|unmatched_host|challenge` filters by scope.
 
 ### POST /error-pages
 
@@ -4455,8 +4703,8 @@ Create a custom error page.
 
 | Field | Description |
 |-------|-------------|
-| `status_code` | 400-599; for `unmatched_host` only 404, 421, 503 (otherwise `400 bad_request`) |
-| `scope` | `site` (default) or `unmatched_host`; anything else answers `400` |
+| `status_code` | 400-599; `unmatched_host` only 404/421/503; `challenge` only 503 (otherwise `400 bad_request`) |
+| `scope` | `site` (default), `unmatched_host` or `challenge`; anything else answers `400` |
 | `name` | 1-200 characters |
 | `content_type` | Defaults to `text/html` |
 | `body_template` | Tera template, must not be empty |

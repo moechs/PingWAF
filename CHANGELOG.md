@@ -8,6 +8,407 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [Unreleased]
+
+## [PingWAF 0.32.50] — 2026-11-25
+
+### Changed
+
+- **Traffic page: a threat layer on the globe, a fullscreen view, and real
+  latency percentiles.** The globe now draws a red bubble per country the WAF
+  refused requests from (HTTP 403/429), sized and shaded by the block count — so
+  the map answers "where are the attacks coming from" beside the existing
+  request bubbles — with a fullscreen toggle next to the pause button. The card
+  takes two thirds of its row with the ASN ranking beside it, and the ASN empty
+  state now names the real cause: the number is resolved on the control plane
+  from a MaxMind ASN database (GeoLite2-ASN), so an installation without one
+  ranks nothing, and logs written before it was installed stay unranked.
+  `GET /analytics/requests-over-time` returns `p50`/`p90`/`p99_latency_ms` per
+  bucket and the latency chart plots all three instead of the mean alone; both
+  geo-statistics endpoints return `blocked` next to `requests`.
+- **Dashboard: response mix, inventory and attacker networks at a glance.** The
+  status-code widget is now a donut whose slices are the response families,
+  drawn with the traffic page's palette and tooltip (a 4xx is the same colour on
+  both pages) while the per-code counts stay listed underneath. Live visitors
+  moved out of its own wide card into the KPI row — same icon tile, figure,
+  label and help tooltip as Requests and the rest — beside a new **total
+  sites** card that also reports how many of them are active. The threat-IP
+  table gained an **ASN** column: the organization name, the `AS<number>`, and
+  both in the hover title, backed by a new `asn` / `asn_name` pair on
+  `GET /analytics/top-ips`. Addresses the edge never resolved (private ranges,
+  agents without GeoIP ASN data, logs written before the column existed) stay
+  `NULL` and render `—` rather than a guessed network.
+- **The console listens on `0.0.0.0` by default.** The installer and the compose
+  file bound the dashboard to `127.0.0.1`, so a fresh install answered nothing on
+  the host's own address: opening `https://<host>:9080` from any other machine
+  failed and the installation looked broken before the first login was even
+  possible. `admin_addr` is now written as `0.0.0.0:9080` (the built-in default
+  all along), compose publishes `PINGWAF_ADMIN_BIND=0.0.0.0` and the shipped
+  `pingwaf.toml` matches. The exposure stays bounded by what the installer
+  already does — the administrator password is generated per install and a fresh
+  database answers every write with `403 password_change_required` until it is
+  changed. gRPC (9090) is unchanged (`127.0.0.1` until `--listen-public`, which
+  now governs only gRPC). Restrict 9080 with a firewall,
+  `PINGWAF_ADMIN_BIND=<admin-ip>` or a reverse proxy; deployments that already
+  front it with a proxy keep working untouched.
+
+## [PingWAF 0.32.49] — 2026-11-25
+
+### Added
+
+- **Adaptive proof-of-work difficulty.** A challenge's difficulty now starts at
+  the site's `base_difficulty` (20 by default — the value every deployment
+  already used) and rises per host+IP with failed verifications and with
+  request volume above `rate_threshold`, capped at `max_difficulty` (24 by
+  default) and reset by a successful verification. The difficulty issued with
+  a challenge is stored with the pending entry and is what the submission is
+  verified against, so a page is always solvable exactly as issued and a
+  settings change never invalidates pages in flight. The client never supplies
+  the value. Wired through a new `challenge_settings` migration
+  (`000103_challenge_adaptive_pow`), the site API (`GET`/`PUT
+  /sites/{site_id}/challenge`), the proto `ChallengeConfig` (`base_difficulty`,
+  `max_difficulty`), the agent cache and the challenge plugin; configurable in
+  the console under **Web Protection → Rate limiting & challenge**.
+- **Per-IP challenge issuance and verification limits.** One guarded mint path
+  serves every challenge the edge can issue — the CC gate and a WAF rule /
+  IP-geo / bot / rate-limit challenge alike — and keeps bounded, TTL-pruned per
+  host+IP counters for the two new settings `issue_limit_per_min` (default 120)
+  and `verify_limit_per_min` (default 300). Above the issuance limit the visitor
+  gets a `429` rate-limit page stamped `x-pingwaf-mitigated: block` instead of a
+  challenge page; above the verification limit the submission is refused with
+  `429` **before** any verification work, so a flood of guesses cannot spend a
+  legitimate visitor's nonce. Both refusals are written to the access log. A
+  full counter table never refuses issuance (the page is minted without a
+  budget entry) so an attacker cannot lock new visitors out, while verification
+  fails closed. WAF-minted pages use the site's difficulty and the same budget
+  rather than the WAF plugin's static value. All counters are per edge process.
+- **ASN data source for the traffic ranking.** The edge's GeoIP snapshot
+  carries country ranges only, so agents report ASN `0` and `access_logs.asn`
+  would stay NULL. The control plane now enriches the column at ingestion from
+  a locally read MaxMind ASN database (`GeoLite2-ASN` / `GeoIP2-ISP` /
+  `GeoIP2-Enterprise`), installed either by uploading it through the new
+  administrator endpoints (`GET`/`POST`/`DELETE /api/v1/asn/database`, written
+  to the `pingwaf-data` volume) or by pointing `PINGWAF_ASN_MMDB` at a file.
+  The agent's own value still wins; a database miss stays NULL. The database is
+  read once into memory, so no request performs a network call, and a country
+  database is rejected instead of producing an empty ranking. Without a
+  database the ranking stays empty, which is documented. See
+  [docs/api.md](docs/api.md#asn-data-source).
+- **ASN analytics: `GET /api/v1/analytics/top-asns`.** `access_logs` gains a
+  nullable `asn` column (migration 000102) filled from the AS number the agent
+  already ships in `LogEntry.asn`; the endpoint ranks networks by request
+  count over the same window and tenant scope as the other analytics
+  endpoints, returning `{asn, asn_name, requests}` ordered by requests
+  descending. ASN → organization names come from a bundled snapshot
+  (`pingwaf-server/assets/asn_names.tsv`) that an operator can extend or correct
+  through the new `PINGWAF_ASN_NAMES_FILE` import — no per-request network
+  call — and an unlisted number is labelled `Unknown (AS<number>)` instead of
+  a bare number. The edge now resolves the client's ASN once per request and
+  carries it onto the access log (the protocol field existed, but the agent
+  hardcoded 0, so the column could never be populated). Rows without a
+  resolved ASN stay NULL and are excluded from the ranking, so the endpoint
+  answers `[]` on a deployment whose GeoIP data has no ASN ranges. See
+  [docs/api.md](docs/api.md#get-analyticstop-asns).
+
+### Fixed
+
+- **The JS challenge no longer loops on HTTP/2 when the browser splits its
+  cookies.** HTTP/2 lets a client send its cookie jar as several `Cookie`
+  header fields (RFC 9113 §8.2.3) and Chromium does exactly that once the jar
+  grows, so a request arrives as `cookie: app_id=…`, `cookie: session_id=…`,
+  `cookie: __pingwaf_clearance=…`. Every clearance read took only the first
+  field: the visitor solved the challenge, was issued a fresh signed cookie,
+  and was challenged again on the next request — an endless loop that stopped
+  the moment HTTP/2 was disabled in the browser (issue #108, reproducible with
+  Under Attack Mode and with WAF rules whose action is Challenge).
+  `get_cookie_value()` now parses every `Cookie` field in wire order, joined
+  with the `"; "` separator RFC 9113 requires a recipient to assume, and the
+  WAF plugin's cookie map and clearance extractor do the same. Fixed at the
+  shared accessor because the single-field read also hid cookies from OIDC
+  sessions, the JWT-in-cookie mode, CSRF double-submit, visitor auth, sticky
+  sessions, hash-by-cookie, `match_cookies` location conditions and access-log
+  cookie tags.
+- **A site's "self-signed" mode now actually issues a certificate.** The flag
+  was stored and pushed to the edge but never consumed: a site that enabled
+  HTTPS with `self_signed: true` (the console's default for a new site) pushed
+  a TLS listener with no certificate, so every handshake on 443 failed with
+  `tls_choose_sigalg: no suitable signature algorithm` while the console
+  promised automatic issuance. The control plane now issues a leaf covering the
+  site's domain and `alternate_domains` into `site_ssl.cert_pem/key_pem`
+  (issuer `PingWAF Self-Signed`), renews it before expiry, and issues one for
+  the clone of a self-signed site. A backfill migration flags existing sites
+  that had HTTPS on with no certificate source at all, and the startup
+  reconcile issues their leaves, so an upgraded deployment stops failing every
+  handshake without operator action. Enabling HTTPS with no source at all is
+  now rejected with `400` instead of silently pushing a listener that cannot
+  complete one; an uploaded pair, a selected certificate or an ACME order turns
+  self-signed mode off, and a delivered ACME certificate takes the site over
+  from the generated leaf.
+- **The ASN ranking's `limit` now counts only real networks.** The endpoint
+  filtered AS0 and out-of-range values in Rust *after* the SQL `LIMIT`, so a
+  window dominated by such rows (written by an older writer or a manual
+  insert) could answer fewer rows than requested — even an empty list. The
+  validity range is now part of the statement, so the cap applies to networks
+  that actually have a resolved ASN. `GET`/`POST`/`DELETE /asn/database` also
+  moved their MaxMind file reads and writes onto the blocking thread pool,
+  where an 8–10 MB read can no longer stall an async worker serving other
+  requests.
+
+### Changed
+
+- **Reworked traffic dashboard (traffic + site-detail traffic pages).** The
+  oversized world map is replaced by an interactive 3D globe (d3-geo
+  orthographic projection over the bundled world-atlas topology, rendered as
+  SVG — no WebGL and no new dependency) with request-sized country bubbles,
+  drag/arrow-key rotation, a pause control and `prefers-reduced-motion`
+  support, beside a separate scrollable country ranking that drills into the
+  matching access logs. Bandwidth and requests now share one composed chart
+  with a request axis and a bit-rate axis; egress is summed into the request
+  buckets (bucket width derived from the returned timestamps), so the two
+  series cannot drift and no bucket is dropped. A new sortable **ASN Top**
+  table (network name, `ASxxxxx`, requests, share of the window) renders
+  `GET /analytics/top-asns`, and the unknown-network fallback is localised in
+  all three console languages.
+
+## [PingWAF 0.32.48] — 2026-11-22
+
+### Security
+
+- **Challenge submissions are bound to the issuing client context.** The
+  pending challenge now records the client IP and request User-Agent observed
+  when the page was issued; verification rejects a submission from another
+  address, another UA, or a fingerprint whose `user_agent` disagrees with the
+  live request. This closes the trivial "fetch the page on one machine, solve
+  it elsewhere, submit a fabricated fingerprint" path. The nonce comment was
+  also corrected: the nonce is necessarily embedded in the page for PoW, while
+  the site id and request context stay server-side.
+
+## [PingWAF 0.32.47] — 2026-11-22
+
+### Fixed
+
+- **Challenge verification now uses the per-site engine.** `handle_verify`
+  called the static plugin engine, so a site's `browser_integrity_check`,
+  clearance duration and TLS-fingerprint settings were ignored when the
+  browser submitted its solution. A site that disabled the integrity check
+  still rejected automated/headless browsers as `headlesschrome`. The verify
+  endpoint now resolves the same per-site engine that issued the challenge,
+  falling back to the static engine only when the site no longer resolves.
+
+## [PingWAF 0.32.46] — 2026-11-22
+
+### Changed
+
+- **Agent full-config sync peak reduced.** The full `SiteConfig` sync now
+  converts every proto bundle into the local `SiteRules` mirror and builds the
+  domain index **before** the RCU closure. Previously each RCU retry repeated
+  the conversion and the old/new snapshots overlapped with a second full set
+  of converted rules. The closure now only clones the prepared maps and swaps
+  them in; the full config still replaces both maps authoritatively.
+- **`SiteRules` identifiers are interned.** `site_id`, `domain` and alternate
+  domains are `Arc<str>`; `CachedRules::sites` keys and `domain_index` values
+  share the site-id `Arc`, and domain-index keys share the normalized domain
+  `Arc` where possible. This removes the duplicate site/domain strings that
+  were stored per site and per domain entry. Site status is now a
+  `SiteStatus` enum (`active`/`paused`/`pending`) instead of a `String`, with
+  the same lowercase snapshot representation.
+
+## [PingWAF 0.32.45] — 2026-11-22
+
+### Fixed
+
+- **Updated `url` to 2.5.9 for RUSTSEC-2026-0592.** The advisory is a stack
+  overflow in `Url::origin()` on nested `blob:` URLs; 2.5.8 was the version in
+  `Cargo.lock` and the Security Audit gate failed on it. The dependency bump
+  also carries `form_urlencoded` 1.2.3.
+
+## [PingWAF 0.32.44] — 2026-11-22
+
+### Fixed
+
+- **Fixed the `agent_sites` migration on PostgreSQL.** SeaORM emitted two
+  primary-key constraints for the composite key, so `0.32.43` failed to boot
+  with `multiple primary keys for table "agent_sites" are not allowed`. The
+  migration now declares one composite primary key. `0.32.43` was withdrawn;
+  use `0.32.44`.
+- **The challenge page is no longer labelled "503 Service Unavailable".**
+  Custom Pages → Challenge page now uses an explicit challenge label and a
+  "Challenge template" subtitle. The challenge page is a separate
+  `error_pages` scope: editing it never changes the site or unmatched-host 503
+  error pages. Legacy challenge rows named "Service Unavailable" are displayed
+  and normalised to the challenge label.
+
+### Added
+
+- **Per-agent site scope.** A new `agent_sites` table and `agents.site_scope`
+  let an agent serve only its assigned sites (`selected`) instead of every
+  site owned by its API key (`all`, the legacy default). The console's Agents
+  page has a **Manage sites** dialog; `PUT /api/v1/agents/{id}/sites` changes
+  the scope and re-pushes the agent immediately. This is the P0 memory
+  optimisation for multi-site, multi-node fleets: rule bundles, certificates
+  and per-site caches scale with the assignment rather than the whole account.
+  Existing single-site bindings are migrated to a selected assignment; an
+  empty selection is valid and leaves the node idle.
+
+## [PingWAF 0.32.42] — 2026-11-22
+
+### Added
+
+- **Challenge page presentation templates reuse Custom Error Pages.** The
+  error-page editor now has a `challenge` scope (fixed 503); the template is
+  global, Tera-rendered and delivered through the existing agent bundle. The
+  fingerprint, proof-of-work, verification and redirect JavaScript remains
+  compiled in and is injected at `{{ challenge_scripts | safe }}`. Templates
+  containing `<script>`, omitting the safe filter or missing one of the
+  required DOM ids fall back to the built-in page with a warning.
+
+### Changed
+
+- **The dashboard section is now "Custom Pages"** (自定义页面 / カスタムページ),
+  covering error responses and the challenge page. The API path
+  `/api/v1/error-pages` and the `error_pages` table keep their historical names
+  for compatibility; docs explain the mapping.
+
+### Fixed
+
+- **Removed stale `cargo-audit` ignores.** `RUSTSEC-2026-0344` (ruzstd) and
+  `RUSTSEC-2026-0194`/`0195` (quick-xml) no longer match anything in
+  `Cargo.lock`: ruzstd is already 0.9.1 and quick-xml is no longer in the tree.
+  Leaving the ids in `.cargo/audit.toml` would silently mute a later
+  regression.
+
+## [PingWAF 0.32.41] — 2026-11-22
+
+### Fixed
+
+- **The agent installer keeps the control-plane CA and verifies the node
+  actually registered.** `--server-ca-cert` used to be written into the
+  config/unit as the source path, so a CA downloaded to `/tmp` disappeared on
+  the next reboot and every gRPC handshake failed with an opaque certificate
+  error. The installer now copies it to `/etc/pingwaf/grpc-ca.pem` and
+  references that path. It also restarts an already-running unit (`enable
+  --now` does not restart), waits up to 60 s for `Registered with control
+  plane`, and exits nonzero instead of printing "installed successfully" when
+  the node never registers.
+- **Agent install docs state the unbound all-sites scope and the control-plane
+  version requirement.** Every agent currently receives every site owned by
+  the API key's owner, including the control-plane dashboard site whose
+  upstream is `127.0.0.1:9080`; on an edge that loopback has no dashboard and
+  the site returns 502. The docs now say so, and explain that an ACME-issuing
+  control plane must be 0.32.40+ to sync and push issued PEMs; older control
+  planes make each agent start its own HTTP-01 order, which fails behind the
+  control plane. The `PINGAP_DISABLE_ACME=true` mitigation and the fact that
+  the console's generated install command omits the CA/`--server-tls-name` are
+  documented too.
+
+- **Manual binary + systemd installs no longer lose the cache or expose the
+  console by default.** The shipped unit now sets
+  `WorkingDirectory=/var/lib/pingwaf`; without it the example config's relative
+  `cache_dir = "./data/cache"` resolved to `/data/cache`, which
+  `ProtectSystem=strict` made read-only, so the agent cache and ACME state
+  failed to persist (`Failed to create cache directory ... Read-only file
+  system`). The example config now binds the dashboard and gRPC to loopback
+  instead of `0.0.0.0`, matching the installer's default; use `0.0.0.0` only
+  behind a proxy or for remote agents.
+- **The manual install documentation matches the archive and the binary.**
+  Path 3 now copies `pingwaf-linux-amd64/pingwaf.service` from inside the
+  extracted directory, creates the `pingwaf` user idempotently, installs the
+  distribution's PostgreSQL package (`postgresql-18` on Ubuntu 26.04, not the
+  non-existent `postgresql-16`), uses `PINGWAF_DB_URL` instead of the ignored
+  `PINGWAF_DATABASE_URL`, and tells the operator to change the example
+  `pingwaf123` admin password and set `PINGWAF_SECRET_KEY` before first start.
+  It also documents the manual unit's missing mimalloc arena pin and the need
+  to move an old agent cache aside when switching to all-in-one.
+
+## [PingWAF 0.32.40] — 2026-11-22
+
+### Fixed
+
+- **ACME-issued PEMs are synced from the embedded data plane into the control
+  plane and pushed to every agent.** In all-in-one mode the data plane's
+  lets-encrypt task issued the certificate into its local `acme_state.toml`,
+  but `site_certificates.cert_pem` stayed empty. `build_site_config` therefore
+  told every other agent "ACME enabled, no PEM", and each tried its own
+  HTTP-01 order. The CA's validation request reaches whichever instance owns
+  port 80 — the control plane — which never had the token the issuing edge
+  saved, so the order failed with `token not found` and the edge never got a
+  certificate to serve. The control plane now mirrors the PEMs (and their
+  issuer/validity) from `acme_state.toml` into the ACME-managed
+  `site_certificates` rows every 30 seconds and pushes the updated bundle to
+  the agents. `PINGWAF_ACME_STATE` overrides the file path; a remote agent
+  that is not the HTTP-01 endpoint should still use DNS-01.
+- **Global certificate events are no longer dropped as "foreign site".**
+  `ShipCertEvents` rejected an empty `site_id`, so the ACME environment,
+  account and authorization lines — which have no site — were discarded with
+  a misleading `site this agent does not serve` warning. Empty stamps are now
+  stored as global events (`site_id = NULL`); only a non-empty invisible site
+  is dropped. An empty stamp that still names a `certificate_id` is rejected
+  too, so an agent cannot fail another tenant's certificate by id. The
+  heartbeat/log/security paths still reject empty stamps.
+- **The benign pingora bodyless-upstream warning no longer floods the log.**
+  pingora 0.9.1 logs `Upstream body is already finished. Nothing to write` for
+  every HTTP/2 GET whose upstream is HTTP/1.1, which turned a crawler into
+  hundreds of WARN lines per hour. The fmt layer now drops exactly that
+  message; the real fix is in pingora.
+
+## [PingWAF 0.32.39] — 2026-11-21
+
+### Fixed
+
+- **The installer now sizes mimalloc's first arena from the memory ceiling.**
+  mimalloc creates its first arena at load time, before
+  `allocator_tune::apply()` can call `mi_option_set`, and an existing arena
+  cannot be shrunk. On a small host the generated systemd unit therefore kept
+  the 1 GiB default reserve (a 894 MiB host showed a 1 GiB anonymous mapping
+  and the "below the 2 GiB minimum" warning) even though the startup log
+  printed the adaptive value. `install.sh` now writes
+  `MIMALLOC_ARENA_RESERVE` and `MIMALLOC_ARENA_EAGER_COMMIT` into the unit's
+  environment from the cgroup v2/v1 limit or `MemTotal`: 64 MiB below 1 GiB,
+  256 MiB below 4 GiB, 512 MiB up to 16 GiB, else 1 GiB; eager commit is on
+  only at 4 GiB and above. The dry-run plan prints the computed values.
+  This reduces virtual/committed memory and removes the startup warning on
+  small hosts; it does not shrink the live data-plane heap, which the binary
+  split does not change either.
+- **The allocator warning now checks whether the standard env var is set.**
+  `allocator_tune` only warned below a 2 GiB ceiling and never looked at
+  `MIMALLOC_ARENA_RESERVE`, so a pinned unit still printed the warning, while
+  2–16 GiB hosts (adaptive 256/512 MiB) silently kept the 1 GiB default
+  without any warning. The condition now covers the whole range where the
+  adaptive reserve is below mimalloc's default, uses the effective value in
+  the message, and is suppressed when `MIMALLOC_ARENA_RESERVE` is present in
+  the process environment.
+- **The agent-only binary keeps the full binary's tracing target.** Logs from
+  `src/pingwaf.rs` used the module path, so the edge build reported
+  `pingwaf_agent::pingwaf` while the full build reported `pingwaf::pingwaf`;
+  filters, alerts and dashboards keyed on the target missed edge nodes. Both
+  builds now use `pingwaf::pingwaf`.
+- **`--version` / `--help` no longer print allocator diagnostics.** The
+  allocator probe runs before the CLI, so asking for the version printed the
+  startup banner and (on small hosts) the arena warning to stderr first.
+  Informational flags now skip the probe; a real startup still logs it.
+
+## [PingWAF 0.32.38] — 2026-11-21
+
+### Added
+
+- **The edge agent now ships as its own binary, and `install.sh --mode agent`
+  installs it.** The agent used to be a mode of the all-in-one `pingwaf`
+  binary, which meant an edge node downloaded, stored and mapped the control
+  plane too (PostgreSQL/sqlx, the REST API and the embedded dashboard). The
+  new `pingwaf-agent` target (`cargo build --bin pingwaf-agent --features
+  edge`) compiles the same data plane with the control-plane modules and the
+  dashboard-embedding admin plugin compiled out; the release pipeline publishes
+  `pingwaf-agent-linux-{amd64,arm64}.tar.xz` / `.tar.gz` alongside the existing
+  archives, with the same `.sha256` sidecars and build-provenance attestations.
+  `install.sh --mode agent` downloads that archive and installs it as
+  `/usr/local/bin/pingwaf`, so the systemd unit, the config path and the
+  upgrade path are unchanged; `pingwaf --version` marks the build with `edge`.
+  Releases that predate the asset fall back to the full binary with a warning.
+  The agent-only binary accepts both `pingwaf-agent agent ...` (the spelling
+  the unit uses, and what a self-upgraded all-in-one binary still understands)
+  and `pingwaf-agent ...`. `server`, `all-in-one` and the maintenance commands
+  remain available only from the full `pingwaf` binary.
+
 ## [PingWAF 0.32.37] — 2026-11-21
 
 ### Fixed

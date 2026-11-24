@@ -41,10 +41,12 @@ pub struct PingWafCli {
 #[derive(Subcommand, Debug)]
 pub enum PingWafCommand {
     /// Run the control plane server only (REST API + gRPC + dashboard)
+    #[cfg(not(feature = "edge"))]
     Server(ServerOpts),
     /// Run the data plane agent only (connects to a remote control plane)
     Agent(AgentOpts),
     /// Run both control plane and data plane in a single process
+    #[cfg(not(feature = "edge"))]
     AllInOne(AllInOneOpts),
     /// Dashboard user administration
     User {
@@ -69,6 +71,7 @@ pub enum PingWafCommand {
 }
 
 /// Options shared by all PingWAF modes.
+#[cfg(not(feature = "edge"))]
 #[derive(Parser, Debug, Clone)]
 pub struct CommonOpts {
     /// PostgreSQL connection string
@@ -136,6 +139,7 @@ pub struct CommonOpts {
 }
 
 /// Control plane server options.
+#[cfg(not(feature = "edge"))]
 #[derive(Parser, Debug, Clone)]
 #[command(args_override_self = true)]
 pub struct ServerOpts {
@@ -277,6 +281,7 @@ pub struct AgentOpts {
 }
 
 /// All-in-one mode options (server + agent in one process).
+#[cfg(not(feature = "edge"))]
 #[derive(Parser, Debug, Clone)]
 #[command(args_override_self = true)]
 pub struct AllInOneOpts {
@@ -533,9 +538,12 @@ pub enum OnOff {
 /// The run modes: the subcommands that start a long-running process.
 ///
 /// Test-only: production mode detection comes from clap via [`is_mode`], and
-/// the parity test keeps this list honest.
-#[cfg(test)]
+/// the parity test keeps this list honest. The agent-only build exposes just
+/// `agent`, so its list shrinks with the CLI.
+#[cfg(all(test, not(feature = "edge")))]
 pub const RUN_MODES: [&str; 3] = ["server", "agent", "all-in-one"];
+#[cfg(all(test, feature = "edge"))]
+pub const RUN_MODES: [&str; 1] = ["agent"];
 
 /// The maintenance commands: they run against the database and exit.
 #[cfg(test)]
@@ -577,10 +585,15 @@ fn version_banner() -> &'static str {
 /// clap serves `--version` from the top-level command, which an injected
 /// subcommand hides, so the flag is answered here instead.
 fn print_version(args: &[String]) -> ! {
-    if args.iter().skip(1).any(|arg| arg == "--version") {
-        println!("pingwaf {}", version_banner());
+    let program = if cfg!(feature = "edge") {
+        "pingwaf-agent"
     } else {
-        println!("pingwaf {}", env!("CARGO_PKG_VERSION"));
+        "pingwaf"
+    };
+    if args.iter().skip(1).any(|arg| arg == "--version") {
+        println!("{program} {}", version_banner());
+    } else {
+        println!("{program} {}", env!("CARGO_PKG_VERSION"));
     }
     std::process::exit(0);
 }
@@ -613,6 +626,7 @@ fn apply_db_file(db: &mut DbOpts) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(feature = "edge"))]
 fn apply_common_file(common: &mut CommonOpts) -> Result<(), String> {
     if let Some(path) = common.db_url_file.as_deref() {
         common.db_url = load_secret_file(path, "--db-url-file")?;
@@ -670,7 +684,9 @@ fn apply_config_subcommand(command: &mut ConfigCommand) -> Result<(), String> {
 /// warning below still tells them the inline value was visible.
 fn apply_secret_files(command: &mut PingWafCommand) -> Result<(), String> {
     match command {
+        #[cfg(not(feature = "edge"))]
         PingWafCommand::Server(opts) => apply_common_file(&mut opts.common),
+        #[cfg(not(feature = "edge"))]
         PingWafCommand::AllInOne(opts) => {
             apply_common_file(&mut opts.common)?;
             apply_api_key_file(&mut opts.api_key, opts.api_key_file.as_deref())
@@ -767,12 +783,96 @@ pub fn parse_pingwaf_cli() -> PingWafCli {
     cli
 }
 
+/// Parse the command line of the agent-only `pingwaf-agent` binary.
+///
+/// Two spellings are accepted:
+///
+/// * `pingwaf-agent agent --server-url ...` — the same invocation as
+///   `pingwaf agent`, which matters because a self-upgrade replaces the file
+///   with the control plane's all-in-one build while the unit's `ExecStart`
+///   keeps saying `... agent`.
+/// * `pingwaf-agent --server-url ...` — the redundant subcommand omitted.
+///
+/// `--config` layering, `--api-key-file`, `--version` and the inline-secret
+/// warnings are shared with [`parse_pingwaf_cli`].
+#[cfg(feature = "edge")]
+pub fn parse_agent_cli() -> AgentOpts {
+    parse_agent_args(std::env::args().collect())
+}
+
+#[cfg(feature = "edge")]
+fn parse_agent_args(args: Vec<String>) -> AgentOpts {
+    if wants_version(&args) {
+        print_version(&args);
+    }
+
+    let mut argv = args.clone();
+    // `--help` and a bare flag list are parsed as `agent ...`, so clap prints
+    // the agent's own help instead of the top-level command's.
+    if argv.get(1).map(String::as_str) != Some("agent") {
+        argv.insert(1, "agent".to_string());
+    }
+
+    // The file's arguments go next to the subcommand so the command line,
+    // parsed after them, still wins (same contract as `pingwaf agent`).
+    match crate::config_file::injections("agent", &argv) {
+        Ok(extra) => {
+            argv.splice(2..2, extra);
+        },
+        Err(err) => {
+            eprintln!("pingwaf-agent: {err}");
+            std::process::exit(1);
+        },
+    }
+
+    let mut cli = PingWafCli::parse_from(argv);
+    if let Err(err) = apply_secret_files(&mut cli.command) {
+        eprintln!("pingwaf-agent: {err}");
+        std::process::exit(1);
+    }
+    for warning in inline_secret_warnings(&args) {
+        eprintln!("warning: {warning}");
+    }
+    match cli.command {
+        PingWafCommand::Agent(opts) => opts,
+        _ => {
+            // Only reachable if the injected `agent` was overridden by
+            // something clap accepted as a different subcommand; the agent
+            // build must not silently start another role.
+            eprintln!(
+                "pingwaf-agent only runs the data plane agent (agent mode)"
+            );
+            std::process::exit(2);
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> PingWafCommand {
         PingWafCli::try_parse_from(args).unwrap().command
+    }
+
+    /// The agent-only binary is invoked both ways: by the installer/unit
+    /// (`pingwaf-agent agent ...`, which is also what a self-upgraded
+    /// all-in-one binary understands) and directly (`pingwaf-agent ...`).
+    #[cfg(feature = "edge")]
+    #[test]
+    fn the_agent_binary_accepts_both_spellings() {
+        let opts = parse_agent_args(vec![
+            "pingwaf-agent".to_string(),
+            "--server-url=http://control-plane:9090".to_string(),
+        ]);
+        assert_eq!(opts.server_url, "http://control-plane:9090");
+
+        let opts = parse_agent_args(vec![
+            "pingwaf-agent".to_string(),
+            "agent".to_string(),
+            "--server-url=http://control-plane-2:9090".to_string(),
+        ]);
+        assert_eq!(opts.server_url, "http://control-plane-2:9090");
     }
 
     #[test]
@@ -800,6 +900,7 @@ mod tests {
         assert!(!opts.fail_open);
     }
 
+    #[cfg(not(feature = "edge"))]
     #[test]
     fn the_last_spelling_of_an_argument_wins() {
         // The configuration file is layered in as earlier arguments, so an
@@ -834,8 +935,10 @@ mod tests {
             let args = ["pingwaf", mode, path.as_str()];
             let cli = PingWafCli::try_parse_from(args).unwrap();
             let config = match cli.command {
+                #[cfg(not(feature = "edge"))]
                 PingWafCommand::Server(opts) => opts.config,
                 PingWafCommand::Agent(opts) => opts.config,
+                #[cfg(not(feature = "edge"))]
                 PingWafCommand::AllInOne(opts) => opts.config,
                 _ => panic!("{mode} is not a run mode"),
             };
@@ -980,6 +1083,7 @@ mod tests {
         file
     }
 
+    #[cfg(not(feature = "edge"))]
     #[test]
     fn db_url_file_is_trimmed_and_wins_over_the_inline_value() {
         let file = secret_file("postgres://file:pw@db:5432/pingwaf\n\n");
@@ -1037,6 +1141,7 @@ mod tests {
         assert_eq!(opts.db_url, "postgres://file:pw@db:5432/pingwaf");
     }
 
+    #[cfg(not(feature = "edge"))]
     #[test]
     fn empty_or_missing_secret_files_are_refused() {
         let empty = secret_file("  \n");

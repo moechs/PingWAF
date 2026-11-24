@@ -83,7 +83,7 @@ pub struct CachedRules {
     /// (`get_site_rules`) return a pointer instead of deep-cloning every
     /// rule the site carries. Updates build a new map but reuse the
     /// `Arc`s of untouched sites.
-    pub sites: HashMap<String, Arc<SiteRules>>,
+    pub sites: HashMap<Arc<str>, Arc<SiteRules>>,
     /// Domain → site_id index for fast lookup
     ///
     /// Keys and values are shared via `Arc<str>` so the copy-on-write
@@ -129,6 +129,16 @@ pub struct CachedRules {
     pub config_hash: Arc<str>,
 }
 
+/// Reuse an already-normalized domain `Arc` as the index key; only allocate
+/// when normalization actually changes the string.
+fn domain_index_key(domain: &Arc<str>) -> Arc<str> {
+    if normalize_host(domain) == **domain {
+        Arc::clone(domain)
+    } else {
+        Arc::from(normalize_host(domain))
+    }
+}
+
 impl Default for CachedRules {
     fn default() -> Self {
         Self {
@@ -145,16 +155,52 @@ impl Default for CachedRules {
     }
 }
 
+/// Lifecycle state of a site as the data plane sees it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SiteStatus {
+    #[default]
+    Active,
+    Paused,
+    Pending,
+}
+
+impl SiteStatus {
+    pub fn from_proto(value: i32) -> Self {
+        match value {
+            1 => Self::Paused,
+            2 => Self::Pending,
+            _ => Self::Active,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => site_status::ACTIVE,
+            Self::Paused => site_status::PAUSED,
+            Self::Pending => site_status::PENDING,
+        }
+    }
+}
+
 /// Rules for a single site/domain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteRules {
-    pub site_id: String,
-    pub domain: String,
-    pub alternate_domains: Vec<String>,
+    /// Interned site identifier: the same `Arc` is also the value stored in
+    /// `CachedRules::domain_index`, so a site id exists once per snapshot
+    /// instead of once per domain entry.
+    pub site_id: Arc<str>,
+    /// Interned primary domain. The domain index shares this `Arc` when the
+    /// control plane already stored the normalized form.
+    pub domain: Arc<str>,
+    /// Interned alternate domains, shared with their domain-index keys.
+    pub alternate_domains: Vec<Arc<str>>,
     /// Lifecycle status (`active`/`paused`/`pending`); caches written before
     /// the edge consumed it default to `active`.
-    #[serde(default = "default_site_status")]
-    pub status: String,
+    #[serde(default)]
+    pub status: SiteStatus,
     /// Per-site downstream read/write timeout in seconds; 60 for old caches.
     #[serde(default = "default_downstream_timeout_secs")]
     pub downstream_timeout_secs: u32,
@@ -366,13 +412,13 @@ fn path_match_type(value: i32) -> String {
 impl SiteRules {
     /// All domains this site responds to.
     pub fn all_domains(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.domain.as_str())
-            .chain(self.alternate_domains.iter().map(|s| s.as_str()))
+        std::iter::once(&*self.domain)
+            .chain(self.alternate_domains.iter().map(|s| s.as_ref()))
     }
 
     /// Whether the control plane has paused the site.
     pub fn is_paused(&self) -> bool {
-        self.status == site_status::PAUSED
+        self.status == SiteStatus::Paused
     }
 }
 
@@ -504,8 +550,8 @@ fn default_downstream_timeout_secs() -> u32 {
     60
 }
 
-fn default_site_status() -> String {
-    site_status::ACTIVE.to_string()
+fn default_site_status() -> SiteStatus {
+    SiteStatus::Active
 }
 
 /// Maps a `pingwaf.SiteStatusEnum` value onto the persisted string form; the
@@ -868,6 +914,17 @@ impl CacheTypePolicy {
 
 // ─── Challenge ──────────────────────────────────────────────
 
+/// Difficulty a site runs with when the control plane states none: the value
+/// every deployment used before difficulty became configurable.
+pub const DEFAULT_CHALLENGE_BASE_DIFFICULTY: u32 = 20;
+/// Ceiling adaptive difficulty may reach when none is configured.
+pub const DEFAULT_CHALLENGE_MAX_DIFFICULTY: u32 = 24;
+/// Challenge pages issued per host+IP per minute when none is configured.
+pub const DEFAULT_CHALLENGE_ISSUE_LIMIT_PER_MINUTE: u32 = 120;
+/// Solution submissions accepted per host+IP per minute when none is
+/// configured.
+pub const DEFAULT_CHALLENGE_VERIFY_LIMIT_PER_MINUTE: u32 = 300;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChallengeConfig {
     pub enabled: bool,
@@ -878,6 +935,30 @@ pub struct ChallengeConfig {
     pub request_threshold: u32,
     pub browser_integrity_check: bool,
     pub tls_fingerprint_check: bool,
+    /// Proof-of-work difficulty a normal visitor solves (leading zero bits).
+    /// Zero in the stored JSON means "unset" — an older snapshot written
+    /// before the field existed — and is read as
+    /// [`DEFAULT_CHALLENGE_BASE_DIFFICULTY`].
+    #[serde(default)]
+    pub base_difficulty: u32,
+    /// Ceiling adaptive difficulty may raise the work to.
+    #[serde(default)]
+    pub max_difficulty: u32,
+    /// Challenge pages issued per host+IP per 60-second window.
+    #[serde(default)]
+    pub issue_limit_per_minute: u32,
+    /// Solution submissions accepted per host+IP per 60-second window.
+    #[serde(default)]
+    pub verify_limit_per_minute: u32,
+}
+
+/// A proto3 scalar of `0` means "unset"; fall back to the documented default.
+fn or_default(value: u32, default: u32) -> u32 {
+    if value == 0 {
+        default
+    } else {
+        value
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1605,10 +1686,10 @@ impl RuleCache {
                 quota_mb = quota_mb
                     .max(quota::configured_quota_mb(domain).unwrap_or(0));
             }
-            let status = ssl.get(site_id);
+            let status = ssl.get(site_id.as_ref());
             out.push(proto::SiteStatus {
-                site_id: site_id.clone(),
-                domain: site.domain.clone(),
+                site_id: site_id.to_string(),
+                domain: site.domain.to_string(),
                 requests_total: 0,
                 requests_blocked: 0,
                 cache_hits: 0,
@@ -1700,7 +1781,7 @@ impl RuleCache {
             .inner
             .load()
             .sites
-            .get(&site_id)
+            .get(site_id.as_str())
             .map(|site| site.downstream_timeout_secs);
         let mut converted = Self::convert_bundle(bundle);
         // A rule bundle does not carry site-level fields. Preserve the value
@@ -1719,7 +1800,7 @@ impl RuleCache {
             .inner
             .load()
             .sites
-            .get(&site_id)
+            .get(site_id.as_str())
             .map(|s| site_enforcement(Some(s)));
 
         // Built once here and shared into the snapshot by pointer: the rcu
@@ -1739,7 +1820,7 @@ impl RuleCache {
             // Remove old domain index entries for this site. Removal keys
             // are normalised the same way as insertion keys below, so an
             // entry written as `EXAMPLE.com` is still findable for cleanup.
-            if let Some(old_site) = updated.sites.get(&site_id) {
+            if let Some(old_site) = updated.sites.get(site_id.as_str()) {
                 // A domain can be shared by several sites; only drop the
                 // index entry when it still points at *this* site, otherwise
                 // updating one site silently unhooks the other.
@@ -1772,7 +1853,7 @@ impl RuleCache {
             }
             updated
                 .sites
-                .insert(site_id.clone(), Arc::clone(&site_rules));
+                .insert(Arc::clone(&site_id_key), Arc::clone(&site_rules));
             // Every bundle carries the complete failover registry, so one
             // push refreshes it wholesale — including wholesale deletions
             // (an empty registry must replace a stale non-empty one).
@@ -1815,7 +1896,7 @@ impl RuleCache {
             .inner
             .load()
             .sites
-            .get(&site_id)
+            .get(site_id.as_str())
             .map(|s| site_enforcement(Some(s)));
         if previous.is_some_and(waf_enforcing)
             && !current.is_some_and(waf_enforcing)
@@ -1835,6 +1916,13 @@ impl RuleCache {
     }
 
     /// Update cache from a full SiteConfig (used on initial registration).
+    ///
+    /// The expensive part — converting every proto bundle into the local
+    /// `SiteRules` mirror and building the domain index — happens **before**
+    /// the RCU closure. `rcu` may retry under reader contention; doing the
+    /// conversion inside it repeated every allocation and held two full
+    /// generations of converted rules at once. The closure now only clones
+    /// the prepared maps and swaps them in.
     pub fn update_from_site_config(
         &self,
         config: &proto::SiteConfig,
@@ -1847,7 +1935,7 @@ impl RuleCache {
             .load()
             .sites
             .iter()
-            .map(|(id, s)| (id.clone(), site_enforcement(Some(s))))
+            .map(|(id, s)| (id.to_string(), site_enforcement(Some(s))))
             .collect();
 
         // The bundles embed the same registry in every site; one pass over
@@ -1861,8 +1949,16 @@ impl RuleCache {
         let mut global_cache = None;
         let mut origin_verify_cert = None;
         let mut log_settings = None;
+        let mut prepared_sites: HashMap<Arc<str>, Arc<SiteRules>> =
+            HashMap::with_capacity(config.sites.len());
+        let mut prepared_domain_index: HashMap<Arc<str>, Arc<str>> =
+            HashMap::with_capacity(config.sites.len() * 2);
+
         for site in &config.sites {
-            if let Some(ref bundle) = site.rules {
+            let Some(ref bundle) = site.rules else {
+                continue;
+            };
+            if failover_registry.is_none() {
                 failover_registry = Some(Arc::new(failover_registry_from(
                     &bundle.site_policies,
                 )));
@@ -1876,8 +1972,46 @@ impl RuleCache {
                     .log_settings
                     .as_ref()
                     .map(|ls| Arc::new(Self::convert_log_settings(ls)));
-                break;
             }
+
+            let mut site_rules = Self::convert_bundle(bundle);
+            // Override domain from site-level field
+            if !site.domain.is_empty() {
+                site_rules.domain = Arc::from(site.domain.as_str());
+            }
+            site_rules.site_id = Arc::from(site.id.as_str());
+            site_rules.alternate_domains = site
+                .alternate_domains
+                .iter()
+                .map(|domain| Arc::from(domain.as_str()))
+                .collect();
+            site_rules.status = SiteStatus::from_proto(site.status);
+            site_rules.downstream_timeout_secs =
+                if site.downstream_timeout_secs == 0 {
+                    default_downstream_timeout_secs()
+                } else {
+                    site.downstream_timeout_secs
+                };
+            site_rules.proxy_trust = ProxyTrustConfig {
+                enabled: site.trust_proxy_headers,
+                header: site.trusted_header.clone(),
+                last_hop_only: site.trust_last_hop,
+                trusted_ranges: site.trusted_proxy_ranges.clone(),
+            };
+
+            // The domain index shares the site id Arc across all of the
+            // site's domains instead of duplicating it per entry.
+            let site_id_key: Arc<str> = Arc::clone(&site_rules.site_id);
+            prepared_domain_index.insert(
+                domain_index_key(&site_rules.domain),
+                Arc::clone(&site_id_key),
+            );
+            for alt in &site_rules.alternate_domains {
+                prepared_domain_index
+                    .insert(domain_index_key(alt), Arc::clone(&site_id_key));
+            }
+            prepared_sites
+                .insert(Arc::clone(&site_rules.site_id), Arc::new(site_rules));
         }
 
         self.inner.rcu(|current| {
@@ -1901,77 +2035,11 @@ impl RuleCache {
                 updated.log_settings = Some(Arc::clone(ls));
             }
 
-            for site in &config.sites {
-                if let Some(ref bundle) = site.rules {
-                    let mut site_rules = Self::convert_bundle(bundle);
-                    // Override domain from site-level field
-                    if !site.domain.is_empty() {
-                        // Remove old domain index
-                        updated.domain_index.remove(
-                            normalize_host(&site_rules.domain).as_str(),
-                        );
-                        site_rules.domain = site.domain.clone();
-                    }
-                    site_rules.site_id = site.id.clone();
-                    site_rules.alternate_domains =
-                        site.alternate_domains.clone();
-                    site_rules.status = site_status_str(site.status);
-                    site_rules.downstream_timeout_secs =
-                        if site.downstream_timeout_secs == 0 {
-                            default_downstream_timeout_secs()
-                        } else {
-                            site.downstream_timeout_secs
-                        };
-                    site_rules.proxy_trust = ProxyTrustConfig {
-                        enabled: site.trust_proxy_headers,
-                        header: site.trusted_header.clone(),
-                        last_hop_only: site.trust_last_hop,
-                        trusted_ranges: site.trusted_proxy_ranges.clone(),
-                    };
-
-                    // Update domain index; the site id is shared between
-                    // this site's entries instead of duplicated per
-                    // domain.
-                    let site_id_key: Arc<str> = Arc::from(site.id.as_str());
-                    updated.domain_index.insert(
-                        Arc::from(normalize_host(&site_rules.domain)),
-                        Arc::clone(&site_id_key),
-                    );
-                    for alt in &site_rules.alternate_domains {
-                        updated.domain_index.insert(
-                            Arc::from(normalize_host(alt)),
-                            Arc::clone(&site_id_key),
-                        );
-                    }
-                    updated.sites.insert(site.id.clone(), Arc::new(site_rules));
-                }
-            }
-
-            // A full site config is authoritative: sites the control plane
-            // no longer lists are dropped here together with their domain
-            // index entries, so a deleted site stops being served from
-            // stale cached rules (they would otherwise survive every sync
-            // and even a restart via the disk cache).
-            let known: std::collections::HashSet<&String> =
-                config.sites.iter().map(|s| &s.id).collect();
-            let ghost_ids: Vec<String> = updated
-                .sites
-                .keys()
-                .filter(|id| !known.contains(*id))
-                .cloned()
-                .collect();
-            for id in &ghost_ids {
-                if let Some(old) = updated.sites.remove(id) {
-                    updated
-                        .domain_index
-                        .remove(normalize_host(&old.domain).as_str());
-                    for alt in &old.alternate_domains {
-                        updated
-                            .domain_index
-                            .remove(normalize_host(alt).as_str());
-                    }
-                }
-            }
+            // A full site config is authoritative: replace both maps with
+            // the prepared generation. Sites the control plane no longer
+            // lists (and their domain index entries) disappear here.
+            updated.sites = prepared_sites.clone();
+            updated.domain_index = prepared_domain_index.clone();
 
             Arc::new(updated)
         });
@@ -1987,7 +2055,7 @@ impl RuleCache {
         // entries would otherwise linger until expiry and reload from disk.
         let current = self.inner.load();
         for id in previous.keys() {
-            if !current.sites.contains_key(id) {
+            if !current.sites.contains_key(id.as_str()) {
                 self.clear_site_blocks(id);
             }
         }
@@ -2000,7 +2068,7 @@ impl RuleCache {
                 .inner
                 .load()
                 .sites
-                .get(&site.id)
+                .get(site.id.as_str())
                 .map(|s| site_enforcement(Some(s)));
             if previous.get(&site.id).copied().is_some_and(waf_enforcing)
                 && !current.is_some_and(waf_enforcing)
@@ -3029,8 +3097,8 @@ impl RuleCache {
     /// Convert a proto RuleBundle into local SiteRules.
     fn convert_bundle(bundle: &proto::RuleBundle) -> SiteRules {
         SiteRules {
-            site_id: bundle.site_id.clone(),
-            domain: String::new(), // Will be set from Site if available
+            site_id: Arc::from(bundle.site_id.as_str()),
+            domain: Arc::from(""), // Will be set from Site if available
             alternate_domains: Vec::new(),
             // Set from the owning `Site` in `update_from_site_config`.
             status: default_site_status(),
@@ -3310,6 +3378,31 @@ impl RuleCache {
             request_threshold: c.request_threshold,
             browser_integrity_check: c.browser_integrity_check,
             tls_fingerprint_check: c.tls_fingerprint_check,
+            // Proto3 scalars default to 0, which is also how an older control
+            // plane that predates these fields encodes them. Treat 0 as
+            // "unset" so such a control plane keeps the historical behaviour
+            // (difficulty 20, no adaptive headroom below the default) instead
+            // of shipping a site that issues difficulty-0 challenges.
+            base_difficulty: or_default(
+                c.base_difficulty,
+                DEFAULT_CHALLENGE_BASE_DIFFICULTY,
+            ),
+            max_difficulty: or_default(
+                c.max_difficulty,
+                DEFAULT_CHALLENGE_MAX_DIFFICULTY,
+            )
+            .max(or_default(
+                c.base_difficulty,
+                DEFAULT_CHALLENGE_BASE_DIFFICULTY,
+            )),
+            issue_limit_per_minute: or_default(
+                c.issue_limit_per_minute,
+                DEFAULT_CHALLENGE_ISSUE_LIMIT_PER_MINUTE,
+            ),
+            verify_limit_per_minute: or_default(
+                c.verify_limit_per_minute,
+                DEFAULT_CHALLENGE_VERIFY_LIMIT_PER_MINUTE,
+            ),
         }
     }
 
@@ -4213,6 +4306,54 @@ mod tests {
     }
 
     #[test]
+    fn full_sync_interns_site_and_domain_identifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        cache
+            .update_from_site_config(&proto::SiteConfig {
+                sites: vec![proto::Site {
+                    id: "site-1".to_string(),
+                    name: "site".to_string(),
+                    domain: "example.com".to_string(),
+                    alternate_domains: vec!["alt.example.com".to_string()],
+                    status: 0,
+                    rules: Some(proto::RuleBundle {
+                        site_id: "site-1".to_string(),
+                        config_hash: "hash".to_string(),
+                        ..Default::default()
+                    }),
+                    trust_proxy_headers: false,
+                    trusted_header: String::new(),
+                    trust_last_hop: false,
+                    trusted_proxy_ranges: Vec::new(),
+                    downstream_timeout_secs: 0,
+                }],
+                config_hash: "hash".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let rules = cache.inner.load();
+        let site = rules.sites.get("site-1").expect("site");
+        let key = rules.sites.keys().next().expect("site key");
+        assert!(Arc::ptr_eq(key, &site.site_id));
+        let index =
+            rules.domain_index.get("example.com").expect("domain index");
+        assert!(Arc::ptr_eq(index, &site.site_id));
+        let (domain_key, _) = rules
+            .domain_index
+            .iter()
+            .find(|(domain, id)| {
+                domain.as_ref() == "example.com" && id.as_ref() == "site-1"
+            })
+            .expect("domain entry");
+        assert!(Arc::ptr_eq(domain_key, &site.domain));
+        assert_eq!(site.status, SiteStatus::Active);
+    }
+
+    #[test]
     fn update_from_site_config_removes_deleted_sites() {
         let dir = tempfile::tempdir().unwrap();
         let cache =
@@ -4482,12 +4623,12 @@ mod tests {
     fn new_format_roundtrips() {
         let cached = CachedRules {
             sites: [(
-                "site-1".to_string(),
+                "site-1".into(),
                 Arc::new(SiteRules {
-                    site_id: "site-1".to_string(),
-                    domain: "example.com".to_string(),
+                    site_id: "site-1".into(),
+                    domain: "example.com".into(),
                     alternate_domains: Vec::new(),
-                    status: site_status::PAUSED.to_string(),
+                    status: SiteStatus::Paused,
                     downstream_timeout_secs: 60,
                     waf_config: None,
                     rate_limit_rules: Vec::new(),
@@ -4573,7 +4714,7 @@ mod tests {
         assert_eq!(site.routes[0].path, "/api");
         assert_eq!(site.routes[0].ip_ranges, vec!["10.0.0.0/8"]);
         assert!(site.is_paused());
-        assert_eq!(site.status, site_status::PAUSED);
+        assert_eq!(site.status, SiteStatus::Paused);
         assert_eq!(site.upstreams[0].algo, "hash:header:x-user");
         assert_eq!(site.upstreams[0].sni, "origin.example.com");
     }
@@ -4630,7 +4771,7 @@ mod tests {
         let cached: CachedRules =
             serde_json::from_str(&old.to_string()).expect("old format loads");
         let site = cached.sites.get("site-1").expect("site present");
-        assert_eq!(site.status, site_status::ACTIVE);
+        assert_eq!(site.status, SiteStatus::Active);
         assert!(!site.is_paused());
         assert!(site.routes[0].ip_ranges.is_empty());
         let ssl = site.ssl_config.as_ref().expect("ssl config");
@@ -4652,10 +4793,10 @@ mod tests {
 
         let site = |quota_mb: u32| {
             Arc::new(SiteRules {
-                site_id: "site-1".to_string(),
-                domain: DOMAIN.to_string(),
+                site_id: "site-1".into(),
+                domain: DOMAIN.into(),
                 alternate_domains: Vec::new(),
-                status: site_status::ACTIVE.to_string(),
+                status: SiteStatus::Active,
                 downstream_timeout_secs: 60,
                 waf_config: None,
                 rate_limit_rules: Vec::new(),
@@ -4693,9 +4834,7 @@ mod tests {
         };
         let store = |global_space_mb: Option<u32>, quota_mb: u32| {
             cache.inner.store(Arc::new(CachedRules {
-                sites: [(DOMAIN.to_string(), site(quota_mb))]
-                    .into_iter()
-                    .collect(),
+                sites: [(DOMAIN.into(), site(quota_mb))].into_iter().collect(),
                 domain_index: HashMap::new(),
                 failover_registry: Arc::new(HashMap::new()),
                 global_fail_open: None,
@@ -4762,7 +4901,7 @@ mod tests {
             trusted_proxy_ranges: Vec::new(),
             downstream_timeout_secs: 60,
         };
-        assert_eq!(site_status_str(site.status), site_status::PAUSED);
+        assert_eq!(SiteStatus::from_proto(site.status), SiteStatus::Paused);
         let rules =
             RuleCache::convert_bundle(site.rules.as_ref().expect("bundle"));
         let ssl = rules.ssl_config.as_ref().expect("ssl config");

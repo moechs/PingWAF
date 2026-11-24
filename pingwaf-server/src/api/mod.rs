@@ -10,6 +10,7 @@ pub mod ai_crawl;
 pub mod ai_rate_limit;
 pub mod analytics;
 pub mod api_protection;
+pub mod asn;
 pub mod auth;
 pub mod blocked_ips;
 pub mod bot;
@@ -195,6 +196,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(cache::routes())
         .merge(logs::routes())
         .merge(analytics::routes())
+        .merge(asn::routes())
         .merge(settings::routes())
         .merge(log_retention::routes())
         .merge(ssl::routes())
