@@ -12,6 +12,7 @@ pub mod cache_status;
 pub mod config;
 pub mod control_plane;
 pub mod registry;
+pub mod tunnel_registry;
 pub mod visitor_auth;
 
 pub use cache_status::{CacheStatusRegistry, SiteCacheStatus};
@@ -19,6 +20,7 @@ pub use control_plane::ControlPlaneService;
 pub use registry::{
     AgentRegistry, ConfigDrift, ConnectedAgent, COMMAND_CHANNEL_CAPACITY,
 };
+pub use tunnel_registry::TUNNEL_CONNECTORS;
 
 use pingwaf_proto::control_plane::{
     server_command::Payload, ServerCommand, SiteConfig, UpdateSiteCommand,
@@ -344,7 +346,15 @@ pub async fn notify_all_config_changed(state: &AppState, actor: Option<&str>) {
         let Some(visible) = visible_per_agent.get(&row.id.to_string()) else {
             continue;
         };
-        if push_visible_bundle(state, row, visible, &mut bundle_cache).await {
+        if push_visible_bundle(
+            &state.db,
+            &state.agents,
+            row,
+            visible,
+            &mut bundle_cache,
+        )
+        .await
+        {
             delivered += 1;
         }
     }
@@ -357,13 +367,102 @@ pub async fn notify_all_config_changed(state: &AppState, actor: Option<&str>) {
     );
 }
 
+/// Pushes the current configuration to every registered agent.
+///
+/// Used by the gRPC pairing path, which has no `AppState` to hand to
+/// [`notify_all_config_changed`]. No configuration version is recorded: pairing
+/// changes no site, it only changes the tunnel policy a bundle carries.
+pub async fn push_config_to_all(
+    db: &DatabaseConnection,
+    registry: &AgentRegistry,
+) -> usize {
+    let agents = match agent::Entity::find().all(db).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to list agents for config push");
+            return 0;
+        },
+    };
+    let mut bundle_cache: HashMap<Vec<Uuid>, SiteConfig> = HashMap::new();
+    let mut delivered = 0usize;
+    for row in &agents {
+        let visible = match agent_visible_site_ids(db, row).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(
+                    agent_id = %row.id,
+                    error = %err,
+                    "failed to resolve the sites of an agent"
+                );
+                continue;
+            },
+        };
+        if push_visible_bundle(db, registry, row, &visible, &mut bundle_cache)
+            .await
+        {
+            delivered += 1;
+        }
+    }
+    delivered
+}
+
+/// Pushes one connector's current policy, or a revocation, over its control
+/// stream. Returns whether a live stream received it.
+pub async fn notify_tunnel_connectors(
+    db: &DatabaseConnection,
+    tunnel_id: Uuid,
+    revoked: Option<String>,
+) -> bool {
+    use pingwaf_proto::control_plane::{
+        tunnel_connector_command, TunnelConnectorCommand,
+        TunnelConnectorRevoked,
+    };
+    let command = match revoked {
+        Some(message) => TunnelConnectorCommand {
+            kind: Some(tunnel_connector_command::Kind::Revoked(
+                TunnelConnectorRevoked { message },
+            )),
+        },
+        None => {
+            match crate::tunnel_policy::connector_config(db, tunnel_id).await {
+                Ok(Some(config)) => TunnelConnectorCommand {
+                    kind: Some(tunnel_connector_command::Kind::Config(config)),
+                },
+                Ok(None) => TunnelConnectorCommand {
+                    kind: Some(tunnel_connector_command::Kind::Revoked(
+                        TunnelConnectorRevoked {
+                            message: "the tunnel was deleted".to_string(),
+                        },
+                    )),
+                },
+                Err(err) => {
+                    tracing::warn!(%tunnel_id, error = %err, "failed to build the tunnel policy");
+                    return false;
+                },
+            }
+        },
+    };
+    TUNNEL_CONNECTORS.push(tunnel_id, command).await
+}
+
+/// Pushes the current policy to every connected connector (global settings
+/// changed, ingress list changed).
+pub async fn notify_all_tunnel_connectors(db: &DatabaseConnection) {
+    let online: Vec<Uuid> =
+        TUNNEL_CONNECTORS.online().await.keys().copied().collect();
+    for tunnel_id in online {
+        notify_tunnel_connectors(db, tunnel_id, None).await;
+    }
+}
+
 /// Sends one agent the authoritative bundle of the sites it serves.
 ///
 /// An empty visibility set is meaningful too: once an agent's last site is
 /// gone it needs the empty bundle rather than silence, or it keeps serving the
 /// deleted site. Returns whether the command reached a live stream.
 async fn push_visible_bundle(
-    state: &AppState,
+    db: &DatabaseConnection,
+    registry: &AgentRegistry,
     row: &agent::Model,
     visible: &[Uuid],
     bundle_cache: &mut HashMap<Vec<Uuid>, SiteConfig>,
@@ -371,8 +470,7 @@ async fn push_visible_bundle(
     let payload = match bundle_cache.get(visible) {
         Some(config) => config.clone(),
         None => {
-            let config = match build_site_config(&state.db, Some(visible)).await
-            {
+            let config = match build_site_config(db, Some(visible)).await {
                 Ok(config) => config,
                 Err(err) => {
                     tracing::warn!(
@@ -387,8 +485,7 @@ async fn push_visible_bundle(
             config
         },
     };
-    state
-        .agents
+    registry
         .send_command(&row.id, update_site_command(payload))
         .await
 }
@@ -455,7 +552,15 @@ pub async fn notify_site_deleted(
                 continue;
             },
         };
-        if push_visible_bundle(state, row, &visible, &mut bundle_cache).await {
+        if push_visible_bundle(
+            &state.db,
+            &state.agents,
+            row,
+            &visible,
+            &mut bundle_cache,
+        )
+        .await
+        {
             delivered += 1;
         }
     }

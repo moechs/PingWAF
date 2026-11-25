@@ -33,6 +33,8 @@ pub mod pki;
 pub mod site_cert;
 pub mod subscription;
 pub mod tls;
+pub mod tunnel_policy;
+pub mod tunnel_token;
 
 pub use config::ServerConfig;
 
@@ -67,6 +69,11 @@ use crate::models::{instance_setting, role, user};
 pub async fn start_server(mut config: ServerConfig) -> anyhow::Result<()> {
     // ── 1. Validate ──────────────────────────────────────────────────────────
     config.validate()?;
+
+    // The tunnel session-token key is derived from the JWT secret: initialise
+    // it once, before any pairing RPC can mint a token or a bundle can carry
+    // the public half.
+    crate::tunnel_token::init(&config.jwt_secret);
 
     tracing::info!(
         http_addr = %config.http_addr,

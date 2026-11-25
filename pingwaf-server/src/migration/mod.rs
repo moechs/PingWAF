@@ -109,6 +109,8 @@ mod m20240101_000101_agent_site_assignments;
 mod m20240101_000102_access_log_asn;
 mod m20240101_000103_challenge_adaptive_pow;
 mod m20240101_000104_site_ssl_self_signed_backfill;
+mod m20240101_000105_tunnel_connectors;
+mod m20240101_000106_tunnel_sessions;
 
 use sea_orm_migration::prelude::*;
 
@@ -233,6 +235,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20240101_000102_access_log_asn::Migration),
             Box::new(m20240101_000103_challenge_adaptive_pow::Migration),
             Box::new(m20240101_000104_site_ssl_self_signed_backfill::Migration),
+            Box::new(m20240101_000105_tunnel_connectors::Migration),
+            Box::new(m20240101_000106_tunnel_sessions::Migration),
         ]
     }
 }
@@ -244,7 +248,7 @@ mod tests {
     #[test]
     fn migrations_are_ordered_and_unique() {
         let migrations = Migrator::migrations();
-        assert_eq!(migrations.len(), 104);
+        assert_eq!(migrations.len(), 106);
         let names: Vec<String> =
             migrations.iter().map(|m| m.name().to_owned()).collect();
         let mut sorted = names.clone();

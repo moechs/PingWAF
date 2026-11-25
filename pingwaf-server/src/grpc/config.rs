@@ -960,6 +960,12 @@ fn pools_to_proto(
             // values the data plane parses, and the CHECK constraint keeps
             // anything else out of the row.
             address_family: pool.address_family.clone(),
+            // Empty for a direct origin. When set, the data plane resolves
+            // the peers through the tunnel connector instead of dialing them.
+            tunnel_id: pool
+                .tunnel_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
         });
     }
     configs
@@ -1817,6 +1823,12 @@ pub async fn build_rule_bundle(
         .map(rule_to_proto)
         .collect();
 
+    // The complete tunnel policy rides in every bundle (like `site_policies`),
+    // so one per-site push is enough for the edge to learn a tunnel that was
+    // created after it connected.
+    let (tunnels, tunnel_settings) =
+        crate::tunnel_policy::bundle_tunnels(db).await?;
+
     let mut bundle = RuleBundle {
         site_id: site_row.id.to_string(),
         // Filled in below, once every other field is final.
@@ -1875,6 +1887,8 @@ pub async fn build_rule_bundle(
         oidc: oidc_to_proto(oidc.as_ref(), oidc_provider_row.as_ref()),
         log_settings,
         path_exceptions: path_exceptions_to_proto(&path_exceptions),
+        tunnels,
+        tunnel_settings: Some(tunnel_settings),
     };
 
     bundle.config_hash = fingerprint(&bundle);
@@ -2762,6 +2776,7 @@ mod tests {
         is_default: bool,
     ) -> site_upstream_pools::Model {
         site_upstream_pools::Model {
+            tunnel_id: None,
             id: Uuid::new_v4(),
             site_id: Uuid::nil(),
             name: name.into(),
