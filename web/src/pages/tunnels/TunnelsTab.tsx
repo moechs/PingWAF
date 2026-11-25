@@ -442,13 +442,13 @@ export function TunnelsTab() {
               <p className="mb-1.5 text-[13px] font-medium text-fg">
                 {t('pages.tunnels.usedBy')}
               </p>
-              {liveDetail.sites.length === 0 ? (
+              {(liveDetail.sites ?? []).length === 0 ? (
                 <p className="text-xs text-fg-subtle">
                   {t('pages.tunnels.usedByNone')}
                 </p>
               ) : (
                 <div className="flex flex-wrap gap-1.5">
-                  {liveDetail.sites.map((domain) => (
+                  {(liveDetail.sites ?? []).map((domain) => (
                     <Badge key={domain} tone="neutral">
                       {domain}
                     </Badge>
@@ -600,7 +600,7 @@ export function TunnelsTab() {
         tone="danger"
         title={t('pages.tunnels.deleteTitle')}
         description={t('pages.tunnels.deleteDescription', {
-          count: pendingDelete?.sites.length ?? 0,
+          count: pendingDelete?.sites?.length ?? 0,
         })}
         confirmLabel={t('common.delete')}
         loading={remove.isPending}

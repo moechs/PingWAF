@@ -135,7 +135,7 @@ describe('tunnel API contract', () => {
     expect(tab).toContain("t('pages.tunnels.checklistStep3')")
     // Disabling or deleting a tunnel must name the sites it affects.
     expect(tab).toContain("t('pages.tunnels.usedBy')")
-    expect(tab).toContain('pendingDelete?.sites.length')
+    expect(tab).toContain('pendingDelete?.sites?.length')
   })
 
   it('a pool binding is nullable and the request accepts an empty string to clear it', () => {
