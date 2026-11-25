@@ -297,15 +297,25 @@ pub async fn bundle_tunnels(
         if targets.len() > limit {
             targets.truncate(limit);
         }
+        // An unpaired tunnel (never paired, or revoked) must not accept a
+        // session even when a connector still holds an unexpired token: with
+        // no key in the bundle nothing verifies, which is what makes a
+        // revocation take effect on the next reload instead of waiting out the
+        // token's lifetime.
+        let paired = row.credential_sha256.is_some();
         tunnels.push(proto::TunnelConfig {
             tunnel_id: row.id.to_string(),
             name: row.name,
             // The edges verify a signature; they never receive the connector's
             // credential or its digest.
-            session_public_key: crate::tunnel_token::public_key_hex(),
+            session_public_key: if paired {
+                crate::tunnel_token::public_key_hex()
+            } else {
+                String::new()
+            },
             // A tunnel that was never paired, or that an operator disabled,
             // is not accepted by an edge even though the row still exists.
-            enabled: settings.enabled && row.status != tunnel_status::DISABLED,
+            enabled: accepts_sessions(settings.enabled, paired, &row.status),
             targets,
         });
     }
@@ -320,6 +330,19 @@ pub async fn bundle_tunnels(
                 as u32,
         },
     ))
+}
+
+/// Whether an edge may accept a session for a tunnel.
+///
+/// All three conditions matter: the deployment switch, a paired credential
+/// (an unpaired or revoked tunnel has no key to verify against) and the
+/// per-tunnel status.
+fn accepts_sessions(
+    settings_enabled: bool,
+    paired: bool,
+    status: &str,
+) -> bool {
+    settings_enabled && paired && status != tunnel_status::DISABLED
 }
 
 /// The policy pushed to one connector.
@@ -410,6 +433,21 @@ mod tests {
             "a bare host must get the default port of its TLS flag, or the edge \
              and the bundle would disagree and the pool would have no upstream"
         );
+    }
+
+    #[test]
+    fn an_unpaired_or_disabled_tunnel_refuses_sessions() {
+        assert!(accepts_sessions(true, true, tunnel_status::ACTIVE));
+        // Never paired, or revoked: no key in the bundle, so nothing verifies
+        // — this is what makes a revocation immediate rather than bounded by
+        // the token's lifetime.
+        assert!(!accepts_sessions(true, false, tunnel_status::ACTIVE));
+        // An operator disabled this one.
+        assert!(!accepts_sessions(true, true, tunnel_status::DISABLED));
+        // The deployment-wide switch is off.
+        assert!(!accepts_sessions(false, true, tunnel_status::ACTIVE));
+        // Still waiting for the connector to redeem its token.
+        assert!(accepts_sessions(true, true, tunnel_status::PENDING));
     }
 
     #[test]

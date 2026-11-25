@@ -2333,11 +2333,42 @@ const RELOAD_RETRY_MAX: Duration = Duration::from_secs(300);
 fn reload_key(rule_cache: &RuleCache) -> Arc<str> {
     let hash = rule_cache.config_hash();
     match pingwaf_tunnel::installed_registry() {
-        Some(registry) => {
-            Arc::from(format!("{}#{}", hash, registry.generation()))
-        },
+        Some(registry) => Arc::from(format!(
+            "{}#{}#{:016x}",
+            hash,
+            registry.generation(),
+            tunnel_policy_fingerprint(&rule_cache.all_sites())
+        )),
         None => hash,
     }
+}
+
+/// Fingerprint of the tunnel policy the edge holds.
+///
+/// The reload pass is the only place that reconciles the registry with the
+/// cache, so a policy change that does not move the config hash (a credential
+/// rotation, a disable, a new target list) must move the key too — otherwise a
+/// revoked tunnel would keep its live session until some unrelated change
+/// happened to trigger a reload, and the documented ≤5s convergence would be
+/// a lie.
+fn tunnel_policy_fingerprint(cached: &CachedRules) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for tunnel in cached.tunnels.iter() {
+        tunnel.tunnel_id.hash(&mut hasher);
+        tunnel.enabled.hash(&mut hasher);
+        tunnel.session_public_key.hash(&mut hasher);
+        tunnel.targets.hash(&mut hasher);
+    }
+    if let Some(settings) = cached.tunnel_settings {
+        (
+            settings.max_streams,
+            settings.idle_timeout_secs,
+            settings.heartbeat_secs,
+        )
+            .hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Decides when the hot-reload watcher applies the rule cache to the proxy.
@@ -3168,6 +3199,36 @@ mod tests {
                 .unwrap()
                 .contains("{{ host }}"),
             "the control-plane template must pass through untouched"
+        );
+    }
+
+    #[test]
+    fn the_reload_key_moves_when_only_the_tunnel_policy_changes() {
+        // The config hash is identical; only the tunnel policy differs. Without
+        // the policy in the key, the reload pass (the only place that applies
+        // it) would never run and a revoked tunnel would keep its session.
+        let site = site_rules("site1", "a.example.com");
+        let mut cached = one_site_cache(site);
+        let base = tunnel_policy_fingerprint(&cached);
+
+        let tunnel = |key: &str| pingwaf_agent::cache::TunnelConfig {
+            tunnel_id: "tunnel-1".to_string(),
+            name: "branch".to_string(),
+            session_public_key: key.to_string(),
+            enabled: true,
+            targets: vec!["10.0.0.5:8080".to_string()],
+        };
+        cached.tunnels = std::sync::Arc::new(vec![tunnel(&"aa".repeat(32))]);
+        let rotated = tunnel_policy_fingerprint(&cached);
+        assert_ne!(base, rotated, "a new public key must move the key");
+
+        let mut disabled = tunnel(&"bb".repeat(32));
+        disabled.enabled = false;
+        cached.tunnels = std::sync::Arc::new(vec![disabled]);
+        assert_ne!(
+            rotated,
+            tunnel_policy_fingerprint(&cached),
+            "disabling a tunnel must move the key"
         );
     }
 

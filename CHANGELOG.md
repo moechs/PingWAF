@@ -88,6 +88,12 @@ verbatim for reference and attribution, and is not maintained here.
 - **Disabling tunnels deployment-wide no longer makes connectors redial.** The
   edge closes the live session on the next reload and the connector now waits
   for the next policy push instead of producing a refusal every backoff window.
+- **Revocation is immediate again, not bounded by the token's lifetime.** The
+  bundle now carries no session-token public key for an unpaired or revoked
+  tunnel, so the edge refuses its next handshake instead of accepting a token
+  minted before the revocation. The reload key also includes the tunnel policy,
+  so a rotation or a disable reaches the edge on the next poll (≤5s) rather
+  than waiting for an unrelated configuration change to trigger a reload.
 
 ## [PingWAF 0.32.52] — 2026-11-25
 
