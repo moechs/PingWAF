@@ -588,7 +588,17 @@ Sites → [site] → Certificates → Add → Let's Encrypt
   - Cloudflare — `cf`
   - DNSPod (Tencent Cloud) — `tencent`
   - Huawei Cloud — `huawei`
-  - Manual — anything else
+  - Amazon Route 53 — `route53`
+
+Route 53 uses the AWS SDK credential chain of the issuing process (an EC2
+instance role on AWS, or the standard `AWS_*` environment/configuration). Set
+`acme_dns_config` to `{"hosted_zone_id":"Z123EXAMPLE"}` to pin a public hosted
+zone, or leave it empty to discover the closest public zone; discovery also
+checks the zone's public NS delegation. A wildcard and its apex share one
+`_acme-challenge` name, so a combined certificate keeps both TXT values until
+the CA validates the order. Other values (`manual`, `digitalocean`, `cloudxns`)
+are not accepted for managed DNS-01; rows written before this check are
+migrated back to HTTP-01.
 
 Certificates auto-renew 30 days before expiry.
 
