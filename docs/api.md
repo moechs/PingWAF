@@ -2295,7 +2295,7 @@ Drops the credential and any pending pairing token; the tunnel returns to
 The edge sessions currently serving this tunnel (`SessionView[]`, the same
 objects the list embeds).
 
-### GET /settings/tunnel · PUT /settings/tunnel
+### GET /settings/tunnel
 
 Administrators only. The deployment-wide tunnel limits (single row):
 
@@ -2309,8 +2309,13 @@ Administrators only. The deployment-wide tunnel limits (single row):
 | `heartbeat_seconds` | `20` | control-frame heartbeat cadence |
 | `session_token_ttl_seconds` | `3600` | lifetime of a connector session token; also bounds how long a partitioned edge accepts a revoked tunnel |
 
-`PUT` accepts any subset; values are clamped to what the data plane can honour
-and the change is pushed to every agent and connector immediately.
+### PUT /settings/tunnel
+
+Administrators only. Accepts any subset of the fields above; values are clamped
+to what the data plane can honour (the token lifetime to 60 s – 24 h, the
+heartbeat to 5 – 300 s) and the change is pushed to every agent and connector
+immediately — a master-switch change also closes live sessions on the next
+reload.
 
 ### Origin pool binding
 
