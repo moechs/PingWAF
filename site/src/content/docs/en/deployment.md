@@ -128,7 +128,9 @@ It installs `/usr/local/bin/pingwaf-tunnel`, writes `/etc/pingwaf/tunnel.toml` (
 
 **Use it:** bind an origin pool to the tunnel in the site's origin-pool dialog. Its node addresses (`10.0.0.5:8080`, `app.internal:8443`) are then resolved by the connector inside the private network instead of by the edge. The tunnel's target list is derived from the bound pools.
 
-Revoke a tunnel when its host is decommissioned: the credential stops working and every edge refuses the session within one rule-bundle reload. Deleting the tunnel unbinds its pools, which fall back to direct origins.
+Revoke a tunnel when its host is decommissioned: the credential stops working and every edge refuses the session within one rule-bundle reload. Deleting the tunnel is refused while origin pools still reference it (`409`); `?force=true` unbinds them and they fall back to direct origins.
+
+The complete operating guide — the three independent states, the request path, the connector's commands and config keys, SOCKS5 egress for a host with no direct route, and the troubleshooting table — is the [Tunnels](/docs/tunnel/) page.
 
 ## systemd
 

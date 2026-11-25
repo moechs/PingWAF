@@ -187,18 +187,58 @@ agent 进程自身的 RSS，区别于整机内存；旧版 agent 不上报该字
 
 隧道不是 VPN：它只承载绑定到它的源站池流量。
 
+**三个必须区分开的状态**
+
+| 状态 | 含义 | 来源 |
+| --- | --- | --- |
+| **已配对** | 凭据已存在，隧道可用 | 连接器兑换配对令牌时写入 |
+| **已启用** | 运维的按隧道开关 | `PATCH /tunnels/{id}` 的 `status` |
+| **连接器在线** | 当前有连接器持有控制流 | 控制面实时上报 |
+
+「已配对 + 已启用」而连接器离线，是"配置正确但连接器没跑"，不是坏了；反过来不可能
+在未配对时显示「连接器在线」。
+
 **操作步骤**
 
 1. **Agents → Tunnels → 创建隧道**：控制台返回一次性配对命令
    （`install.sh --mode tunnel --server-url ... --token ...`），在内网主机执行即可
    安装连接器、配对并注册 `pingwaf-tunnel.service`。令牌只显示一次（默认 30 分钟
    过期）；重新生成会轮换凭据并断开当前连接器。
+
+   不用安装器时，等价的两步：
+
+   ```bash
+   sudo pingwaf-tunnel pair \
+     --config /etc/pingwaf/tunnel.toml \
+     --server-url https://control-plane:9090 \
+     --server-ca-cert /etc/pingwaf/tunnel-ca.pem \
+     --token <pairing-token>
+   sudo pingwaf-tunnel run --config /etc/pingwaf/tunnel.toml
+   ```
 2. **在边缘开启隧道监听**：`pingwaf.toml` 的 `[agent] tunnel_addr = "0.0.0.0:9443"`
    （或 `--tunnel-addr` / `PINGWAF_TUNNEL_ADDR`），并在 agent 详情里填写
    **隧道入口地址**（连接器拨号的公网 `host:port`）。该面板同时显示监听状态与
    连接器要固定的证书 SHA-256。防火墙只需在边缘放开隧道端口，内网侧无需任何入站。
 3. **把源站池绑定到隧道**：站点 → 基础 → 源站池 → 编辑 → **隧道** 选择器。池内的
    节点地址随后由连接器在内网解析。隧道的目标清单由绑定它的源站池推导，无需另配。
+
+**请求如何流转**
+
+```
+客户端 ──TLS──► 边缘 :443 ──► WAF 流水线 ──► 绑定隧道的源站池
+                                                │
+                                     127.0.0.1:<桥接端口>
+                                                │
+                                       TLS + 多路复用会话
+                                                │
+                                       连接器（内网）
+                                                │
+                                       10.0.0.5:8080（源站）
+```
+
+桥接就是普通源站，链路里没有特殊分支：WAF 照常判决、缓存照常命中、日志照常记录，
+访问日志把源站显示为 `tunnel://<名称>/<目标>`。连接器只拨控制面下发的目标清单
+（可被本地 `allowed_targets` 进一步收紧），边缘无法让它访问策略之外的地址。
 
 **验证是否真的通了**（按失败顺序排查）
 
@@ -254,6 +294,27 @@ curl -fsSL …/install.sh | sudo bash -s -- --mode tunnel \
   永久挂住。
 - 代理只用于连接器的**出站**拨号，不改变边缘访问源站的方式。
 
+**连接器命令与配置**
+
+```bash
+pingwaf-tunnel pair   --token <pairing-token> --server-url https://cp:9090 [--config PATH]
+pingwaf-tunnel run    [--config PATH]
+pingwaf-tunnel status [--config PATH]
+```
+
+| `tunnel.toml` 键 | 含义 |
+| --- | --- |
+| `tunnel_id`、`credential` | 由 `pair` 写入 |
+| `server_url`、`server_ca_cert`、`server_tls_name` | 控制面及其 TLS 信任 |
+| `ingress` | `host:port[=sha256]` 入口；由控制面下发，也可在本地固定 |
+| `allowed_targets` | 可选本地白名单，与策略取交集（绝不合并） |
+| `socks5_proxy`、`socks5_username`、`socks5_password` | 经 SOCKS5 代理出网 |
+| `session_token` | 给边缘的短期令牌，由控制面刷新 |
+
+`status` 不会另开控制面流（那会占掉正在服务流量的连接器的会话位），而是读取 `run`
+发布到 `/var/lib/pingwaf/tunnel/status.json` 的状态：已连接的入口、生效的目标、
+最近一次吊销原因。
+
 **运维动作**
 
 | 动作 | 效果 |
@@ -261,8 +322,8 @@ curl -fsSL …/install.sh | sudo bash -s -- --mode tunnel \
 | 重新配对 | 生成新令牌并轮换凭据；运行中的连接器被断开，需用新令牌重新接入 |
 | 吊销 | 立即作废凭据；绑定站点在重新配对前返回 503 |
 | 禁用 | 保留凭据但拒绝新会话（部署级开关或单隧道开关） |
-| 删除 | 删除隧道；绑定它的源站池回退为**直连源站** |
-| 设置 | 部署级限制：配对令牌有效期、单会话连接数、单隧道目标数、空闲超时、心跳 |
+| 删除 | 删除隧道；仍被源站池引用时返回 `409`，`?force=true` 才会解绑并回退为**直连源站** |
+| 设置 | 部署级限制：总开关、配对令牌有效期、单会话连接数、单隧道目标数、会话存活、心跳、会话令牌有效期 |
 
 **排障要点**
 
@@ -272,6 +333,14 @@ curl -fsSL …/install.sh | sudo bash -s -- --mode tunnel \
 - 「目标 无」：还没有源站池绑定该隧道。
 - 隧道在线但请求 502/503：该边缘没有会话（监听未开，或证书指纹已变）；agent 详情
   面板可见监听状态与指纹，连接器会在下次配置刷新时取到新指纹。
+
+**本版本的限制**
+
+- 经站点承载 HTTP、HTTPS 与 WebSocket；不暴露裸 TCP。
+- 一个隧道即一个信任域：任何服务该隧道所绑定站点的边缘都能请求其任意目标，请按
+  网段拆分隧道。
+- 单隧道目标数与单会话流数由设置行限制。
+- 边缘监听在启动时绑定；入口地址与策略热生效（连通时 ≤5s）。
 
 **安全模型**
 

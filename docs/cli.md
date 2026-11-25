@@ -151,9 +151,29 @@ credential and writes `/etc/pingwaf/tunnel.toml` (`0600`); `run` serves until
 SIGTERM (or until the tunnel is revoked); `status` prints the stored
 configuration plus the live state `run` publishes to
 `/var/lib/pingwaf/tunnel/status.json` — the connected ingress endpoints, the
-targets in force, and the last revocation reason. `status` never opens a
-control-plane stream: doing so would take the session slot of the connector
-that is actually serving traffic.
+targets in force, the SOCKS5 proxy when one is configured, and the last
+revocation reason. `status` never opens a control-plane stream: doing so would
+take the session slot of the connector that is actually serving traffic.
+
+`pair` and `run` take the same global flags; anything not on the command line is
+read from the config file:
+
+| Flag | Env | Meaning |
+| --- | --- | --- |
+| `--config PATH` | — | `tunnel.toml` (default `/etc/pingwaf/tunnel.toml`) |
+| `--token`, `--token-file` | `PINGWAF_TUNNEL_TOKEN`, `PINGWAF_TUNNEL_TOKEN_FILE` | the one-time pairing token |
+| `--server-url` | `PINGWAF_TUNNEL_SERVER_URL` | control-plane gRPC URL (`https://…:9090`) |
+| `--server-ca-cert` | `PINGWAF_TUNNEL_SERVER_CA_CERT` | CA bundle for a self-signed control plane |
+| `--server-tls-name` | `PINGWAF_TUNNEL_SERVER_TLS_NAME` | override the TLS server name |
+| `--ingress` | `PINGWAF_TUNNEL_INGRESS` | pin edge endpoints (`host:port[=sha256],…`) |
+| `--allowed-targets` | `PINGWAF_TUNNEL_ALLOWED_TARGETS` | local allowlist, intersected with the policy |
+| `--socks5-proxy`, `--socks5-username`, `--socks5-password` | `PINGWAF_TUNNEL_SOCKS5_*` | egress through a SOCKS5 proxy |
+
+The config file carries the same keys in snake_case (`server_url`,
+`server_ca_cert`, `server_tls_name`, `ingress`, `allowed_targets`,
+`socks5_proxy`, `socks5_username`, `socks5_password`, plus the `tunnel_id`,
+`credential` and `session_token` that `pair` writes). A malformed value is an
+error, never a silent fallback to a direct dial.
 
 ### Passing secrets safely
 

@@ -1214,6 +1214,21 @@ certificates) applies exactly as it does for a direct origin.
 A tunnel is **not** a VPN: it carries the traffic of the origin pools bound to
 it, nothing else.
 
+### Three states that are not the same
+
+The console renders them separately, and most confusion comes from collapsing
+them:
+
+| State | Meaning | Where it comes from |
+| --- | --- | --- |
+| **Paired** | a credential exists, so the tunnel is usable | set when a connector redeems its pairing token |
+| **Enabled** | the operator's per-tunnel switch | `PATCH /tunnels/{id}` with `status` |
+| **Connector online** | a connector currently holds a control stream | reported live by the control plane |
+
+*Paired* and *Enabled* with the connector offline is a working configuration
+with a disconnected connector, not a broken tunnel; *Connector online* is
+impossible without being paired.
+
 ### 1. Create the tunnel and pair the connector
 
 **Agents → Tunnels → Create tunnel.** The console creates the tunnel and shows a
@@ -1230,7 +1245,18 @@ curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh \
 Run it on a host inside the private network. It installs `pingwaf-tunnel`,
 redeems the token for a long-lived credential, writes
 `/etc/pingwaf/tunnel.toml` (`0600`) and registers
-`pingwaf-tunnel.service`. The token is shown **once** and expires (30 minutes by
+`pingwaf-tunnel.service`.
+
+Without the installer, the same two steps by hand:
+
+```bash
+sudo pingwaf-tunnel pair \
+  --config /etc/pingwaf/tunnel.toml \
+  --server-url https://control-plane:9090 \
+  --server-ca-cert /etc/pingwaf/tunnel-ca.pem \
+  --token <pairing-token>
+sudo pingwaf-tunnel run --config /etc/pingwaf/tunnel.toml
+``` The token is shown **once** and expires (30 minutes by
 default); minting a new one rotates the credential and disconnects the current
 connector.
 
@@ -1278,6 +1304,27 @@ pool "app"   tunnel = branch-office
 
 The tunnel's target list is derived from the pools bound to it — there is no
 second place to configure it.
+
+### How a request flows
+
+```
+client ──TLS──► edge :443 ──► WAF pipeline ──► pool bound to the tunnel
+                                                    │
+                                         127.0.0.1:<bridge>
+                                                    │
+                                        TLS + multiplexed session
+                                                    │
+                                       connector (private network)
+                                                    │
+                                       10.0.0.5:8080 (the origin)
+```
+
+The bridge is an ordinary origin, so nothing in the request path is
+special-cased: the WAF decides, the cache caches, the site's log records, and
+the access log renders the origin as `tunnel://<name>/<target>` instead of a
+loopback port. The connector only dials the target list the control plane
+pushed (optionally narrowed by its local `allowed_targets`), so the edge cannot
+make it reach an address outside the tunnel's policy.
 
 ### Verify it works
 
@@ -1345,6 +1392,28 @@ Notes:
 - The proxy is used for the connector's **outbound** dials only. It does not
   change how the edge reaches the origin (that is the tunnel's job).
 
+### Connector commands and config
+
+```bash
+pingwaf-tunnel pair   --token <pairing-token> --server-url https://cp:9090 [--config PATH]
+pingwaf-tunnel run    [--config PATH]
+pingwaf-tunnel status [--config PATH]
+```
+
+| Key in `tunnel.toml` | Meaning |
+| --- | --- |
+| `tunnel_id`, `credential` | written by `pair` |
+| `server_url`, `server_ca_cert`, `server_tls_name` | control plane and its TLS trust |
+| `ingress` | `host:port[=sha256]` endpoints; filled from the control plane, can be pinned locally |
+| `allowed_targets` | optional local allowlist, intersected with the policy (never merged) |
+| `socks5_proxy`, `socks5_username`, `socks5_password` | egress through a SOCKS5 proxy |
+| `session_token` | short-lived token for the edges, refreshed by the control plane |
+
+`status` never opens a control-plane stream — that would take the session slot
+of the connector actually serving traffic. It reads the state `run` publishes to
+`/var/lib/pingwaf/tunnel/status.json` (connected ingress endpoints, the targets
+in force, and the last revocation reason).
+
 ### Operations
 
 | Action | Effect |
@@ -1352,8 +1421,8 @@ Notes:
 | **Re-pair** | Mints a new token and rotates the credential; the running connector is disconnected and must be paired again. |
 | **Revoke** | Drops the credential immediately. Bound sites answer 503 until the connector is paired again. |
 | **Disable** | Keeps the credential but stops accepting sessions (deployment switch or per-tunnel). |
-| **Delete** | Removes the tunnel; bound pools fall back to **direct** origins. |
-| **Settings** | Deployment-wide limits: pairing-token lifetime, streams per session, targets per tunnel, idle timeout, heartbeat. |
+| **Delete** | Removes the tunnel. Refused with `409` while origin pools still reference it; `?force=true` unbinds them and they fall back to **direct** origins. |
+| **Settings** | Deployment-wide limits: master switch, pairing-token lifetime, streams per session, targets per tunnel, session liveness, heartbeat, session-token lifetime. |
 
 ### Troubleshooting
 
@@ -1408,6 +1477,16 @@ Notes:
   until they expire — the same fail-open behaviour the deployment applies to
   its rules. A revoked tunnel stops working as soon as the edge receives the
   next bundle (≤5s on a connected edge).
+
+### Limits in this version
+
+- HTTP, HTTPS and WebSocket through a site; raw TCP is not exposed.
+- One tunnel is one trust domain: every edge serving a site bound to it can ask
+  the connector for any of that tunnel's targets. Split network segments across
+  separate tunnels.
+- Per-tunnel targets and per-session streams are capped by the settings row.
+- The edge listener binds at startup; the ingress address and the policy are
+  hot (≤5s on a connected edge).
 
 ## Access Control
 

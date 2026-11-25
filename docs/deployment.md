@@ -544,6 +544,13 @@ Bind an origin pool to the tunnel in the site's origin pool settings; its node
 addresses are then resolved by the connector inside the private network. See
 [user-guide.md](user-guide.md#tunnels-internal-services-without-an-inbound-port).
 
+A connector host with **no direct egress** can reach both the control plane and
+the edges through a SOCKS5 proxy: add `socks5_proxy = "10.0.0.1:1080"` (plus
+`socks5_username` / `socks5_password` when the proxy requires them) to
+`tunnel.toml`, or pass `--socks5-proxy` to `install.sh --mode tunnel`. Target
+names are resolved by the proxy, the handshake is bounded, and a dial never
+falls back to a direct connection.
+
 The gRPC listener serves TLS by default, so `server_url` should be `https://`
 with the CA that signed the control plane's certificate in
 `server_ca_cert` (self-signed control plane: download the CA from
