@@ -171,6 +171,7 @@ async fn sync_certificate(
         .filter(site_certificates::Column::SiteId.eq(site_id))
         .all(&state.db)
         .await?;
+    let has_candidates = !candidates.is_empty();
     let mut matches = candidates
         .into_iter()
         .filter(|row| names(&row.domain) == expected);
@@ -181,8 +182,18 @@ async fn sync_certificate(
     }
     let Some(row) = row else {
         // The file can outlive a deleted certificate row. Not an error: the
-        // next issuance or a site edit removes it.
-        debug!(site_id = %site_id, domains, "ACME certificate has no row");
+        // next issuance or a site edit removes it. But a site that still owns
+        // certificate rows and none of them matches the ACME state's SAN set
+        // is a configuration drift an operator needs to see.
+        if has_candidates {
+            warn!(
+                %site_id,
+                domains,
+                "ACME certificate has no certificate row with this exact hostname set"
+            );
+        } else {
+            debug!(site_id = %site_id, domains, "ACME certificate has no row");
+        }
         return Ok(false);
     };
 

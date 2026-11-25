@@ -1741,11 +1741,12 @@ fn site_certificate_conf(
             .flatten();
     }
 
-    // An issued Route 53 PEM comes back through config sync. Keep its ACME
-    // settings so the issuer can check expiry and renew it after reload.
+    // An issued PEM comes back through config sync (the control plane imports
+    // the issuer's ACME state and pushes the material back). Keep its ACME
+    // settings so the issuer can check expiry and renew it after reload; the
+    // previous provider-specific gate silently stopped renewal for every other
+    // DNS provider (and for HTTP-01) once the synced PEM reached the config.
     if acme_enabled
-        && ssl.acme_challenge_type == "AcmeDns01"
-        && normalize_dns_provider(&ssl.acme_dns_provider) == Some("route53")
         && let Some(mut config) = acme_certificate_conf(ssl, domains.clone())
     {
         config.tls_cert = Some(ssl.cert_pem.clone());
@@ -5304,6 +5305,21 @@ mod tests {
         assert_eq!(cert.tls_cert.as_deref(), Some("issued PEM"));
         assert!(cert.acme.is_some());
         assert_eq!(cert.dns_provider.as_deref(), Some("route53"));
+
+        // Every managed provider keeps renewing after the synced PEM comes
+        // back, not just Route 53.
+        ssl.acme_dns_provider = "cf".into();
+        let cert = site_certificate_conf(&ssl, domains.into()).unwrap();
+        assert!(cert.acme.is_some());
+        assert_eq!(cert.dns_provider.as_deref(), Some("cf"));
+
+        // HTTP-01 certificates are managed the same way. The wildcard domain set
+        // cannot be validated over HTTP-01, so use an apex-only set here.
+        ssl.acme_challenge_type = "AcmeHttp01".into();
+        ssl.acme_dns_provider.clear();
+        let cert = site_certificate_conf(&ssl, "example.com".into()).unwrap();
+        assert!(cert.acme.is_some());
+        assert_eq!(cert.dns_challenge, None);
 
         ssl.acme_enabled = false;
         let cert = site_certificate_conf(&ssl, domains.into()).unwrap();
