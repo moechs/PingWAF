@@ -193,7 +193,7 @@ const ACME_FAILURE_MARKER: &str = "acme_failed";
 /// errors can include the request URL, and those URLs carry credentials as
 /// query parameters; the text is persisted, shown in the console and sent to
 /// notification channels, so query strings must never travel with it.
-fn redact_url_queries(text: &str) -> String {
+pub(crate) fn redact_url_queries(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for part in text.split_inclusive(char::is_whitespace) {
         if !part.contains("://") {

@@ -25,6 +25,23 @@ fn failure(message: &str) -> Error {
     }
 }
 
+/// Bounded SDK error text for an operator log.
+///
+/// The ACME failure event persists this message and shows it in the console,
+/// so provider URLs are stripped of their query strings (credentials) and the
+/// whole text is capped: `AccessDenied`, `NoSuchHostedZone` and a conflicting
+/// record set must stay distinguishable instead of collapsing into one generic
+/// "TXT change failed" line.
+fn describe(error: impl std::fmt::Display) -> String {
+    let text = error.to_string().replace(['\n', '\r'], " ");
+    let text = crate::lets_encrypt::redact_url_queries(&text);
+    let mut bounded: String = text.chars().take(240).collect();
+    if bounded.len() < text.len() {
+        bounded.push('…');
+    }
+    bounded
+}
+
 fn dns_name(name: &str) -> String {
     name.trim_end_matches('.').to_ascii_lowercase()
 }
@@ -45,13 +62,24 @@ fn select_zone<'a>(
         .filter(|(zone, _)| in_zone(name, zone))
         .collect();
     matching.sort_unstable_by_key(|(zone, _)| std::cmp::Reverse(zone.len()));
-    match matching.as_slice() {
-        [] => Err(failure("no matching public hosted zone")),
-        [first, second, ..] if first.0 == second.0 => Err(failure(
+    let Some(best) = matching.first() else {
+        return Err(failure("no matching public hosted zone"));
+    };
+    // Duplicate hosted zones can exist for the same name (split tests or an
+    // abandoned re-create). Count every match for the selected name instead of
+    // trusting the first pair, so an ambiguous account always fails closed.
+    let best_name = best.0.as_str();
+    if matching
+        .iter()
+        .filter(|(zone, _)| zone.as_str() == best_name)
+        .count()
+        > 1
+    {
+        return Err(failure(
             "multiple public hosted zones match; configure hosted_zone_id",
-        )),
-        [first, ..] => Ok(&first.1),
+        ));
     }
+    Ok(&best.1)
 }
 
 async fn build_client() -> Client {
@@ -104,8 +132,12 @@ impl Route53DnsTask {
             let mut pages =
                 self.client.list_hosted_zones().into_paginator().send();
             while let Some(page) = pages.next().await {
-                let page =
-                    page.map_err(|_| failure("could not list hosted zones"))?;
+                let page = page.map_err(|err| {
+                    failure(&format!(
+                        "could not list hosted zones: {}",
+                        describe(err)
+                    ))
+                })?;
                 zones.extend(
                     page.hosted_zones()
                         .iter()
@@ -125,13 +157,15 @@ impl Route53DnsTask {
             }
             select_zone(name, &zones)?.to_owned()
         };
-        let result = self
-            .client
-            .get_hosted_zone()
-            .id(&id)
-            .send()
-            .await
-            .map_err(|_| failure("could not read hosted zone"))?;
+        let result =
+            self.client.get_hosted_zone().id(&id).send().await.map_err(
+                |err| {
+                    failure(&format!(
+                        "could not read hosted zone: {}",
+                        describe(err)
+                    ))
+                },
+            )?;
         let zone = result
             .hosted_zone()
             .ok_or_else(|| failure("missing hosted zone"))?;
@@ -240,7 +274,12 @@ impl Route53DnsTask {
                 .max_items(2)
                 .send()
                 .await
-                .map_err(|_| failure("could not read TXT record set"))?;
+                .map_err(|err| {
+                    failure(&format!(
+                        "could not read TXT record set: {}",
+                        describe(err)
+                    ))
+                })?;
             let mut sets =
                 records.resource_record_sets().iter().filter(|set| {
                     dns_name(set.name()) == name && set.r#type() == &RrType::Txt
@@ -281,10 +320,11 @@ impl Route53DnsTask {
                     ))
                     .await;
                 },
-                Err(_) => {
-                    return Err(failure(
-                        "TXT change failed or could not be confirmed",
-                    ));
+                Err(err) => {
+                    return Err(failure(&format!(
+                        "TXT change failed: {}",
+                        describe(err)
+                    )));
                 },
             }
         }
