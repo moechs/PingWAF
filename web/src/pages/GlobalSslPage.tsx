@@ -88,7 +88,7 @@ const emptyForm = (): FormState => ({
   autoRenew: true,
   acmeEmail: '',
   challengeType: 'http-01',
-  dnsProvider: ACME_DNS_PROVIDERS[0],
+  dnsProvider: '',
   dnsConfig: [],
   certPem: '',
   keyPem: '',
@@ -985,7 +985,10 @@ export function GlobalSslPage() {
                   <Select
                     label={t('pages.ssl.dnsProvider')}
                     hint={t('pages.sslGlobal.dnsProviderHint')}
-                    options={ACME_DNS_PROVIDERS.map((p) => ({ value: p, label: p }))}
+                    options={[
+                      { value: '', label: t('pages.sslGlobal.dnsProviderNone') },
+                      ...ACME_DNS_PROVIDERS.map((p) => ({ value: p, label: p })),
+                    ]}
                     value={form.dnsProvider}
                     onChange={(e) => setForm((f) => ({ ...f, dnsProvider: e.target.value }))}
                   />
