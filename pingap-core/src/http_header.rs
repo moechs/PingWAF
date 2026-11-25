@@ -694,7 +694,18 @@ pub fn forwarded_identity(
     let peer = canonical_ip(session.client_addr()?.as_inet()?.ip());
     let trusted = |ip| match site {
         Some(policy) => policy.enabled && policy.peer_is_trusted(ip),
-        None => is_trusted_proxy(ip),
+        // No per-site policy: use the same trust resolution as
+        // `get_client_ip`, or the client IP the WAF/logs see and the chain
+        // forwarded upstream would disagree. When `trusted_proxies` is
+        // configured it is the strict list; when it is not, the legacy
+        // private/loopback heuristic applies.
+        None => {
+            if TRUSTED_PROXIES_ENABLED.load(Ordering::Relaxed) {
+                is_trusted_proxy(ip)
+            } else {
+                is_plausible_internal_proxy(ip)
+            }
+        },
     };
     let header =
         site.map_or(HTTP_HEADER_X_FORWARDED_FOR, |p| p.header.as_str());
@@ -1647,6 +1658,11 @@ mod tests {
         )
         .await;
         assert_eq!(get_client_ip(&session), "192.168.1.1");
+        // The forwarded chain must use the same trust rule, or the origin
+        // receives only the proxy address while the WAF/logs see the client.
+        let identity = forwarded_identity(&session, &Ctx::default(), None)
+            .expect("the mock peer has an address");
+        assert_eq!(identity.client, "192.168.1.1");
 
         let session = new_test_session_with_peer(
             &["X-Real-Ip:192.168.1.2"],

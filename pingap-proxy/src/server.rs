@@ -889,17 +889,11 @@ impl Server {
         // `X-Real-IP` only when the peer is a configured trusted proxy, and
         // caches the answer on the context so plugins see the same value.
         let policy = self.site_proxy_trust.map(|lookup| lookup(&host));
+        // Resolve the legacy client IP first. The per-site forwarded identity
+        // is only computed for a location that actually opts into the standard
+        // reverse-proxy headers, so turning that feature on for one site no
+        // longer changes the WAF/rate-limit identity of every other site.
         let mut forwarded = None;
-        if policy.is_some() {
-            forwarded =
-                pingap_core::forwarded_identity(session, ctx, policy.as_ref());
-            ctx.conn.client_ip = Some(
-                forwarded
-                    .as_ref()
-                    .map(|f| f.client.clone())
-                    .unwrap_or_default(),
-            );
-        }
         let client_ip = ensure_client_ip(session, ctx).parse::<IpAddr>().ok();
 
         // Host-bucket index shrinks candidates; weight order is preserved so
@@ -923,7 +917,10 @@ impl Server {
                             policy.as_ref(),
                         );
                     }
-                    forwarded.as_ref().and_then(|f| f.client.parse().ok())
+                    forwarded
+                        .as_ref()
+                        .and_then(|f| f.client.parse().ok())
+                        .or(client_ip)
                 } else {
                     client_ip
                 };
@@ -940,14 +937,11 @@ impl Server {
 
         // The name is all the access log and the per-location metrics
         // need; they pair their own counters by it.
-        if location.enable_reverse_proxy_headers {
-            ctx.conn.client_ip = Some(
-                forwarded
-                    .as_ref()
-                    .map(|f| f.client.clone())
-                    .unwrap_or_default(),
-            );
-            ctx.conn.forwarded = forwarded;
+        if location.enable_reverse_proxy_headers
+            && let Some(identity) = forwarded
+        {
+            ctx.conn.client_ip = Some(identity.client.clone());
+            ctx.conn.forwarded = Some(identity);
         }
         ctx.upstream.location = location.name.clone();
         if let Some(captures) = captures {

@@ -2240,6 +2240,12 @@ pub async fn start_data_plane(
                     return pingap_core::ProxyTrust::default();
                 };
                 let trust = &site.proxy_trust;
+                // Most sites do not configure a trust boundary. Return the
+                // disabled policy without parsing CIDR strings and allocating
+                // a header name on every request.
+                if !trust.enabled {
+                    return pingap_core::ProxyTrust::default();
+                }
                 pingap_core::ProxyTrust::new(
                     trust.enabled,
                     trust.effective_header(),
