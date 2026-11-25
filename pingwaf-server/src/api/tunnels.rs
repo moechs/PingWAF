@@ -193,7 +193,7 @@ async fn list(
         .paginate(&state.db, pagination.page_size)
         .fetch_page(pagination.page.saturating_sub(1))
         .await?;
-    let views = build_views(&state, rows).await?;
+    let views = build_views(&state, rows, scope_owner(&current)).await?;
     Ok(Json(Page::new(views, total, pagination)))
 }
 
@@ -206,7 +206,8 @@ async fn show(
     let tunnel_id = parse_uuid(&tunnel_id, "tunnel id")?;
     let row = load(&state, tunnel_id).await?;
     ensure_visible(&state, &current, &row).await?;
-    let mut views = build_views(&state, vec![row]).await?;
+    let mut views =
+        build_views(&state, vec![row], scope_owner(&current)).await?;
     views
         .pop()
         .map(Json)
@@ -246,8 +247,13 @@ async fn create(
     .insert(&state.db)
     .await?;
 
-    let (view, token, expires_at) =
-        issue_pairing_token(&state, row, settings.pairing_ttl_seconds).await?;
+    let (view, token, expires_at) = issue_pairing_token(
+        &state,
+        row,
+        settings.pairing_ttl_seconds,
+        scope_owner(&current),
+    )
+    .await?;
     let command = pairing_command(&state, &headers, &token);
     tracing::info!(tunnel_id = %view.id, actor = %current.id, "tunnel created");
     Ok((
@@ -326,7 +332,8 @@ async fn update(
         notify_tunnel_connectors(&state.db, tunnel_id, None).await;
     }
     tracing::info!(%tunnel_id, actor = %current.id, status = %row.status, "tunnel updated");
-    let mut views = build_views(&state, vec![row]).await?;
+    let mut views =
+        build_views(&state, vec![row], scope_owner(&current)).await?;
     views
         .pop()
         .map(Json)
@@ -380,6 +387,13 @@ async fn remove(
     tunnel_connector::Entity::delete_by_id(tunnel_id)
         .exec(&state.db)
         .await?;
+    // The per-edge session rows have no foreign key (an agent reports them and
+    // may be offline when the tunnel goes away), so they are cleared here
+    // instead of waiting for a heartbeat that may never come.
+    let _ = tunnel_session::Entity::delete_many()
+        .filter(tunnel_session::Column::TunnelId.eq(tunnel_id))
+        .exec(&state.db)
+        .await;
     notify_tunnel_connectors(
         &state.db,
         tunnel_id,
@@ -424,8 +438,13 @@ async fn mint_pairing(
     .await;
     notify_all_config_changed(&state, Some(&current.id.to_string())).await;
 
-    let (view, token, expires_at) =
-        issue_pairing_token(&state, row, settings.pairing_ttl_seconds).await?;
+    let (view, token, expires_at) = issue_pairing_token(
+        &state,
+        row,
+        settings.pairing_ttl_seconds,
+        scope_owner(&current),
+    )
+    .await?;
     let command = pairing_command(&state, &headers, &token);
     tracing::info!(%tunnel_id, actor = %current.id, "tunnel pairing token minted");
     Ok(Json(PairingView {
@@ -462,7 +481,8 @@ async fn revoke(
     .await;
     notify_all_config_changed(&state, Some(&current.id.to_string())).await;
     tracing::info!(%tunnel_id, actor = %current.id, "tunnel credential revoked");
-    let mut views = build_views(&state, vec![row]).await?;
+    let mut views =
+        build_views(&state, vec![row], scope_owner(&current)).await?;
     views
         .pop()
         .map(Json)
@@ -569,6 +589,12 @@ async fn update_settings(
 ///
 /// `None` means "no restriction" (an administrator). An empty set is a real
 /// answer — the caller owns no site bound to any tunnel, so the list is empty.
+/// What the caller may see of the derived tunnel facts: an administrator sees
+/// everything, everyone else only their own sites.
+fn scope_owner(current: &AuthUser) -> Option<Uuid> {
+    (!current.is_admin()).then_some(current.id)
+}
+
 async fn visible_tunnel_ids(
     state: &AppState,
     current: &AuthUser,
@@ -626,6 +652,7 @@ async fn issue_pairing_token(
     state: &AppState,
     row: tunnel_connector::Model,
     ttl_seconds: i32,
+    owner: Option<Uuid>,
 ) -> Result<(TunnelView, String, DateTime<Utc>), ApiError> {
     let token = tunnel_policy::generate_secret();
     let expires_at =
@@ -635,7 +662,7 @@ async fn issue_pairing_token(
     active.pairing_token_expires_at = Set(Some(expires_at));
     active.updated_at = Set(Utc::now());
     let row = active.update(&state.db).await?;
-    let mut views = build_views(state, vec![row]).await?;
+    let mut views = build_views(state, vec![row], owner).await?;
     let view = views
         .pop()
         .ok_or_else(|| ApiError::NotFound("tunnel not found".to_string()))?;
@@ -656,16 +683,21 @@ fn pairing_command(
 }
 
 /// Builds the console view of a set of rows.
+/// `owner` scopes the derived facts: `None` for an administrator, `Some` for a
+/// non-admin, whose view must not include other tenants' domains or internal
+/// addresses on a shared tunnel.
 async fn build_views(
     state: &AppState,
     rows: Vec<tunnel_connector::Model>,
+    owner: Option<Uuid>,
 ) -> Result<Vec<TunnelView>, ApiError> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
     let settings = tunnel_policy::load_settings(&state.db).await?;
-    let targets = tunnel_policy::targets_by_tunnel(&state.db).await?;
-    let sites = tunnel_policy::sites_by_tunnel(&state.db).await?;
+    let derived = tunnel_policy::derive_for(&state.db, owner).await?;
+    let targets = derived.targets;
+    let sites = derived.sites;
     let online = TUNNEL_CONNECTORS.online().await;
     let names = agent_names(state).await?;
     let sessions = tunnel_session::Entity::find().all(&state.db).await?;

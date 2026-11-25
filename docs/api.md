@@ -2271,9 +2271,14 @@ reload) and tells a connected connector it was disabled.
 
 ### DELETE /tunnels/{tunnel_id}
 
-Deletes the tunnel. The connector is told to stop and the foreign key clears
-`tunnel_id` on the bound pools, which fall back to **direct** origins (the
-delete is not blocked by the bindings).
+Deletes the tunnel. The connector is told to stop, its per-edge session rows are
+cleared, and the tunnel disappears from the next rule bundle.
+
+A tunnel that origin pools still reference is refused with `409` — silently
+turning those pools into **direct** origins means the edge starts dialing the
+internal addresses itself, which may either fail or reach a network the tunnel
+existed to isolate. Pass `?force=true` to clear the bindings and delete anyway;
+the response's `sites` field (from `GET /tunnels/{id}`) names what is affected.
 
 ### POST /tunnels/{tunnel_id}/pairing
 

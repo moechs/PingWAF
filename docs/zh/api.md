@@ -311,7 +311,7 @@ warn 日志（见 [CHANGELOG Unreleased](../../CHANGELOG.md) 的 `site_hosts` �
 | POST | `/tunnels` | 创建并返回**一次性**配对令牌与安装命令（需写权限） |
 | GET | `/tunnels/{id}` | 单个隧道 |
 | PATCH | `/tunnels/{id}` | 改名/描述/启停（`status` 仅 `active`/`disabled`） |
-| DELETE | `/tunnels/{id}` | 删除；绑定池回退为直连源站 |
+| DELETE | `/tunnels/{id}` | 删除；仍被源站池引用时返回 `409`，需 `?force=true` 才会清空绑定（池回退为直连源站） |
 | POST | `/tunnels/{id}/pairing` | 重新配对（轮换凭据并断开当前连接器） |
 | POST | `/tunnels/{id}/revoke` | 吊销凭据，隧道回到 `pending` |
 | GET | `/tunnels/{id}/sessions` | 各边缘会话明细 |

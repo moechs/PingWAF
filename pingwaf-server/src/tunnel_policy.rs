@@ -4,7 +4,8 @@
 //! Two consumers share this module:
 //!
 //! * the rule bundle ([`bundle_tunnels`]) — every edge learns which tunnels it
-//!   may accept, the SHA-256 of the credential to check, and the target list;
+//!   may accept, the public key its session token must verify against, and the
+//!   target list;
 //! * the connector control stream ([`connector_config`]) — the connector learns
 //!   the same policy plus the ingress endpoints and the certificate
 //!   fingerprints to pin.
@@ -17,7 +18,9 @@ use std::collections::HashMap;
 
 use rand::RngExt;
 use sea_orm::ActiveModelTrait;
-use sea_orm::{DatabaseConnection, DbErr, EntityTrait, Set};
+use sea_orm::{
+    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, Set,
+};
 use uuid::Uuid;
 
 use pingwaf_proto::control_plane as proto;
@@ -81,17 +84,48 @@ pub async fn targets_by_tunnel(
 ) -> Result<HashMap<Uuid, Vec<String>>, DbErr> {
     let pools = site_upstream_pools::Entity::find().all(db).await?;
     let peers = site_upstreams::Entity::find().all(db).await?;
-    let pool_tunnel: HashMap<Uuid, Uuid> = pools
-        .into_iter()
-        .filter_map(|pool| pool.tunnel_id.map(|tunnel| (pool.id, tunnel)))
+    Ok(collect_targets(&bindings(&pools), &peer_rows(&peers)))
+}
+
+/// `(pool id, tunnel id)` for every pool bound to a tunnel.
+fn bindings(pools: &[site_upstream_pools::Model]) -> Vec<(Uuid, Option<Uuid>)> {
+    pools.iter().map(|pool| (pool.id, pool.tunnel_id)).collect()
+}
+
+/// `(pool id, address, tls)` for every origin node.
+fn peer_rows(peers: &[site_upstreams::Model]) -> Vec<(Uuid, String, bool)> {
+    peers
+        .iter()
+        .map(|peer| (peer.pool_id, peer.address.clone(), peer.tls))
+        .collect()
+}
+
+/// The pure part of [`targets_by_tunnel`]: which `host:port` each tunnel
+/// serves, deduplicated and sorted.
+///
+/// The address goes through `normalize_pool_target`, the same function the edge
+/// uses to look a bridge up. A pool may store a bare host (`app.internal`,
+/// which the API accepts); deriving the target with the *strict* normalizer
+/// dropped it, and the pool then silently had no upstream on the edge while the
+/// connector refused to dial it. The default port follows the peer's TLS flag,
+/// exactly as a direct origin would.
+pub(crate) fn collect_targets(
+    bindings: &[(Uuid, Option<Uuid>)],
+    peers: &[(Uuid, String, bool)],
+) -> HashMap<Uuid, Vec<String>> {
+    let pool_tunnel: HashMap<Uuid, Uuid> = bindings
+        .iter()
+        .filter_map(|(pool_id, tunnel_id)| {
+            tunnel_id.map(|tunnel| (*pool_id, tunnel))
+        })
         .collect();
     let mut targets: HashMap<Uuid, Vec<String>> = HashMap::new();
-    for peer in peers {
-        let Some(tunnel_id) = pool_tunnel.get(&peer.pool_id).copied() else {
+    for (pool_id, address, tls) in peers {
+        let Some(tunnel_id) = pool_tunnel.get(pool_id).copied() else {
             continue;
         };
         let Some(address) =
-            pingwaf_tunnel::protocol::normalize_target(&peer.address)
+            pingwaf_tunnel::protocol::normalize_pool_target(address, *tls)
         else {
             continue;
         };
@@ -103,7 +137,7 @@ pub async fn targets_by_tunnel(
     for list in targets.values_mut() {
         list.sort();
     }
-    Ok(targets)
+    targets
 }
 
 /// Targets of one tunnel, capped by the deployment limit.
@@ -132,13 +166,10 @@ pub async fn targets_for_tunnel(
 ///
 /// Used by the console to answer "what breaks if I disable/delete this?", so a
 /// destructive action can name its blast radius instead of a count.
-pub async fn sites_by_tunnel(
-    db: &DatabaseConnection,
-) -> Result<HashMap<Uuid, Vec<String>>, DbErr> {
-    let pools = site_upstream_pools::Entity::find().all(db).await?;
-    let sites = crate::models::site::Entity::find().all(db).await?;
-    let domains: HashMap<Uuid, String> =
-        sites.into_iter().map(|row| (row.id, row.domain)).collect();
+pub(crate) fn collect_sites(
+    pools: &[site_upstream_pools::Model],
+    domains: &HashMap<Uuid, String>,
+) -> HashMap<Uuid, Vec<String>> {
     let mut by_tunnel: HashMap<Uuid, Vec<String>> = HashMap::new();
     for pool in pools {
         let Some(tunnel_id) = pool.tunnel_id else {
@@ -155,7 +186,65 @@ pub async fn sites_by_tunnel(
     for list in by_tunnel.values_mut() {
         list.sort();
     }
-    Ok(by_tunnel)
+    by_tunnel
+}
+
+/// The derived tunnel facts, as one caller is allowed to see them.
+#[derive(Debug, Default)]
+pub struct TunnelDerivation {
+    pub targets: HashMap<Uuid, Vec<String>>,
+    pub sites: HashMap<Uuid, Vec<String>>,
+}
+
+/// Derives the per-tunnel targets and site domains.
+///
+/// `owner = None` is an administrator and sees everything. `Some(user_id)`
+/// restricts both maps to that user's own sites: a non-admin whose site is
+/// bound to a tunnel must not learn the *other* tenants' domains or internal
+/// addresses that share it.
+pub async fn derive_for(
+    db: &DatabaseConnection,
+    owner: Option<Uuid>,
+) -> Result<TunnelDerivation, DbErr> {
+    let sites = match owner {
+        Some(user_id) => {
+            crate::models::site::Entity::find()
+                .filter(crate::models::site::Column::UserId.eq(user_id))
+                .all(db)
+                .await?
+        },
+        None => crate::models::site::Entity::find().all(db).await?,
+    };
+    let site_ids: Vec<Uuid> = sites.iter().map(|row| row.id).collect();
+    if owner.is_some() && site_ids.is_empty() {
+        return Ok(TunnelDerivation::default());
+    }
+    let domains: HashMap<Uuid, String> =
+        sites.into_iter().map(|row| (row.id, row.domain)).collect();
+    let pools = match owner {
+        Some(_) => {
+            site_upstream_pools::Entity::find()
+                .filter(site_upstream_pools::Column::SiteId.is_in(site_ids))
+                .all(db)
+                .await?
+        },
+        None => site_upstream_pools::Entity::find().all(db).await?,
+    };
+    let peers = match owner {
+        Some(_) => {
+            let pool_ids: Vec<Uuid> =
+                pools.iter().map(|pool| pool.id).collect();
+            site_upstreams::Entity::find()
+                .filter(site_upstreams::Column::PoolId.is_in(pool_ids))
+                .all(db)
+                .await?
+        },
+        None => site_upstreams::Entity::find().all(db).await?,
+    };
+    Ok(TunnelDerivation {
+        targets: collect_targets(&bindings(&pools), &peer_rows(&peers)),
+        sites: collect_sites(&pools, &domains),
+    })
 }
 
 /// Ingress endpoints connectors should dial, grouped by public address.
@@ -294,5 +383,56 @@ mod tests {
         assert!(!pingwaf_tunnel::protocol::credential_matches(
             "other", &digest
         ));
+    }
+
+    #[test]
+    fn targets_get_the_default_port_of_the_peer_tls_flag() {
+        let tunnel = Uuid::new_v4();
+        let pool = Uuid::new_v4();
+        let bindings = vec![(pool, Some(tunnel))];
+        let peers = vec![
+            (pool, "app.internal".to_string(), false),
+            (pool, "secure.internal".to_string(), true),
+            (pool, "10.0.0.5:8080".to_string(), false),
+            // Duplicated and unsorted on purpose: the derivation dedupes and
+            // sorts, so a reordered pool does not churn the config hash.
+            (pool, "10.0.0.5:8080".to_string(), false),
+            (pool, "app.internal".to_string(), false),
+        ];
+        let targets = collect_targets(&bindings, &peers);
+        assert_eq!(
+            targets.get(&tunnel).cloned().unwrap_or_default(),
+            vec![
+                "10.0.0.5:8080".to_string(),
+                "app.internal:80".to_string(),
+                "secure.internal:443".to_string(),
+            ],
+            "a bare host must get the default port of its TLS flag, or the edge \
+             and the bundle would disagree and the pool would have no upstream"
+        );
+    }
+
+    #[test]
+    fn an_unbound_pool_contributes_nothing() {
+        let pool = Uuid::new_v4();
+        let targets = collect_targets(
+            &[(pool, None)],
+            &[(pool, "10.0.0.5:8080".to_string(), false)],
+        );
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn an_unparsable_address_is_dropped_instead_of_panicking() {
+        let tunnel = Uuid::new_v4();
+        let pool = Uuid::new_v4();
+        let targets = collect_targets(
+            &[(pool, Some(tunnel))],
+            &[
+                (pool, "bad:port:here".to_string(), false),
+                (pool, "  ".to_string(), false),
+            ],
+        );
+        assert!(targets.is_empty());
     }
 }

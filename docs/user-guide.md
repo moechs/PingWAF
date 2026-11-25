@@ -1248,7 +1248,19 @@ tunnel_addr = "0.0.0.0:9443"
 or `--tunnel-addr 0.0.0.0:9443` / `PINGWAF_TUNNEL_ADDR`. Then give that edge a
 **tunnel ingress address** — the public `host:port` connectors dial — in the
 agent's detail panel (Agents → [node] → **Tunnel ingress**). The panel also
-shows the listener state and the SHA-256 of the certificate connectors pin.
+shows the listener state and the SHA-256 of the certificate connectors pin, and
+it explains a listener that is configured but failed to bind (for example the
+port is already in use).
+
+The listener binds at startup: changing `tunnel_addr` needs an edge restart. The
+ingress *address* and the tunnel policy are hot — they reach the connectors and
+the edges through the next push (≤5s on a connected edge), so a new ingress
+address or a re-paired credential does not need one.
+
+**Tunnels → Settings** carries the deployment-wide limits: a master switch (off
+closes live sessions on the next reload and stops connectors from redialing),
+the pairing-token lifetime, streams per session, targets per tunnel, the session
+liveness timeout, the heartbeat cadence and the session-token lifetime.
 
 Open the tunnel port on the edge's firewall. Nothing needs to be open on the
 private-network side.

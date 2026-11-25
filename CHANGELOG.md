@@ -69,6 +69,26 @@ verbatim for reference and attribution, and is not maintained here.
   leaves it alone) and accepts `tunnel_ingress_addr`. Previously any update
   omitted the field and silently cleared the label.
 
+### Fixed
+
+- **A tunnel target stored as a bare hostname had no upstream.** The origin-pool
+  API accepts `app.internal`, but the control plane derived tunnel targets with
+  the strict `host:port` normalizer, so the target never reached the rule
+  bundle and the edge could not find a bridge for it: the pool silently had no
+  upstream while the connector refused to dial the address. Both sides now use
+  the same normalizer, which appends the default port of the node's TLS flag
+  (80/443), exactly as a direct origin would.
+- **A shared tunnel no longer leaks other tenants' sites and internal
+  addresses.** The derived `sites` and `targets` a non-administrator sees are
+  scoped to that account's own sites.
+- **The per-edge session report is replaced in one transaction**, so the tunnel
+  page cannot flash "no sessions" between a heartbeat's delete and inserts, and
+  a deleted tunnel's session rows are cleared instead of lingering until a
+  heartbeat that may never arrive.
+- **Disabling tunnels deployment-wide no longer makes connectors redial.** The
+  edge closes the live session on the next reload and the connector now waits
+  for the next policy push instead of producing a refusal every backoff window.
+
 ## [PingWAF 0.32.52] — 2026-11-25
 
 ### Fixed

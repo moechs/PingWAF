@@ -31,7 +31,7 @@ use pingwaf_proto::control_plane::{
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait,
-    QueryFilter, QuerySelect, Set, UpdateMany,
+    QueryFilter, QuerySelect, Set, TransactionTrait, UpdateMany,
 };
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
@@ -3766,36 +3766,51 @@ async fn persist_tunnel_state(
         crate::grpc::notify_all_tunnel_connectors(db).await;
     }
 
-    if let Err(err) = tunnel_session::Entity::delete_many()
-        .filter(tunnel_session::Column::AgentId.eq(agent_id))
-        .exec(db)
-        .await
-    {
-        tracing::warn!(%agent_id, error = %err, "cannot clear the tunnel session report");
-        return;
-    }
+    // The report is a snapshot, not a delta: replace it atomically so a reader
+    // never sees the agent with zero sessions between the delete and the
+    // inserts (the tunnel page would flash "no sessions" on every heartbeat).
     let now = Utc::now();
-    for report in &heartbeat.tunnel_sessions {
-        let Ok(tunnel_id) = Uuid::parse_str(report.tunnel_id.trim()) else {
-            continue;
-        };
-        let connected_at = from_timestamp(report.connected_at.as_ref());
-        let session = tunnel_session::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            tunnel_id: Set(tunnel_id),
-            agent_id: Set(agent_id),
-            connected_at: Set(connected_at),
-            last_seen_at: Set(now),
-            version: Set(optional(&report.connector_version)),
-            hostname: Set(optional(&report.hostname)),
-            streams_active: Set(
-                report.streams_active.min(i32::MAX as u32) as i32
-            ),
-            rtt_ms: Set(report.rtt_ms.min(i32::MAX as u32) as i32),
-        };
-        if let Err(err) = session.insert(db).await {
-            tracing::warn!(%agent_id, %tunnel_id, error = %err, "cannot record a tunnel session");
-        }
+    let reports: Vec<(Uuid, tunnel_session::ActiveModel)> = heartbeat
+        .tunnel_sessions
+        .iter()
+        .filter_map(|report| {
+            let tunnel_id = Uuid::parse_str(report.tunnel_id.trim()).ok()?;
+            let session = tunnel_session::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                tunnel_id: Set(tunnel_id),
+                agent_id: Set(agent_id),
+                connected_at: Set(from_timestamp(report.connected_at.as_ref())),
+                last_seen_at: Set(now),
+                version: Set(optional(&report.connector_version)),
+                hostname: Set(optional(&report.hostname)),
+                streams_active: Set(
+                    report.streams_active.min(i32::MAX as u32) as i32
+                ),
+                rtt_ms: Set(report.rtt_ms.min(i32::MAX as u32) as i32),
+            };
+            Some((tunnel_id, session))
+        })
+        .collect();
+    let replaced = db
+        .transaction::<_, (), sea_orm::DbErr>(|txn| {
+            Box::pin(async move {
+                tunnel_session::Entity::delete_many()
+                    .filter(tunnel_session::Column::AgentId.eq(agent_id))
+                    .exec(txn)
+                    .await?;
+                for (tunnel_id, session) in reports {
+                    if let Err(err) = session.insert(txn).await {
+                        // A single bad row must not roll back the whole
+                        // report: the other tunnels' sessions are still true.
+                        tracing::warn!(%agent_id, %tunnel_id, error = %err, "cannot record a tunnel session");
+                    }
+                }
+                Ok(())
+            })
+        })
+        .await;
+    if let Err(err) = replaced {
+        tracing::warn!(%agent_id, error = %err, "cannot record the tunnel session report");
     }
 }
 

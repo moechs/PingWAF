@@ -77,6 +77,27 @@ impl ConnectorState {
     }
 }
 
+/// What the session loop should do with the current connector state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionAction {
+    /// The tunnel was revoked: stop for good.
+    Stop,
+    /// Tunnels are disabled deployment-wide: wait, do not dial.
+    Wait,
+    /// Dial (or redial) the edge.
+    Connect,
+}
+
+fn session_action(state: &ConnectorState) -> SessionAction {
+    if state.revoked.is_some() {
+        return SessionAction::Stop;
+    }
+    if !state.enabled {
+        return SessionAction::Wait;
+    }
+    SessionAction::Connect
+}
+
 /// Static configuration of one connector process.
 #[derive(Debug, Clone)]
 pub struct ConnectorConfig {
@@ -248,8 +269,24 @@ impl Connector {
     async fn session_loop(self: Arc<Self>, ingress: IngressEndpoint) {
         let mut backoff = BACKOFF_MIN;
         loop {
-            if self.state().revoked.is_some() {
-                return;
+            match session_action(&self.state()) {
+                SessionAction::Stop => return,
+                SessionAction::Wait => {
+                    // The deployment-wide switch is off: the edge has already
+                    // been told to close this session, and dialing again would
+                    // only produce a refusal every backoff window. Wait for
+                    // the next push instead (the control plane notifies on a
+                    // settings change).
+                    info!(
+                        target: "pingwaf::tunnel",
+                        endpoint = %ingress.endpoint,
+                        "tunnel support is disabled deployment-wide; waiting for it to be re-enabled"
+                    );
+                    self.changed.notified().await;
+                    backoff = BACKOFF_MIN;
+                    continue;
+                },
+                SessionAction::Connect => {},
             }
             match Arc::clone(&self).run_session(ingress.clone()).await {
                 Ok(()) => {
@@ -872,6 +909,23 @@ mod tests {
         assert_eq!(host_of("127.0.0.1:9443").unwrap(), "127.0.0.1");
         assert!(host_of("nope").is_err());
         assert!(host_of(":9443").is_err());
+    }
+
+    #[test]
+    fn a_disabled_deployment_waits_instead_of_redialing() {
+        let mut state = ConnectorState {
+            enabled: true,
+            ..ConnectorState::default()
+        };
+        assert_eq!(session_action(&state), SessionAction::Connect);
+        // The global switch is off: the edge closes the session and the
+        // connector must wait for the next push, not produce a refusal every
+        // backoff window.
+        state.enabled = false;
+        assert_eq!(session_action(&state), SessionAction::Wait);
+        // A revocation outranks the switch: the process stops.
+        state.revoked = Some("revoked by an operator".to_string());
+        assert_eq!(session_action(&state), SessionAction::Stop);
     }
 
     #[test]
