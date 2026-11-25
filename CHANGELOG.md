@@ -8,7 +8,7 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
-## [Unreleased]
+## [PingWAF 0.33.0] — 2026-11-25
 
 ### Added
 
@@ -2470,12 +2470,12 @@ that table up if you may need to roll back.
   built from `site/` (Astro), whose deployment pages now document both install
   modes.
 
-## [PingWAF 0.33.0] — 2026-10-31
+### Also in this release
 
-Feature release: static-asset access-log filtering, AI bots as a first-class
-client type, and regex support in rewrite body replacement. One migration
-ships automatically; the `RuleBundle` proto gains an optional field, so old
-agents keep working against a new control plane.
+Static-asset access-log filtering, AI bots as a first-class client type, and
+regex support in rewrite body replacement. One migration ships automatically;
+the `RuleBundle` proto gains an optional field, so old agents keep working
+against a new control plane.
 
 ### Added
 
