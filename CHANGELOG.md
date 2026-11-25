@@ -26,8 +26,11 @@ verbatim for reference and attribution, and is not maintained here.
   holding a session, and carries the deployment-wide limits
   (`tunnel_settings`).
   - Edge side: `agent.tunnel_addr` / `--tunnel-addr` / `PINGWAF_TUNNEL_ADDR`
-    (off by default) starts the TLS listener; the edge generates and rotates its
-    own self-signed certificate and reports its SHA-256, which connectors pin.
+    (off by default) starts the TLS listener; the edge generates its own
+    self-signed certificate on first boot (persisted, so restarts keep the same
+    fingerprint) and reports its SHA-256, which connectors pin. Deleting the
+    certificate files and restarting rotates it; the new fingerprint reaches the
+    connectors on the next heartbeat.
   - Auth: a one-time pairing token is redeemed over the new `PairTunnel` gRPC
     RPC for a 32-byte credential (stored only as its SHA-256), which
     authenticates the connector's control stream. Edges never see it: the

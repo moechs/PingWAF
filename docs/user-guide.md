@@ -1387,7 +1387,11 @@ Notes:
   edge keeps accepting a revoked tunnel, so shorten it if revocation must
   converge faster than the rule-bundle push.
 - The edge's tunnel certificate is self-signed and generated locally; the
-  connector **pins its SHA-256** and fails closed on a mismatch.
+  connector **pins its SHA-256** and fails closed on a mismatch. It is
+  persisted, so a restart keeps the same fingerprint. To rotate it, stop the
+  edge, delete the certificate files under its data directory
+  (`cert.pem` / `key.pem`), and start it again: the new
+  fingerprint reaches the connectors on the next heartbeat.
 - The edge only opens streams for targets its own sites reference, and the
   connector only dials targets the control plane lists (optionally narrowed by
   its local `allowed_targets`).
