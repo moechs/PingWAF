@@ -1673,10 +1673,8 @@ export const ACME_CHALLENGE_TYPES: AcmeChallengeType[] = ['http-01', 'dns-01']
 export const ACME_DNS_PROVIDERS = [
   'cloudflare',
   'route53',
-  'digitalocean',
   'aliyun',
   'dnspod',
-  'cloudxns',
   'huawei',
   'manual',
 ] as const
