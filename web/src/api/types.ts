@@ -1714,6 +1714,8 @@ export interface SslCertificate {
   acme_challenge_type: string
   acme_dns_provider: string | null
   acme_dns_config: unknown | null
+  /** Agent allowed to issue this certificate; null = agent-level scope. */
+  acme_issuer_agent_id?: string | null
   status: CertificateStatus | string
   /** Why the last ACME issuance was given up on; null while healthy. */
   failure_reason: string | null
@@ -1807,6 +1809,8 @@ export interface CreateSslRequest {
   acme_challenge_type?: AcmeChallengeType | string | null
   acme_dns_provider?: string | null
   acme_dns_config?: unknown | null
+  /** Agent allowed to issue this certificate; omit for the agent-level scope. */
+  acme_issuer_agent_id?: string | null
   /** Manual upload. */
   cert_pem?: string | null
   key_pem?: string | null

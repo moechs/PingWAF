@@ -16,17 +16,18 @@ use pingwaf_proto::control_plane::{
     control_plane_server::ControlPlane as ControlPlaneTrait, AgentHeartbeat,
     BlockedIp, CertEventAck, CertEventEntry, GetSiteConfigRequest, HostSample,
     LogAck, LogEntry, Metric, MetricAck, MetricBatch, PairTunnelRequest,
-    PairTunnelResponse, RegisterAgentRequest, RegisterAgentResponse,
-    RuleBundle, ServerCommand, SiteConfig, SiteStatus, SyncRulesRequest,
-    TunnelConnectorCommand, TunnelConnectorMessage, UpstreamHealth,
-    VisitorChallengeRequest, VisitorChallengeResponse,
-    VisitorChangePasswordRequest, VisitorChangePasswordResponse,
-    VisitorGrantsRequest, VisitorGrantsResponse, VisitorLoginRequest,
-    VisitorLoginResponse, VisitorLogoutRequest, VisitorLogoutResponse,
-    VisitorPasskeyBeginRequest, VisitorPasskeyFinishRequest,
-    VisitorPasskeyFinishResponse, VisitorPasskeyListResponse,
-    VisitorPasskeyOptionsResponse, VisitorSetVisibleRequest,
-    VisitorSetVisibleResponse, VisitorValidateRequest, VisitorValidateResponse,
+    PairTunnelResponse, PublishCertificateRequest, PublishCertificateResponse,
+    RegisterAgentRequest, RegisterAgentResponse, RuleBundle, ServerCommand,
+    SiteConfig, SiteStatus, SyncRulesRequest, TunnelConnectorCommand,
+    TunnelConnectorMessage, UpstreamHealth, VisitorChallengeRequest,
+    VisitorChallengeResponse, VisitorChangePasswordRequest,
+    VisitorChangePasswordResponse, VisitorGrantsRequest, VisitorGrantsResponse,
+    VisitorLoginRequest, VisitorLoginResponse, VisitorLogoutRequest,
+    VisitorLogoutResponse, VisitorPasskeyBeginRequest,
+    VisitorPasskeyFinishRequest, VisitorPasskeyFinishResponse,
+    VisitorPasskeyListResponse, VisitorPasskeyOptionsResponse,
+    VisitorSetVisibleRequest, VisitorSetVisibleResponse,
+    VisitorValidateRequest, VisitorValidateResponse,
 };
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -429,7 +430,7 @@ impl ControlPlaneService {
         let mut config = build_site_config(&self.db, Some(&ids))
             .await
             .map_err(db_status)?;
-        crate::grpc::scope_acme_for_agent(&mut config, row.acme_issuer);
+        crate::grpc::scope_acme_for_agent(&mut config, row.id, row.acme_issuer);
         Ok(config)
     }
 }
@@ -1654,7 +1655,11 @@ impl ControlPlaneTrait for ControlPlaneService {
             let mut config = build_site_config(&self.db, Some(&[id]))
                 .await
                 .map_err(db_status)?;
-            crate::grpc::scope_acme_for_agent(&mut config, row.acme_issuer);
+            crate::grpc::scope_acme_for_agent(
+                &mut config,
+                row.id,
+                row.acme_issuer,
+            );
             config
         };
 
@@ -1675,6 +1680,97 @@ impl ControlPlaneTrait for ControlPlaneService {
         }
 
         Ok(Response::new(config))
+    }
+
+    /// `PublishCertificate` — a designated issuer reports the material it
+    /// just issued.
+    ///
+    /// The caller must be an issuer and serve the site; the certificate row
+    /// must be ACME-managed, match the submitted hostname set and (when it
+    /// names one) be designated to this agent. The PEM/key pair and its
+    /// validity are checked before the row is promoted and the site config is
+    /// fanned out to every assigned agent.
+    async fn publish_certificate(
+        &self,
+        request: Request<PublishCertificateRequest>,
+    ) -> Result<Response<PublishCertificateResponse>, Status> {
+        let payload = request.into_inner();
+        let row = self.authorize(&payload.agent_token).await?;
+        if !row.acme_issuer {
+            return Err(Status::permission_denied(
+                "this agent is not an ACME issuer",
+            ));
+        }
+        let site_id = Uuid::parse_str(payload.site_id.trim())
+            .map_err(|_| Status::invalid_argument("site_id is not a UUID"))?;
+        let visible = self.visible_sites(&row).await?;
+        if !visible.iter().any(|site| site.id == site_id) {
+            return Err(Status::permission_denied(
+                "agent does not serve this site",
+            ));
+        }
+        const MAX_PEM_BYTES: usize = 1024 * 1024;
+        if payload.cert_pem.trim().is_empty()
+            || payload.key_pem.trim().is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "cert_pem and key_pem are required",
+            ));
+        }
+        if payload.cert_pem.len() > MAX_PEM_BYTES
+            || payload.key_pem.len() > MAX_PEM_BYTES
+        {
+            return Err(Status::invalid_argument(
+                "certificate material is too large",
+            ));
+        }
+
+        match crate::acme_state_sync::import_certificate(
+            &self.db,
+            site_id,
+            &payload.domains,
+            &payload.cert_pem,
+            &payload.key_pem,
+            Some(row.id),
+        )
+        .await
+        {
+            Ok(crate::acme_state_sync::ImportOutcome::Updated) => {
+                tracing::info!(
+                    agent_id = %row.id,
+                    %site_id,
+                    "certificate published by agent"
+                );
+                crate::grpc::notify_config_changed_for(
+                    &self.db,
+                    &self.agents,
+                    site_id,
+                    Some("agent-publish"),
+                )
+                .await;
+                Ok(Response::new(PublishCertificateResponse {
+                    accepted: true,
+                    message: "certificate published".to_string(),
+                }))
+            },
+            Ok(crate::acme_state_sync::ImportOutcome::Unchanged) => {
+                Ok(Response::new(PublishCertificateResponse {
+                    accepted: true,
+                    message: "certificate already current".to_string(),
+                }))
+            },
+            Ok(crate::acme_state_sync::ImportOutcome::Skipped(reason)) => {
+                let status = if reason.contains("designated") {
+                    Status::permission_denied(reason)
+                } else {
+                    Status::invalid_argument(reason)
+                };
+                Err(status)
+            },
+            Err(err) => Err(Status::internal(format!(
+                "could not store the published certificate: {err}"
+            ))),
+        }
     }
 
     // ── Visitor authentication ─────────────────────────────────────────

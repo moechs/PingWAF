@@ -245,7 +245,7 @@ pub struct UpdateAgentRequest {
 ///
 /// serde only calls this when the key is present, so the outer `Option`
 /// separates "absent" (`None`) from a JSON `null` (`Some(None)`).
-fn deserialize_present_nullable<'de, D, T>(
+pub(crate) fn deserialize_present_nullable<'de, D, T>(
     deserializer: D,
 ) -> Result<Option<Option<T>>, D::Error>
 where

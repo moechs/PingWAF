@@ -1157,9 +1157,27 @@ credentials come from the issuer's own runtime.
   agent detail panel.
 
 A control-plane-only deployment with no embedded issuer has no issuer until one
-is marked. Without a certificate publication RPC a remote issuer still cannot
-return its PEM to the control plane, so the supported issuing topology remains
-the all-in-one control plane.
+is marked. A remote issuer that is marked (and assigned to the site) can return
+its issued PEM over the authenticated `PublishCertificate` gRPC call: the
+control plane validates the caller, the site assignment, the certificate's
+hostname set, the key/leaf pair and the certificate's validity before promoting
+it and fanning it out to every assigned agent. The embedded all-in-one issuer
+keeps working through its local ACME state file; the two paths are idempotent.
+
+### Per-certificate issuer
+
+The agent-level flag decides whether a node may issue at all. To narrow one
+certificate to one agent, set `acme_issuer_agent_id` on the certificate (the
+"Issuer agent" selector in the certificate form, or the field on
+`POST/PUT /api/v1/certificates`). When it is set:
+
+- only that agent receives the certificate's ACME material;
+- only that agent's `PublishCertificate` call is accepted for it;
+- every other agent gets the consumer bundle and serves the distributed PEM.
+
+Leave it empty to keep the agent-level scope (the embedded all-in-one issuer
+and single-agent deployments need no designation). The designated agent must
+already be marked `acme_issuer=true` and serve the certificate's site.
 
 ### Monitoring Agents
 

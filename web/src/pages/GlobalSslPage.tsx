@@ -35,6 +35,7 @@ import { useToast } from '@/components/ui/Toast'
 import { errorMessage } from '@/api/errors'
 import { ApiError } from '@/api/client'
 import { sslApi, sslKeys, daysUntilExpiry, expiryTone } from '@/api/ssl'
+import { agentsApi } from '@/api/agents'
 import { useCanWrite, useNow, useSitesList } from '@/hooks'
 import { formatDateTime } from '@/lib/format'
 import { bindingKind, deleteBlockers, mergeBindResults } from '@/lib/certFlow'
@@ -75,6 +76,7 @@ interface FormState {
   acmeEmail: string
   challengeType: string
   dnsProvider: string
+  issuerAgentId: string
   dnsConfig: Array<{ key: string; value: string }>
   certPem: string
   keyPem: string
@@ -89,6 +91,7 @@ const emptyForm = (): FormState => ({
   acmeEmail: '',
   challengeType: 'http-01',
   dnsProvider: '',
+  issuerAgentId: '',
   dnsConfig: [],
   certPem: '',
   keyPem: '',
@@ -154,6 +157,13 @@ export function GlobalSslPage() {
 
   const certs = useMemo(() => certsQuery.data?.items ?? [], [certsQuery.data])
   const hasPending = certs.some((cert) => cert.status === 'pending')
+
+  const issuersQuery = useQuery({
+    queryKey: ['agents', 'acme-issuers'],
+    queryFn: () => agentsApi.list({ page_size: 200 }),
+    enabled: form.mode === 'acme' && form.challengeType === 'dns-01',
+  })
+  const issuers = (issuersQuery.data?.items ?? []).filter((a) => a.acme_issuer)
 
   const eventsQuery = useQuery({
     queryKey: sslKeys.events({
@@ -362,6 +372,9 @@ export function GlobalSslPage() {
         if (Object.keys(config).length > 0) {
           payload.acme_dns_config = config
         }
+      }
+      if (form.challengeType === 'dns-01' && form.issuerAgentId) {
+        payload.acme_issuer_agent_id = form.issuerAgentId
       }
     } else {
       const certPem = form.certPem.trim()
@@ -992,6 +1005,23 @@ export function GlobalSslPage() {
                     value={form.dnsProvider}
                     onChange={(e) => setForm((f) => ({ ...f, dnsProvider: e.target.value }))}
                   />
+                  {form.challengeType === 'dns-01' && (
+                    <Select
+                      label={t('pages.sslGlobal.issuerAgent')}
+                      hint={t('pages.sslGlobal.issuerAgentHint')}
+                      options={[
+                        { value: '', label: t('pages.sslGlobal.issuerAgentAuto') },
+                        ...issuers.map((a) => ({
+                          value: a.id,
+                          label: a.display_name ?? a.hostname,
+                        })),
+                      ]}
+                      value={form.issuerAgentId}
+                      onChange={(e) =>
+                        setForm((f) => ({ ...f, issuerAgentId: e.target.value }))
+                      }
+                    />
+                  )}
                   {form.dnsProvider && (
                     <div className="flex flex-col gap-2">
                       <div className="flex items-center justify-between">

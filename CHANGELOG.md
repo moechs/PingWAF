@@ -27,12 +27,24 @@ verbatim for reference and attribution, and is not maintained here.
   that is expired, not yet valid, older than the certificate already stored, or
   issued by an ACME staging CA (unless `PINGAP_ACME_STAGING` is set), instead
   of marking it active and pushing it to every agent.
+- **Per-certificate issuer and certificate publication.** A managed
+  certificate can name one issuer agent (`site_certificates.acme_issuer_agent_id`,
+  migration `000110`); only that agent receives the ACME material and only its
+  publication is accepted. The designated issuer reports the issued chain and
+  key over the authenticated `PublishCertificate` gRPC call; the control plane
+  validates the caller, the site assignment, the exact hostname set, the
+  key/leaf pair and the certificate's validity, then promotes it and fans it
+  out. The embedded all-in-one issuer keeps using its local ACME state file;
+  the two paths are idempotent. The certificate form exposes the optional
+  issuer selector.
 
 ### Changed
 
 - A non-issuer agent's bundle no longer carries `acme_dns_config` or
   `acme_enabled`, so consumer-only edges cannot read the provider token or
   start a duplicate order.
+- A certificate designated to one agent is skipped by the local ACME state
+  import: the file sync cannot overwrite another agent's certificate.
 
 ## [PingWAF 0.33.2] — 2026-11-26
 
