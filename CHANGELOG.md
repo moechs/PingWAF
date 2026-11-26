@@ -43,6 +43,12 @@ verbatim for reference and attribution, and is not maintained here.
 - A non-issuer agent's bundle no longer carries `acme_dns_config` or
   `acme_enabled`, so consumer-only edges cannot read the provider token or
   start a duplicate order.
+- **The edge page hosts agents and tunnels under one header.** "Create tunnel"
+  and "Add node" sit side by side in the shared header (the active tab's action
+  is primary), the tunnel tab no longer renders its own header/tabs, and the
+  page description now covers both. The agents tab's refresh moved next to
+  its filters and its empty state offers "Add node" like the tunnel empty state
+  offers "Create tunnel".
 - A certificate designated to one agent is skipped by the local ACME state
   import: the file sync cannot overwrite another agent's certificate.
 

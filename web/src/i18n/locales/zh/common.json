@@ -1704,7 +1704,7 @@
     },
     "agents": {
       "title": "节点",
-      "description": "部署在边缘的 PingWAF 节点及其健康状态。",
+      "description": "边缘节点及其健康状态，以及它们承载的隧道。",
       "empty": "暂无已连接节点",
       "emptyDescription": "部署节点程序以开始保护您的站点。",
       "noResults": "没有匹配的节点",

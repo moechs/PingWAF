@@ -1704,7 +1704,7 @@
     },
     "agents": {
       "title": "Agents",
-      "description": "PingWAF agents deployed at the edge and their health.",
+      "description": "Edge agents, their health, and the tunnels they terminate.",
       "empty": "No agents connected",
       "emptyDescription": "Deploy an agent binary to start protecting your sites.",
       "noResults": "No matching agents",
