@@ -92,6 +92,31 @@ where
     Ok(sites.iter().map(|row| row.id).collect())
 }
 
+/// Removes ACME issuance material from a bundle an agent must not use to
+/// issue.
+///
+/// A consumer keeps `cert_pem`/`key_pem` and serves TLS, but it never receives
+/// the site's DNS provider credentials (`acme_dns_config`) and never starts an
+/// order. The embedded all-in-one issuer keeps the full bundle.
+pub(crate) fn scope_acme_for_agent(config: &mut SiteConfig, acme_issuer: bool) {
+    if acme_issuer {
+        return;
+    }
+    for site in &mut config.sites {
+        let Some(rules) = site.rules.as_mut() else {
+            continue;
+        };
+        let Some(ssl) = rules.ssl.as_mut() else {
+            continue;
+        };
+        ssl.acme_enabled = false;
+        ssl.acme_email.clear();
+        ssl.acme_challenge_type = 0;
+        ssl.acme_dns_provider.clear();
+        ssl.acme_dns_config.clear();
+    }
+}
+
 /// Builds the `UpdateSite` payload one agent should receive for a change on
 /// `site_id`: its bound site's bundle, or the full visible bundle for an
 /// unbound agent. `None` when the agent does not serve the site.
@@ -109,12 +134,15 @@ async fn update_payload_for_agent(
         && visible.len() == 1
         && agent_row.site_id == Some(site_id)
     {
-        return Ok(Some(changed_site_config.clone()));
+        let mut config = changed_site_config.clone();
+        scope_acme_for_agent(&mut config, agent_row.acme_issuer);
+        return Ok(Some(config));
     }
     // A selected or unbound agent carries every visible site: the payload is
     // authoritative, so it must list them all or the agent would drop the
     // sites it does not carry.
-    let config = build_site_config(db, Some(&visible)).await?;
+    let mut config = build_site_config(db, Some(&visible)).await?;
+    scope_acme_for_agent(&mut config, agent_row.acme_issuer);
     Ok(Some(config))
 }
 
@@ -146,7 +174,8 @@ pub(crate) async fn repush_agent_config(
         return Ok(false);
     };
     let visible = agent_visible_site_ids(db, &row).await?;
-    let config = build_site_config(db, Some(&visible)).await?;
+    let mut config = build_site_config(db, Some(&visible)).await?;
+    scope_acme_for_agent(&mut config, row.acme_issuer);
     Ok(registry
         .send_command(&agent_id, update_site_command(config))
         .await)
@@ -467,7 +496,7 @@ async fn push_visible_bundle(
     visible: &[Uuid],
     bundle_cache: &mut HashMap<Vec<Uuid>, SiteConfig>,
 ) -> bool {
-    let payload = match bundle_cache.get(visible) {
+    let mut payload = match bundle_cache.get(visible) {
         Some(config) => config.clone(),
         None => {
             let config = match build_site_config(db, Some(visible)).await {
@@ -485,6 +514,7 @@ async fn push_visible_bundle(
             config
         },
     };
+    scope_acme_for_agent(&mut payload, row.acme_issuer);
     registry
         .send_command(&row.id, update_site_command(payload))
         .await
@@ -571,4 +601,72 @@ pub async fn notify_site_deleted(
         delivered,
         "site removal pushed to agents"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pingwaf_proto::control_plane::{RuleBundle, SslConfig};
+
+    fn bundle(acme: bool) -> SiteConfig {
+        SiteConfig {
+            sites: vec![pingwaf_proto::control_plane::Site {
+                id: "site-1".to_string(),
+                rules: Some(RuleBundle {
+                    ssl: Some(SslConfig {
+                        cert_pem: "CERT".to_string(),
+                        key_pem: "KEY".to_string(),
+                        acme_enabled: acme,
+                        acme_email: "ops@example.com".to_string(),
+                        acme_challenge_type: 1,
+                        acme_dns_provider: "cf".to_string(),
+                        acme_dns_config: [(
+                            "token".to_string(),
+                            "secret".to_string(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn consumer_bundle_keeps_pem_and_drops_acme_credentials() {
+        let mut config = bundle(true);
+        scope_acme_for_agent(&mut config, false);
+        let ssl = config.sites[0]
+            .rules
+            .as_ref()
+            .and_then(|rules| rules.ssl.as_ref())
+            .expect("the test bundle carries TLS material");
+        assert_eq!(ssl.cert_pem, "CERT");
+        assert_eq!(ssl.key_pem, "KEY");
+        assert!(!ssl.acme_enabled);
+        assert!(ssl.acme_email.is_empty());
+        assert!(ssl.acme_dns_provider.is_empty());
+        assert!(ssl.acme_dns_config.is_empty());
+    }
+
+    #[test]
+    fn issuer_bundle_keeps_acme_credentials() {
+        let mut config = bundle(true);
+        scope_acme_for_agent(&mut config, true);
+        let ssl = config.sites[0]
+            .rules
+            .as_ref()
+            .and_then(|rules| rules.ssl.as_ref())
+            .expect("the test bundle carries TLS material");
+        assert!(ssl.acme_enabled);
+        assert_eq!(ssl.acme_dns_provider, "cf");
+        assert_eq!(
+            ssl.acme_dns_config.get("token"),
+            Some(&"secret".to_string())
+        );
+    }
 }

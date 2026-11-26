@@ -1146,6 +1146,11 @@ export interface Agent {
   site_domain: string | null
   /** `all` = every site owned by the API key; `selected` = `site_ids`. */
   site_scope: 'all' | 'selected'
+  /**
+   * Whether the agent may run ACME issuance and receive DNS provider
+   * credentials. Consumers serve the distributed PEM without seeing the token.
+   */
+  acme_issuer: boolean
   /** Sites assigned to a selected agent; empty for `all`. */
   site_ids: string[]
   /** Domains matching `site_ids`, in order. */

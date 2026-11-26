@@ -426,9 +426,11 @@ impl ControlPlaneService {
     ) -> Result<SiteConfig, Status> {
         let sites = self.visible_sites(row).await?;
         let ids: Vec<Uuid> = sites.iter().map(|site| site.id).collect();
-        build_site_config(&self.db, Some(&ids))
+        let mut config = build_site_config(&self.db, Some(&ids))
             .await
-            .map_err(db_status)
+            .map_err(db_status)?;
+        crate::grpc::scope_acme_for_agent(&mut config, row.acme_issuer);
+        Ok(config)
     }
 }
 
@@ -495,6 +497,14 @@ impl ControlPlaneTrait for ControlPlaneService {
         // unbound agent serves all of the owner's sites; a future manual
         // binding API can narrow the scope explicitly.
         let site_id = None;
+        // The embedded all-in-one issuer reaches the control plane over
+        // loopback; a remote agent starts as a consumer and must be marked
+        // explicitly. The flag is set only on insert: a re-registration must
+        // not undo an operator's choice.
+        let acme_issuer = peer_ip
+            .as_deref()
+            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
 
         let row = match existing {
             Some(row) => {
@@ -533,6 +543,7 @@ impl ControlPlaneTrait for ControlPlaneService {
                     id: Set(agent_id),
                     site_id: Set(site_id),
                     site_scope: Set("all".to_string()),
+                    acme_issuer: Set(acme_issuer),
                     hostname: Set(payload.hostname.clone()),
                     // The label is the operator's: a registering agent never
                     // supplies or clears it.
@@ -1640,9 +1651,11 @@ impl ControlPlaneTrait for ControlPlaneService {
                     "agent is not allowed to read this site",
                 ));
             }
-            build_site_config(&self.db, Some(&[id]))
+            let mut config = build_site_config(&self.db, Some(&[id]))
                 .await
-                .map_err(db_status)?
+                .map_err(db_status)?;
+            crate::grpc::scope_acme_for_agent(&mut config, row.acme_issuer);
+            config
         };
 
         tracing::debug!(

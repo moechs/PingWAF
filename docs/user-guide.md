@@ -600,6 +600,12 @@ the CA validates the order. Other values (`manual`, `digitalocean`, `cloudxns`)
 are not accepted for managed DNS-01; rows written before this check are
 migrated back to HTTP-01.
 
+The control plane imports the issuer's local ACME state only when the entry is
+ACME-managed, matches the certificate row's hostname set, and is currently
+valid: expired, not-yet-valid, older-than-stored, and (unless
+`PINGAP_ACME_STAGING` is set on the control plane) staging-CA certificates are
+rejected with a warning instead of being pushed to agents.
+
 Certificates auto-renew 30 days before expiry.
 
 ### Manual Upload
@@ -1131,6 +1137,29 @@ Agents → [agent] → Manage sites
 The assignment is validated against the API key's owner and takes effect
 immediately for a connected agent; an offline node receives it on reconnect.
 The same setting is available as `PUT /api/v1/agents/{id}/sites`.
+
+### ACME issuer scope
+
+An agent either **issues** certificates or only **serves** them. Only an issuer
+receives the site's `acme_dns_config` (the Cloudflare/Aliyun/Tencent/Huawei
+token) and only an issuer opens ACME orders; a consumer keeps serving the PEM
+the control plane distributes and never sees the DNS credential. Route 53 is
+different: its `acme_dns_config` holds only a hosted-zone ID, and the AWS
+credentials come from the issuer's own runtime.
+
+- The embedded all-in-one issuer is marked automatically (it registers over
+  loopback).
+- A remote agent that should issue must be marked explicitly:
+  `PATCH /api/v1/agents/{id}` with `{"acme_issuer": true}`, or the toggle in
+  **Agents → [agent]**.
+- Mark consumer-only edges `acme_issuer=false` so a compromised edge cannot
+  open orders or read the provider token. The console shows the scope in the
+  agent detail panel.
+
+A control-plane-only deployment with no embedded issuer has no issuer until one
+is marked. Without a certificate publication RPC a remote issuer still cannot
+return its PEM to the control plane, so the supported issuing topology remains
+the all-in-one control plane.
 
 ### Monitoring Agents
 

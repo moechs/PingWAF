@@ -229,6 +229,19 @@ export function AgentsPage() {
     },
   })
 
+  const setAcmeIssuer = useMutation({
+    mutationFn: ({ id, value }: { id: string; value: boolean }) =>
+      agentsApi.update(id, { acme_issuer: value }),
+    onSuccess: (agent) => {
+      toast.success(t('pages.agents.acmeIssuerSaved'), displayName(agent))
+      setDetail((prev) => (prev?.id === agent.id ? agent : prev))
+      invalidate()
+    },
+    onError: (error) => {
+      toast.error(t('pages.agents.acmeIssuerFailed'), errorMessage(error))
+    },
+  })
+
   const remove = useMutation({
     mutationFn: (id: string) => agentsApi.remove(id),
     onSuccess: (_data, id) => {
@@ -839,6 +852,36 @@ export function AgentsPage() {
                       ? detail.site_domains.join(', ')
                       : t('pages.agents.noSites')
                     : t('pages.agents.allSites')
+                }
+              />
+              <DetailRow
+                label={t('pages.agents.acmeIssuer')}
+                title={t('pages.agents.acmeIssuerHint')}
+                value={
+                  <span className="inline-flex items-center gap-2">
+                    <span>
+                      {detail.acme_issuer
+                        ? t('pages.agents.acmeIssuerYes')
+                        : t('pages.agents.acmeIssuerNo')}
+                    </span>
+                    {canWrite && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        loading={setAcmeIssuer.isPending}
+                        onClick={() =>
+                          setAcmeIssuer.mutate({
+                            id: detail.id,
+                            value: !detail.acme_issuer,
+                          })
+                        }
+                      >
+                        {detail.acme_issuer
+                          ? t('pages.agents.acmeIssuerDisable')
+                          : t('pages.agents.acmeIssuerEnable')}
+                      </Button>
+                    )}
+                  </span>
                 }
               />
               <DetailRow label={t('pages.agents.publicIp')} value={detail.public_ip} mono />

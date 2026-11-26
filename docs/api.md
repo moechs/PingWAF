@@ -2023,14 +2023,15 @@ Get agent details. The response carries the same `display_name` /
 
 ### PATCH /agents/{agent_id}
 
-Set or clear the operator-facing display name and/or the tunnel ingress
-address. Requires write access (non-viewer).
+Set or clear the operator-facing display name, the tunnel ingress
+address, and/or the ACME issuer scope. Requires write access (non-viewer).
 
 **Request:**
 ```json
 {
   "display_name": "edge-01 (backup)",
-  "tunnel_ingress_addr": "edge1.example.com:9443"
+  "tunnel_ingress_addr": "edge1.example.com:9443",
+  "acme_issuer": true
 }
 ```
 
@@ -2051,6 +2052,13 @@ Rules:
   are read-only here; the last one explains a configured listener that could
   not bind (for example the port is taken), so the console can tell "not
   configured" apart from "configured but failing".
+- `acme_issuer` (boolean) controls whether this agent may run ACME issuance.
+  Only an issuer receives the site's `acme_dns_config` (the DNS provider
+  token) and only an issuer opens orders; a consumer keeps serving the
+  distributed PEM and never sees the credential. The embedded all-in-one
+  issuer is marked automatically. A remote agent that should issue must be
+  marked here; a change takes effect immediately and is re-pushed to the node.
+  The response carries `acme_issuer` on every agent read.
 - At most `100` characters; control characters are rejected (`display_name
   must be at most 100 characters` / `display_name must not contain control
   characters`).

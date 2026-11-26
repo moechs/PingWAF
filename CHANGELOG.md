@@ -8,6 +8,32 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [Unreleased]
+
+### Added
+
+- **ACME issuer scope per agent.** An agent either issues certificates or only
+  serves them. Only an issuer receives the site's `acme_dns_config` (the
+  Cloudflare/Aliyun/Tencent/Huawei token) and only an issuer opens orders; a
+  consumer keeps serving the distributed PEM and never sees the credential.
+  The embedded all-in-one issuer is marked automatically because it registers
+  over loopback; a remote issuer is marked with
+  `PATCH /api/v1/agents/{id}` (`{"acme_issuer": true}`) or the toggle in the
+  agent detail panel. Migration `000109` adds the column and keeps an existing
+  single-agent deployment issuing. Route 53 is unaffected in the config (its
+  `acme_dns_config` carries only a hosted-zone ID; AWS credentials stay in the
+  issuer's runtime).
+- **ACME state import validation.** The control plane now refuses an entry
+  that is expired, not yet valid, older than the certificate already stored, or
+  issued by an ACME staging CA (unless `PINGAP_ACME_STAGING` is set), instead
+  of marking it active and pushing it to every agent.
+
+### Changed
+
+- A non-issuer agent's bundle no longer carries `acme_dns_config` or
+  `acme_enabled`, so consumer-only edges cannot read the provider token or
+  start a duplicate order.
+
 ## [PingWAF 0.33.2] — 2026-11-26
 
 ### Added
