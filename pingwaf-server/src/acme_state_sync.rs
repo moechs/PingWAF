@@ -225,18 +225,28 @@ async fn sync_certificate(
         warn!(%site_id, domains, "ACME state PEM or key does not match certificate configuration");
         return Ok(false);
     }
+    let Some(meta) = parse_certificate_meta(cert_pem) else {
+        warn!(%site_id, domains, "ACME state PEM cannot be parsed");
+        return Ok(false);
+    };
+    if let Err(reason) = validate_imported_certificate(
+        &meta,
+        row.expires_at,
+        Utc::now(),
+        staging_allowed(),
+    ) {
+        warn!(%site_id, domains, reason, "ACME state certificate rejected");
+        return Ok(false);
+    }
     let mut active: site_certificates::ActiveModel = row.clone().into();
     active.cert_pem = Set(Some(cert_pem.to_string()));
     active.key_pem = Set(Some(key_pem.to_string()));
     active.status = Set(cert_status::ACTIVE.to_string());
     active.failure_reason = Set(None);
     active.updated_at = Set(Utc::now());
-    let meta = parse_certificate_meta(cert_pem);
-    if let Some(meta) = &meta {
-        active.issuer = Set(Some(meta.issuer.clone()));
-        active.not_before = Set(Some(meta.not_before));
-        active.expires_at = Set(Some(meta.expires_at));
-    }
+    active.issuer = Set(Some(meta.issuer.clone()));
+    active.not_before = Set(Some(meta.not_before));
+    active.expires_at = Set(Some(meta.expires_at));
     let certificate_id = row.id;
     active.update(&state.db).await?;
 
@@ -255,10 +265,8 @@ async fn sync_certificate(
             posture.certificate_id = Set(Some(certificate_id));
             posture.cert_pem = Set(None);
             posture.key_pem = Set(None);
-            if let Some(meta) = &meta {
-                posture.issuer = Set(Some(meta.issuer.clone()));
-                posture.expires_at = Set(Some(meta.expires_at));
-            }
+            posture.issuer = Set(Some(meta.issuer.clone()));
+            posture.expires_at = Set(Some(meta.expires_at));
             posture.update(&state.db).await?;
             info!(
                 site_id = %site_id,
@@ -281,6 +289,54 @@ async fn sync_certificate(
 fn site_id_from_key(name: &str) -> Option<Uuid> {
     let site = name.strip_suffix("_cert")?;
     Uuid::parse_str(site).ok()
+}
+
+/// How far a certificate may be from "now" before it is considered
+/// unusable. The issuer and the control plane run on different clocks.
+const IMPORT_CLOCK_LEEWAY_MINUTES: i64 = 5;
+
+/// Whether the deployment explicitly opted into the ACME staging directory.
+fn staging_allowed() -> bool {
+    std::env::var("PINGAP_ACME_STAGING").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "staging" | "stage"
+        )
+    })
+}
+
+/// Let's Encrypt staging intermediates carry a marker in the issuer DN.
+fn is_staging_issuer(issuer: &str) -> bool {
+    let upper = issuer.to_ascii_uppercase();
+    upper.contains("(STAGING)") || upper.contains("FAKE LE")
+}
+
+/// Refuses an ACME state entry that must not become the site's certificate.
+///
+/// The file is written by the issuer, but it can be stale, restored from a
+/// backup, or left behind by a staging run. Importing such material would
+/// mark an unusable certificate active and push it to every consumer.
+fn validate_imported_certificate(
+    meta: &CertificateMeta,
+    current_expires_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    staging_allowed: bool,
+) -> Result<(), &'static str> {
+    if meta.expires_at <= now {
+        return Err("the certificate has already expired");
+    }
+    if meta.not_before
+        > now + chrono::Duration::minutes(IMPORT_CLOCK_LEEWAY_MINUTES)
+    {
+        return Err("the certificate is not valid yet");
+    }
+    if current_expires_at.is_some_and(|current| meta.expires_at < current) {
+        return Err("the certificate is older than the stored one");
+    }
+    if !staging_allowed && is_staging_issuer(&meta.issuer) {
+        return Err("the certificate was issued by an ACME staging CA");
+    }
+    Ok(())
 }
 
 fn parse_certificate_meta(cert_pem: &str) -> Option<CertificateMeta> {
@@ -308,6 +364,75 @@ fn parse_certificate_meta(cert_pem: &str) -> Option<CertificateMeta> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn meta(
+        not_before: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        issuer: &str,
+    ) -> CertificateMeta {
+        CertificateMeta {
+            issuer: issuer.to_string(),
+            not_before,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn rejects_unusable_certificates_before_import() {
+        let now = Utc::now();
+        let day = chrono::Duration::days(1);
+        let valid = meta(
+            now - day,
+            now + chrono::Duration::days(60),
+            "CN=R3, O=Let's Encrypt",
+        );
+        assert!(validate_imported_certificate(&valid, None, now, false).is_ok());
+        // Re-importing the same certificate is idempotent, not "older".
+        assert!(validate_imported_certificate(
+            &valid,
+            Some(valid.expires_at),
+            now,
+            false
+        )
+        .is_ok());
+
+        let expired =
+            meta(now - chrono::Duration::days(60), now - day, "CN=R3");
+        assert_eq!(
+            validate_imported_certificate(&expired, None, now, false),
+            Err("the certificate has already expired")
+        );
+
+        let future = meta(now + day, now + chrono::Duration::days(60), "CN=R3");
+        assert_eq!(
+            validate_imported_certificate(&future, None, now, false),
+            Err("the certificate is not valid yet")
+        );
+
+        let older = meta(now - day, now + chrono::Duration::days(10), "CN=R3");
+        assert_eq!(
+            validate_imported_certificate(
+                &older,
+                Some(now + chrono::Duration::days(30)),
+                now,
+                false
+            ),
+            Err("the certificate is older than the stored one")
+        );
+
+        for issuer in
+            ["CN=(STAGING) Pretend Pear X1", "CN=Fake LE Intermediate X1"]
+        {
+            let staging =
+                meta(now - day, now + chrono::Duration::days(60), issuer);
+            assert_eq!(
+                validate_imported_certificate(&staging, None, now, false),
+                Err("the certificate was issued by an ACME staging CA")
+            );
+            assert!(validate_imported_certificate(&staging, None, now, true)
+                .is_ok());
+        }
+    }
 
     #[test]
     fn parses_issued_certificate_metadata() {
