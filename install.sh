@@ -329,7 +329,8 @@ Examples:
     --admin-email ops@example.com --tls-sans waf.example.com
 
 After installation:
-  Config: /etc/pingwaf/pingwaf.toml   (edit it, then: systemctl restart ${SERVICE_NAME})
+  Config: /etc/pingwaf/pingwaf.toml   (edit it, then restart the unit:
+          systemctl restart pingwaf — or pingwaf-agent on an agent install)
   Data:   /var/lib/pingwaf
 EOF
 }
