@@ -4,6 +4,20 @@ use serde_json::{json, Value};
 
 use super::AlertEvent;
 
+/// Message reported for any unusable `chat_id`, whatever the shape was.
+const INVALID_CHAT_ID: &str =
+    "config.chat_id must be a numeric chat ID or @channel username";
+
+/// Longest slice of a Bot API description echoed back to the operator. The
+/// real text ("Bad Request: chat not found") is short; the cap keeps a
+/// tampered response from flooding the log or the console.
+const MAX_ERROR_DETAIL: usize = 200;
+
+/// Largest failed response body read back. A Bot API answer is a small JSON
+/// object; anything bigger is not worth parsing, and reading it would let a
+/// hijacked host decide how much memory the control plane spends.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024;
+
 fn token(config: &Value) -> Result<&str, String> {
     let value = config
         .get("bot_token")
@@ -27,7 +41,21 @@ fn token(config: &Value) -> Result<&str, String> {
     Ok(value)
 }
 
-fn chat_id(config: &Value) -> Result<&str, String> {
+/// The chat to post into, normalised to the string form the Bot API accepts.
+///
+/// A `@channel` username, a numeric string, and a bare JSON number are all
+/// valid: configuration written by a script (Ansible, a restored backup, the
+/// REST API directly) may well carry the number unquoted, and rejecting that
+/// would deny the very shape Telegram itself documents.
+fn chat_id(config: &Value) -> Result<String, String> {
+    if let Some(id) = config.get("chat_id").and_then(Value::as_i64) {
+        return if id == 0 {
+            Err(INVALID_CHAT_ID.to_string())
+        } else {
+            Ok(id.to_string())
+        };
+    }
+
     let value = config
         .get("chat_id")
         .and_then(Value::as_str)
@@ -41,13 +69,10 @@ fn chat_id(config: &Value) -> Result<&str, String> {
         });
 
     if !valid {
-        return Err(
-            "config.chat_id must be a numeric chat ID or @channel username"
-                .into(),
-        );
+        return Err(INVALID_CHAT_ID.to_string());
     }
 
-    Ok(value)
+    Ok(value.to_string())
 }
 
 fn thread_id(config: &Value) -> Result<Option<i32>, String> {
@@ -128,6 +153,79 @@ fn payload(config: &Value, event: &AlertEvent) -> Result<Value, String> {
     Ok(body)
 }
 
+/// Flattens a Bot API `description` into text safe to log or show: no control
+/// characters, no echo of the bot token, and a bounded length.
+fn sanitise_detail(raw: &str, token: &str) -> String {
+    let flat: String = raw
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(MAX_ERROR_DETAIL * 2)
+        .collect();
+    let redacted = if token.is_empty() {
+        flat
+    } else {
+        flat.replace(token, "<redacted>")
+    };
+    redacted
+        .chars()
+        .take(MAX_ERROR_DETAIL)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Turns a Bot API response into the outcome reported to the operator.
+///
+/// Telegram puts the reason for a refusal in `description` ("chat not found",
+/// "message thread not found", "bot was blocked by the user"), which is the
+/// difference between an operator fixing the channel and guessing. The text is
+/// Telegram's own, not attacker-controlled content fetched from a configured
+/// URL, and it is capped and token-scrubbed before it leaves this function.
+fn interpret(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    token: &str,
+) -> Result<(), String> {
+    let parsed: Option<Value> = serde_json::from_slice(body).ok();
+    let detail = parsed
+        .as_ref()
+        .and_then(|value| value.get("description"))
+        .and_then(Value::as_str)
+        .map(|raw| sanitise_detail(raw, token));
+
+    if status.as_u16() == 429 {
+        return Err(match detail {
+            Some(detail) => {
+                format!("Telegram rate limit exceeded (HTTP 429): {detail}")
+            },
+            None => "Telegram rate limit exceeded (HTTP 429)".to_string(),
+        });
+    }
+
+    if !status.is_success() {
+        return Err(match detail {
+            Some(detail) => {
+                format!("Telegram returned HTTP {status}: {detail}")
+            },
+            None => format!("Telegram returned HTTP {status}"),
+        });
+    }
+
+    match (
+        parsed
+            .as_ref()
+            .and_then(|value| value.get("ok"))
+            .and_then(Value::as_bool),
+        detail,
+    ) {
+        (Some(true), _) => Ok(()),
+        (_, Some(detail)) => {
+            Err(format!("Telegram rejected the notification: {detail}"))
+        },
+        (_, None) => Err("Invalid Telegram API response".to_string()),
+    }
+}
+
 pub async fn send(
     http: &reqwest::Client,
     config: &Value,
@@ -136,8 +234,8 @@ pub async fn send(
     let token = token(config)?;
     let body = payload(config, event)?;
 
-    // Keep the destination fixed. Never expose the request URL,
-    // raw transport error or response body: the URL contains the token.
+    // Keep the destination fixed. Never expose the request URL or the raw
+    // transport error: the URL contains the token.
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");
 
     let response = http
@@ -148,25 +246,18 @@ pub async fn send(
         .map_err(|_| "Telegram request failed".to_string())?;
 
     let status = response.status();
+    // The refusal reason lives in the body, but the body is not ours to trust
+    // with unbounded memory: skip anything claiming more than a Bot API reply.
+    let oversized = response
+        .content_length()
+        .is_some_and(|length| length as usize > MAX_RESPONSE_BYTES);
+    let body = if oversized {
+        Vec::new()
+    } else {
+        response.bytes().await.unwrap_or_default().to_vec()
+    };
 
-    if status.as_u16() == 429 {
-        return Err("Telegram rate limit exceeded (HTTP 429)".into());
-    }
-
-    if !status.is_success() {
-        return Err(format!("Telegram returned HTTP {status}"));
-    }
-
-    let result: Value = response
-        .json()
-        .await
-        .map_err(|_| "Invalid Telegram API response".to_string())?;
-
-    if result.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err("Telegram rejected the notification".into());
-    }
-
-    Ok(())
+    interpret(status, &body, token)
 }
 
 #[cfg(test)]
@@ -277,5 +368,106 @@ mod tests {
 
         assert!(text.encode_utf16().count() <= 4096);
         assert!(text.contains("Severity: warning"));
+    }
+
+    #[test]
+    fn numeric_chat_id_is_accepted_and_normalised() {
+        let mut cfg = config();
+        cfg["chat_id"] = json!(-1001234567890i64);
+
+        assert!(validate_config(&cfg).is_ok());
+        let body = payload(&cfg, &event()).unwrap();
+        assert_eq!(body["chat_id"], json!("-1001234567890"));
+    }
+
+    #[test]
+    fn non_integer_chat_id_shapes_are_rejected() {
+        for value in [json!(0), json!(1.5), json!(true), json!(["1"])] {
+            let mut cfg = config();
+            cfg["chat_id"] = value.clone();
+            assert!(
+                validate_config(&cfg).is_err(),
+                "chat_id {value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_response_is_ok() {
+        assert!(interpret(
+            reqwest::StatusCode::OK,
+            br#"{"ok":true,"result":{}}"#,
+            "123:abc_DEF-1"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn refusal_reason_reaches_the_caller() {
+        let err = interpret(
+            reqwest::StatusCode::BAD_REQUEST,
+            br#"{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}"#,
+            "123:abc_DEF-1",
+        )
+        .unwrap_err();
+
+        assert!(err.contains("chat not found"), "unexpected error: {err}");
+        assert!(err.contains("400"));
+    }
+
+    #[test]
+    fn refusal_reason_never_echoes_the_token() {
+        let token = "123:abc_DEF-1";
+        let body = format!(
+            r#"{{"ok":false,"error_code":401,"description":"Unauthorized {token}"}}"#
+        );
+        let err = interpret(
+            reqwest::StatusCode::UNAUTHORIZED,
+            body.as_bytes(),
+            token,
+        )
+        .unwrap_err();
+
+        assert!(!err.contains(token), "token leaked: {err}");
+        assert!(err.contains("<redacted>"));
+    }
+
+    #[test]
+    fn rate_limit_is_reported_separately() {
+        let err = interpret(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            br#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 5"}"#,
+            "123:abc_DEF-1",
+        )
+        .unwrap_err();
+
+        assert!(err.contains("rate limit"));
+        assert!(err.contains("retry after 5"));
+    }
+
+    #[test]
+    fn non_json_success_body_is_reported_as_invalid() {
+        let err = interpret(
+            reqwest::StatusCode::OK,
+            b"<html>gateway</html>",
+            "123:abc_DEF-1",
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "Invalid Telegram API response");
+    }
+
+    #[test]
+    fn error_detail_is_capped_and_flattened() {
+        let raw = format!("Bad\u{7}Request: {}", "x".repeat(5000));
+        let err = interpret(
+            reqwest::StatusCode::BAD_REQUEST,
+            format!(r#"{{"ok":false,"description":"{raw}"}}"#).as_bytes(),
+            "",
+        )
+        .unwrap_err();
+
+        assert!(!err.contains('\u{7}'), "control character kept");
+        assert!(err.chars().count() <= MAX_ERROR_DETAIL + 40);
     }
 }
