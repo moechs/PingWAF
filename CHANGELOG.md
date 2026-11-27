@@ -1,5 +1,17 @@
 ## [Unreleased]
 
+# Changelog
+
+This file is the change log of **PingWAF** — the distributed, centrally managed
+Web Application Firewall built on top of [pingap](https://github.com/vicanso/pingap)
+and Cloudflare's [Pingora](https://github.com/cloudflare/pingora).
+
+PingWAF entries are listed first. The `pingap` history below the divider is
+inherited from the upstream proxy that provides PingWAF's data plane; it is kept
+verbatim for reference and attribution, and is not maintained here.
+
+## [PingWAF 0.33.5] — 2026-11-28
+
 ### Added
 
 - **`version` and `upgrade` on the command line.** Both binaries now answer
@@ -24,16 +36,6 @@
   `pingwaf-agent.service` (still reading `/etc/pingwaf/pingwaf.toml`), and an
   upgrade retires a legacy `pingwaf.service` agent unit so the two cannot fight
   over the ports. `server`/`all-in-one` keep `pingwaf`.
-
-# Changelog
-
-This file is the change log of **PingWAF** — the distributed, centrally managed
-Web Application Firewall built on top of [pingap](https://github.com/vicanso/pingap)
-and Cloudflare's [Pingora](https://github.com/cloudflare/pingora).
-
-PingWAF entries are listed first. The `pingap` history below the divider is
-inherited from the upstream proxy that provides PingWAF's data plane; it is kept
-verbatim for reference and attribution, and is not maintained here.
 
 ## [PingWAF 0.33.4] — 2026-11-27
 

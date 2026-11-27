@@ -4887,7 +4887,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pingap-acme"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4923,7 +4923,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-cache"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "ahash",
  "async-trait",
@@ -4956,7 +4956,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-certificate"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -4982,7 +4982,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-config"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -5017,7 +5017,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-core"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "TinyUFO",
  "ahash",
@@ -5046,7 +5046,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-discovery"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "async-trait",
  "bollard",
@@ -5065,7 +5065,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-health"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5087,7 +5087,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-imageoptim"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "async-trait",
  "bytemuck",
@@ -5115,7 +5115,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-location"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -5136,7 +5136,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-logger"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5169,7 +5169,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-otel"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -5186,7 +5186,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-performance"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -5216,7 +5216,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-plugin"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "TinyUFO",
  "ahash",
@@ -5281,7 +5281,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-proxy"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "ahash",
  "async-trait",
@@ -5317,7 +5317,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-pyroscope"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "async-trait",
  "pingora",
@@ -5330,14 +5330,14 @@ dependencies = [
 
 [[package]]
 name = "pingap-sentry"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "sentry-core",
 ]
 
 [[package]]
 name = "pingap-upstream"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -5368,7 +5368,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-util"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "aes-gcm-siv",
  "ahash",
@@ -5390,7 +5390,7 @@ dependencies = [
 
 [[package]]
 name = "pingap-webhook"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "async-trait",
  "local-ip-address",
@@ -5696,7 +5696,7 @@ dependencies = [
 
 [[package]]
 name = "pingwaf"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "ahash",
  "anyhow",
@@ -5771,7 +5771,7 @@ dependencies = [
 
 [[package]]
 name = "pingwaf-agent"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5803,7 +5803,7 @@ dependencies = [
 
 [[package]]
 name = "pingwaf-challenge"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -5820,7 +5820,7 @@ dependencies = [
 
 [[package]]
 name = "pingwaf-profiler"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -5829,7 +5829,7 @@ dependencies = [
 
 [[package]]
 name = "pingwaf-proto"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "prost",
  "prost-types",
@@ -5840,7 +5840,7 @@ dependencies = [
 
 [[package]]
 name = "pingwaf-server"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5901,7 +5901,7 @@ dependencies = [
 
 [[package]]
 name = "pingwaf-system"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "bytesize",
  "memory-stats",
@@ -5913,7 +5913,7 @@ dependencies = [
 
 [[package]]
 name = "pingwaf-tunnel"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5946,7 +5946,7 @@ dependencies = [
 
 [[package]]
 name = "pingwaf-waf"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "ahash",
  "aho-corasick",
