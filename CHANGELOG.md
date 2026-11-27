@@ -8,6 +8,50 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
+## [PingWAF 0.33.4] — 2026-11-27
+
+### Added
+
+- **Telegram notification channel.** Alerts can now be delivered to a Telegram
+  bot (`kind = "telegram"`), to a private chat, a group, a supergroup, a channel
+  or a forum topic. The channel takes `config.bot_token` (issued by `@BotFather`,
+  shaped `<numeric bot id>:<secret>`), `config.chat_id` (a numeric id, quoted or
+  not, or `@channelusername`) and an optional `config.message_thread_id` for
+  forum topics. The destination is fixed to `api.telegram.org`: there is no
+  configurable URL, so this channel adds no SSRF surface. Messages are plain
+  text — `parse_mode` is never set, so `<`, `*` and `_` in an alert body are not
+  interpreted as markup — carry a severity indicator and a UTC timestamp, are
+  truncated at Telegram's 4096 UTF-16-unit limit, and leave link previews off.
+  `bot_token` is sealed at rest with `PINGWAF_SECRET_KEY` and masked in API
+  responses exactly like `smtp_pass`, `secret` and `secret_token`; the dashboard
+  form asks for it as a password field in all three languages. Note that any
+  existing channel whose config already carries a field named `bot_token` is now
+  treated as a secret on read and on write, even for the other kinds.
+- **A failed delivery says why.** Telegram returns the reason in its response
+  body (`chat not found`, `message thread not found`, `bot was blocked by the
+  user`, …), and the test button now surfaces it instead of collapsing every
+  refusal into `HTTP 400 Bad Request`. The text is capped at 200 characters, has
+  control characters stripped and any appearance of the bot token redacted, so
+  it is safe in the console and in the log. HTTP 429 is reported as a rate limit
+  and is deliberately not retried in this release.
+
+### Changed
+
+- **Dashboard dependencies.** Fifteen npm packages moved to their latest minor or
+  patch release (`react-router-dom`, `recharts`, `vite`, `vitest`, the Tailwind
+  Vite plugin, `eslint`, `@tanstack/react-query`, `zustand` and others). No major
+  bump, no schema change and no API change; the dashboard build and the frontend
+  test suite are unchanged in shape.
+
+### Fixed
+
+- **"Send test message" no longer sends the sealed secret.** With
+  `PINGWAF_SECRET_KEY` set, the test path read the channel row straight from the
+  database and handed the delivery code the `enc:v1:…` ciphertext as the SMTP
+  password, the DingTalk signing key or the webhook secret, so a working channel
+  reported a failure. The test path now opens the stored config before
+  delivering, the same way the periodic reload does.
+
 ## [PingWAF 0.33.3] — 2026-11-26
 
 ### Added
