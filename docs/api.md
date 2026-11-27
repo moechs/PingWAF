@@ -3832,8 +3832,12 @@ rest when `PINGWAF_SECRET_KEY` is set.
 ```
 
 `kind` is one of `email`, `wecom`, `dingtalk`, `webhook` (the generic one
-POSTs the full event payload as JSON). `events` lists the subscribed event
-types — an empty list subscribes to all of
+POSTs the full event payload as JSON) or `telegram`. Telegram messages are
+plain text (no `parse_mode`, so `<`, `*` and `_` in an alert body are not
+interpreted as markup), go to the fixed `api.telegram.org` endpoint — there
+is no configurable URL — and are truncated at Telegram's 4096 UTF-16-unit
+limit; HTTP 429 is reported as a rate limit and is not retried.
+`events` lists the subscribed event types — an empty list subscribes to all of
 `agent.offline`, `agent.online`, `agent.resource`,
 `control_plane.resource`, `cert.renewal_failed`, `cert.expiring`,
 `cert.expired`, `config.sync_failed`, `site.failover_changed`,
@@ -3848,11 +3852,16 @@ save time — a broken channel is refused with `400` instead of failing at the
 first alert: `email` requires `smtp_host`, `from` and a non-empty `to` list
 (optional `smtp_port` default 465, `smtp_user`, `smtp_pass`, `tls`: `ssl`
 default / `starttls` / `none`); `wecom`, `dingtalk` and `webhook` require a
-non-empty `config.url`. An unknown `kind` or an unknown event type answers
+non-empty `config.url`; `telegram` requires `config.bot_token` (ASCII
+letters, digits, `_` and `-`, shaped like `<numeric bot id>:<secret>`) and
+`config.chat_id` (a numeric chat ID such as `-1001234567890` or an
+`@channelusername`; `0` and non-integers are refused), with an optional
+`config.message_thread_id` (positive integer, for forum topics). An unknown
+`kind` or an unknown event type answers
 `400 bad_request` naming the accepted values.
 
-Secret keys (`smtp_pass`, `secret`, `secret_token`) never come back in plain
-text: responses carry `__REDACTED__` in their place.
+Secret keys (`smtp_pass`, `secret`, `secret_token`, `bot_token`) never come
+back in plain text: responses carry `__REDACTED__` in their place.
 
 ### GET /notifications/channels/{channel_id}
 
