@@ -1,3 +1,30 @@
+## [Unreleased]
+
+### Added
+
+- **`version` and `upgrade` on the command line.** Both binaries now answer
+  `version` (version, build commit, TLS backend, target, and with `--check` the
+  newest published release) and `upgrade` (`--check`, `--version <tag>`,
+  `--force`, `--no-restart`, `--service`, `--binary`, `--repo`). The agent had
+  no way to ask for either; its only update path was the opt-in
+  `agent.auto_upgrade`, which follows the control plane's *full* build.
+  `upgrade` follows GitHub releases instead and installs the agent-only
+  artifact: it verifies the release's `.sha256` sidecar before extracting, asks
+  the extracted binary for its version before replacing anything, keeps the
+  current file as `<binary>.prev`, stages the new file next to the target (an
+  interrupted upgrade leaves the old binary in place) and restarts the systemd
+  unit unless told not to.
+
+### Changed
+
+- **The agent-only build installs as `pingwaf-agent`.** `install.sh --mode
+  agent` used to install the data-plane archive as `/usr/local/bin/pingwaf`,
+  which left an edge node carrying a binary that looked like the console
+  server. It now installs `/usr/local/bin/pingwaf-agent` with its own
+  `pingwaf-agent.service` (still reading `/etc/pingwaf/pingwaf.toml`), and an
+  upgrade retires a legacy `pingwaf.service` agent unit so the two cannot fight
+  over the ports. `server`/`all-in-one` keep `pingwaf`.
+
 # Changelog
 
 This file is the change log of **PingWAF** — the distributed, centrally managed

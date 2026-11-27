@@ -13,7 +13,9 @@
 #   --mode            Operating mode: all-in-one, server, agent, tunnel
 #                     (default: all-in-one). Agent mode installs the agent-only
 #                     build (no control plane or dashboard) as
-#                     /usr/local/bin/pingwaf; tunnel mode installs the tunnel
+#                     /usr/local/bin/pingwaf; agent mode installs the data-plane
+#                     build as /usr/local/bin/pingwaf-agent (unit
+#                     pingwaf-agent.service); tunnel mode installs the tunnel
 #                     connector as /usr/local/bin/pingwaf-tunnel
 #   --server-url      Control plane gRPC URL (agent mode)
 #   --api-key         Agent enrollment token (agent mode)
@@ -256,8 +258,10 @@ Options:
   --mode MODE              Operating mode: all-in-one, server, agent, tunnel.
                            Agent mode downloads the agent-only build
                            (pingwaf-agent) and installs it as
-                           /usr/local/bin/pingwaf. Tunnel mode installs the
-                           tunnel connector as /usr/local/bin/pingwaf-tunnel
+                           /usr/local/bin/pingwaf. Agent mode installs the
+                           data-plane build as /usr/local/bin/pingwaf-agent.
+                           Tunnel mode installs the tunnel connector as
+                           /usr/local/bin/pingwaf-tunnel
                            and pairs it with --token.
   --server-url URL         Control plane gRPC URL (agent mode)
   --server-ca-cert PATH    PEM file with the CA that signed the control plane's
@@ -325,7 +329,7 @@ Examples:
     --admin-email ops@example.com --tls-sans waf.example.com
 
 After installation:
-  Config: /etc/pingwaf/pingwaf.toml   (edit it, then: systemctl restart pingwaf)
+  Config: /etc/pingwaf/pingwaf.toml   (edit it, then: systemctl restart ${SERVICE_NAME})
   Data:   /var/lib/pingwaf
 EOF
 }
@@ -710,6 +714,7 @@ print_plan_summary() {
         fi
         echo "  service:     ${SERVICE_NAME}"
     elif [[ "${MODE:-all-in-one}" == "agent" ]]; then
+        echo "  service:     ${SERVICE_NAME}"
         echo "  control:     ${SERVER_URL}"
         if [[ -n "$SERVER_CA_CERT" ]]; then
             echo "  control CA:  ${SERVER_CA_CERT} -> ${CONFIG_DIR}/grpc-ca.pem"
@@ -823,8 +828,16 @@ if [[ "$MODE" == "tunnel" ]]; then
     SERVICE_NAME="pingwaf-tunnel"
 fi
 
-# Agent mode installs the data-plane-only build; the binary keeps the name
-# `pingwaf` on disk so the unit and upgrade path do not change.
+# Agent mode installs the data-plane-only build under its own name: the archive
+# already carries `pingwaf-agent`, the release names it that way, and an edge
+# node that only runs the data plane should not have a `pingwaf` binary that
+# looks like it could serve the console. `--mode agent` therefore installs
+# /usr/local/bin/pingwaf-agent and pingwaf-agent.service; server/all-in-one keep
+# `pingwaf`.
+if [[ "$MODE" == "agent" ]]; then
+    BINARY_NAME="pingwaf-agent"
+    SERVICE_NAME="pingwaf-agent"
+fi
 ASSET_PREFIX="$(asset_prefix "$MODE")"
 ARCHIVE_BINARY="$ASSET_PREFIX"
 
@@ -1588,6 +1601,24 @@ install_systemd() {
     if ! has systemctl; then
         warn "systemctl not found — skipping service installation."
         return
+    fi
+
+    # Agent installs used to live in pingwaf.service next to /usr/local/bin/
+    # pingwaf. Both units would now bind the same ports and fight over the
+    # config file, so retire the old one before writing the new one. Only an
+    # agent unit is touched: a server/all-in-one install keeps pingwaf.service.
+    if [[ "$MODE" == "agent" ]]; then
+        local legacy_unit="/etc/systemd/system/pingwaf.service"
+        if [[ -f "$legacy_unit" ]] && grep -qE '^ExecStart=.*/pingwaf agent( |$)' "$legacy_unit"; then
+            info "Retiring the legacy agent unit pingwaf.service (now ${SERVICE_NAME}.service)..."
+            local cmd=""
+            [[ -w "/etc/systemd/system" ]] || cmd="sudo"
+            $cmd systemctl stop pingwaf >/dev/null 2>&1 || true
+            $cmd systemctl disable pingwaf >/dev/null 2>&1 || true
+            $cmd rm -f "$legacy_unit"
+            $cmd systemctl daemon-reload >/dev/null 2>&1 || true
+            success "Removed pingwaf.service; the agent now runs as ${SERVICE_NAME}.service."
+        fi
     fi
 
     local service_file="/etc/systemd/system/${SERVICE_NAME}.service"

@@ -326,7 +326,9 @@ fn is_maintenance_command(command: &PingWafCommand) -> bool {
         PingWafCommand::User { .. }
         | PingWafCommand::Mode { .. }
         | PingWafCommand::Security { .. }
-        | PingWafCommand::Config { .. } => true,
+        | PingWafCommand::Config { .. }
+        | PingWafCommand::Version { .. }
+        | PingWafCommand::Upgrade(_) => true,
     }
 }
 
@@ -352,7 +354,9 @@ pub fn build_run_mode(cli: PingWafCli) -> RunMode {
         PingWafCommand::User { .. }
         | PingWafCommand::Mode { .. }
         | PingWafCommand::Security { .. }
-        | PingWafCommand::Config { .. } => {
+        | PingWafCommand::Config { .. }
+        | PingWafCommand::Version { .. }
+        | PingWafCommand::Upgrade(_) => {
             unreachable!("maintenance commands do not build a run mode")
         },
     }
