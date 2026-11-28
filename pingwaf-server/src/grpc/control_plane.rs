@@ -9,15 +9,17 @@ use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use pingwaf_proto::control_plane::{
     control_plane_server::ControlPlane as ControlPlaneTrait, AgentHeartbeat,
     BlockedIp, CertEventAck, CertEventEntry, GetSiteConfigRequest, HostSample,
-    LogAck, LogEntry, Metric, MetricAck, MetricBatch, RegisterAgentRequest,
-    RegisterAgentResponse, RuleBundle, ServerCommand, SiteConfig, SiteStatus,
-    SyncRulesRequest, UpstreamHealth, VisitorChallengeRequest,
+    LogAck, LogEntry, Metric, MetricAck, MetricBatch, PairTunnelRequest,
+    PairTunnelResponse, PublishCertificateRequest, PublishCertificateResponse,
+    RegisterAgentRequest, RegisterAgentResponse, RuleBundle, ServerCommand,
+    SiteConfig, SiteStatus, SyncRulesRequest, TunnelConnectorCommand,
+    TunnelConnectorMessage, UpstreamHealth, VisitorChallengeRequest,
     VisitorChallengeResponse, VisitorChangePasswordRequest,
     VisitorChangePasswordResponse, VisitorGrantsRequest, VisitorGrantsResponse,
     VisitorLoginRequest, VisitorLoginResponse, VisitorLogoutRequest,
@@ -30,7 +32,7 @@ use pingwaf_proto::control_plane::{
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait,
-    QueryFilter, QuerySelect, Set, UpdateMany,
+    QueryFilter, QuerySelect, Set, TransactionTrait, UpdateMany,
 };
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
@@ -59,7 +61,8 @@ use crate::models::{
     access_log, action, agent, agent_blocked_ip, agent_metric, agent_sites,
     agent_status, api_key, certificate_events, certificate_links, geo_rules,
     host_sample, ip_access_rules, path_exceptions, security_event, site,
-    site_basic_auth, site_certificates, site_oidc,
+    site_basic_auth, site_certificates, site_oidc, tunnel_connector,
+    tunnel_session, tunnel_status,
 };
 
 /// Stream type returned by the server-streaming RPCs.
@@ -424,9 +427,11 @@ impl ControlPlaneService {
     ) -> Result<SiteConfig, Status> {
         let sites = self.visible_sites(row).await?;
         let ids: Vec<Uuid> = sites.iter().map(|site| site.id).collect();
-        build_site_config(&self.db, Some(&ids))
+        let mut config = build_site_config(&self.db, Some(&ids))
             .await
-            .map_err(db_status)
+            .map_err(db_status)?;
+        crate::grpc::scope_acme_for_agent(&mut config, row.id, row.acme_issuer);
+        Ok(config)
     }
 }
 
@@ -493,6 +498,14 @@ impl ControlPlaneTrait for ControlPlaneService {
         // unbound agent serves all of the owner's sites; a future manual
         // binding API can narrow the scope explicitly.
         let site_id = None;
+        // The embedded all-in-one issuer reaches the control plane over
+        // loopback; a remote agent starts as a consumer and must be marked
+        // explicitly. The flag is set only on insert: a re-registration must
+        // not undo an operator's choice.
+        let acme_issuer = peer_ip
+            .as_deref()
+            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
 
         let row = match existing {
             Some(row) => {
@@ -531,6 +544,7 @@ impl ControlPlaneTrait for ControlPlaneService {
                     id: Set(agent_id),
                     site_id: Set(site_id),
                     site_scope: Set("all".to_string()),
+                    acme_issuer: Set(acme_issuer),
                     hostname: Set(payload.hostname.clone()),
                     // The label is the operator's: a registering agent never
                     // supplies or clears it.
@@ -555,6 +569,13 @@ impl ControlPlaneTrait for ControlPlaneService {
                     private_ip: Set(optional(&payload.private_ip)),
                     peer_ip: Set(peer_ip.clone()),
                     peer_ip_seen_at: Set(peer_ip.as_ref().map(|_| now)),
+                    // Filled in by the first heartbeat that carries the
+                    // tunnel listener state; the ingress address is the
+                    // operator's and starts unset.
+                    tunnel_ingress_addr: Set(None),
+                    tunnel_listener_addr: Set(None),
+                    tunnel_cert_sha256: Set(None),
+                    tunnel_listener_error: Set(None),
                 }
                 .insert(&self.db)
                 .await
@@ -670,6 +691,7 @@ impl ControlPlaneTrait for ControlPlaneService {
             )
             .await;
             record_upstream_health(&db, agent_id, &first.upstream_health).await;
+            persist_tunnel_state(&db, agent_id, &first).await;
             while let Some(mut message) = match inbound.message().await {
                 Ok(Some(message)) => Some(message),
                 Ok(None) => None,
@@ -702,6 +724,7 @@ impl ControlPlaneTrait for ControlPlaneService {
                 .await;
                 record_upstream_health(&db, agent_id, &message.upstream_health)
                     .await;
+                persist_tunnel_state(&db, agent_id, &message).await;
             }
             mark_offline(&db, agent_id).await;
             registry.disconnect(&agent_id, generation).await;
@@ -713,6 +736,290 @@ impl ControlPlaneTrait for ControlPlaneService {
             Box::pin(ReceiverStream::new(receiver).map(Ok))
                 as Self::HeartbeatStream,
         ))
+    }
+
+    type TunnelControlStream = BoxedStream<TunnelConnectorCommand>;
+
+    async fn pair_tunnel(
+        &self,
+        request: Request<PairTunnelRequest>,
+    ) -> Result<Response<PairTunnelResponse>, Status> {
+        // Unauthenticated by design — the one-time token is the credential —
+        // so the peer is rate limited exactly like agent registration.
+        if let Some(addr) = request.remote_addr() {
+            if let Err(retry_after) =
+                crate::api::rate_limit::consume_agent_registration(addr.ip())
+            {
+                return Err(Status::resource_exhausted(format!(
+                    "too many pairing attempts; retry in {retry_after} seconds"
+                )));
+            }
+        }
+        let payload = request.into_inner();
+        let token = payload.pairing_token.trim();
+        if token.is_empty() {
+            return Err(Status::invalid_argument("pairing_token is required"));
+        }
+        let settings = crate::tunnel_policy::load_settings(&self.db)
+            .await
+            .map_err(db_status)?;
+        if !settings.enabled {
+            return Err(Status::failed_precondition(
+                "tunnel connectors are disabled on this deployment",
+            ));
+        }
+        let hash = crate::tunnel_policy::digest_hex(token);
+        let row = tunnel_connector::Entity::find()
+            .filter(tunnel_connector::Column::PairingTokenHash.eq(hash))
+            .one(&self.db)
+            .await
+            .map_err(db_status)?;
+        let Some(row) = row else {
+            // Same reply whether the token never existed or was already
+            // redeemed: a prober learns nothing either way.
+            return Err(Status::unauthenticated(INVALID_CREDENTIALS));
+        };
+        let now = Utc::now();
+        if row
+            .pairing_token_expires_at
+            .map(|expires| expires <= now)
+            .unwrap_or(true)
+        {
+            return Err(Status::unauthenticated(
+                "the pairing token has expired; mint a new one in the console",
+            ));
+        }
+        if row.status == tunnel_status::DISABLED {
+            return Err(Status::permission_denied("this tunnel is disabled"));
+        }
+
+        let credential = crate::tunnel_policy::generate_secret();
+        let tunnel_id = row.id;
+        let name = row.name.clone();
+        let mut active: tunnel_connector::ActiveModel = row.into();
+        active.credential_sha256 =
+            Set(Some(crate::tunnel_policy::digest_hex(&credential)));
+        active.credential_issued_at = Set(Some(now));
+        active.pairing_token_hash = Set(None);
+        active.pairing_token_expires_at = Set(None);
+        active.status = Set(tunnel_status::ACTIVE.to_string());
+        active.version = Set(optional(&payload.version));
+        active.hostname = Set(optional(&payload.hostname));
+        active.os_info = Set(optional(&payload.os_info));
+        active.last_seen_at = Set(Some(now));
+        active.updated_at = Set(now);
+        active.update(&self.db).await.map_err(db_status)?;
+
+        tracing::info!(
+            %tunnel_id,
+            hostname = %payload.hostname,
+            version = %payload.version,
+            "tunnel connector paired"
+        );
+
+        // A connector that is already running still holds a control stream
+        // opened with the previous credential (or with none). It must be told
+        // to go: otherwise the console shows it online while the edges — which
+        // are about to receive the new digest — refuse its data plane.
+        crate::grpc::notify_tunnel_connectors(
+            &self.db,
+            tunnel_id,
+            Some(
+                "the tunnel was paired again; run the new pairing command"
+                    .to_string(),
+            ),
+        )
+        .await;
+        // The new credential digest has to reach the edges now: until they
+        // hold it, the connector's session is refused.
+        crate::grpc::push_config_to_all(&self.db, &self.agents).await;
+
+        let ingress = crate::tunnel_policy::ingress_endpoints(&self.db)
+            .await
+            .map_err(db_status)?;
+        let targets =
+            crate::tunnel_policy::targets_for_tunnel(&self.db, tunnel_id)
+                .await
+                .map_err(db_status)?;
+        // A token is minted with the pairing so the connector can open edge
+        // sessions immediately; the control stream refreshes it from then on.
+        let (session_token, session_token_expires_at) =
+            crate::tunnel_token::mint(
+                &tunnel_id.to_string(),
+                settings.session_token_ttl_seconds.max(60) as u64,
+            )
+            .map_err(|err| {
+                tracing::error!(%tunnel_id, error = %err, "cannot mint a tunnel session token");
+                Status::internal(INTERNAL_MESSAGE)
+            })?;
+        Ok(Response::new(PairTunnelResponse {
+            tunnel_id: tunnel_id.to_string(),
+            name,
+            credential,
+            ingress,
+            targets,
+            settings: Some(pingwaf_proto::control_plane::TunnelSettings {
+                max_streams: settings.max_streams_per_session.max(1) as u32,
+                idle_timeout_secs: settings.idle_timeout_seconds.max(10) as u32,
+                heartbeat_secs: settings.heartbeat_seconds.max(5) as u32,
+                session_token_ttl_secs: settings
+                    .session_token_ttl_seconds
+                    .max(60) as u32,
+            }),
+            session_token,
+            session_token_expires_at,
+        }))
+    }
+
+    async fn tunnel_control(
+        &self,
+        request: Request<Streaming<TunnelConnectorMessage>>,
+    ) -> Result<Response<Self::TunnelControlStream>, Status> {
+        use pingwaf_proto::control_plane::tunnel_connector_message;
+
+        let mut inbound = request.into_inner();
+        let first = inbound.next().await.ok_or_else(|| {
+            Status::invalid_argument("the connector sent no hello")
+        })??;
+        let Some(tunnel_connector_message::Kind::Hello(hello)) = first.kind
+        else {
+            return Err(Status::invalid_argument(
+                "the first tunnel message must be a hello",
+            ));
+        };
+        let tunnel_id = Uuid::parse_str(hello.tunnel_id.trim())
+            .map_err(|_| Status::invalid_argument("tunnel_id is not a UUID"))?;
+        let row = tunnel_connector::Entity::find_by_id(tunnel_id)
+            .one(&self.db)
+            .await
+            .map_err(db_status)?;
+        let Some(row) = row else {
+            return Err(Status::unauthenticated(INVALID_CREDENTIALS));
+        };
+        let expected = row.credential_sha256.clone().unwrap_or_default();
+        if !pingwaf_tunnel::protocol::credential_matches(
+            &hello.credential,
+            &expected,
+        ) {
+            tracing::warn!(%tunnel_id, "tunnel control stream refused: bad credential");
+            return Err(Status::unauthenticated(INVALID_CREDENTIALS));
+        }
+        let settings = crate::tunnel_policy::load_settings(&self.db)
+            .await
+            .map_err(db_status)?;
+        if !settings.enabled || row.status == tunnel_status::DISABLED {
+            return Err(Status::permission_denied("this tunnel is disabled"));
+        }
+
+        let now = Utc::now();
+        let mut active: tunnel_connector::ActiveModel = row.into();
+        active.last_seen_at = Set(Some(now));
+        active.version = Set(optional(&hello.version));
+        active.hostname = Set(optional(&hello.hostname));
+        active.os_info = Set(optional(&hello.os_info));
+        active.updated_at = Set(now);
+        active.update(&self.db).await.map_err(db_status)?;
+
+        let (generation, mut commands) =
+            crate::grpc::TUNNEL_CONNECTORS.register(tunnel_id).await;
+        let (tx, rx) =
+            mpsc::channel::<Result<TunnelConnectorCommand, Status>>(16);
+        // The policy the connector needs first: without it there is nothing to
+        // dial.
+        match crate::tunnel_policy::connector_config(&self.db, tunnel_id).await
+        {
+            Ok(Some(config)) => {
+                let _ = tx
+                    .send(Ok(TunnelConnectorCommand {
+                        kind: Some(
+                            pingwaf_proto::control_plane::tunnel_connector_command::Kind::Config(
+                                config,
+                            ),
+                        ),
+                    }))
+                    .await;
+            },
+            Ok(None) => {
+                let _ = tx
+                    .send(Ok(TunnelConnectorCommand {
+                        kind: Some(
+                            pingwaf_proto::control_plane::tunnel_connector_command::Kind::Revoked(
+                                pingwaf_proto::control_plane::TunnelConnectorRevoked {
+                                    message: "the tunnel was deleted".to_string(),
+                                },
+                            ),
+                        ),
+                    }))
+                    .await;
+            },
+            Err(err) => {
+                tracing::warn!(%tunnel_id, error = %err, "cannot build the tunnel policy");
+            },
+        }
+        tracing::info!(%tunnel_id, hostname = %hello.hostname, "tunnel connector connected");
+
+        // A connector that goes away without closing the stream (host power
+        // loss, NAT expiry) must not keep the row "connected" forever: the
+        // heartbeat cadence bounds how long silence is plausible.
+        let liveness =
+            Duration::from_secs((settings.heartbeat_seconds.max(5) as u64) * 3);
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    command = commands.recv() => {
+                        match command {
+                            Some(command) => {
+                                if tx.send(Ok(command)).await.is_err() {
+                                    break;
+                                }
+                            },
+                            None => break,
+                        }
+                    },
+                    message = tokio::time::timeout(liveness, inbound.next()) => {
+                        let message = match message {
+                            Ok(message) => message,
+                            Err(_) => {
+                                tracing::warn!(
+                                    %tunnel_id,
+                                    timeout_secs = liveness.as_secs(),
+                                    "tunnel connector went silent, closing its control stream"
+                                );
+                                break;
+                            },
+                        };
+                        match message {
+                            Some(Ok(message)) => {
+                                // Heartbeats keep the row fresh; nothing else
+                                // is expected on this stream.
+                                if let Some(
+                                    tunnel_connector_message::Kind::Heartbeat(heartbeat),
+                                ) = message.kind
+                                {
+                                    let _ = heartbeat;
+                                    let _ = tunnel_connector::Entity::update_many()
+                                        .col_expr(
+                                            tunnel_connector::Column::LastSeenAt,
+                                            Expr::value(Utc::now()),
+                                        )
+                                        .filter(tunnel_connector::Column::Id.eq(tunnel_id))
+                                        .exec(&db)
+                                        .await;
+                                }
+                            },
+                            _ => break,
+                        }
+                    },
+                }
+            }
+            crate::grpc::TUNNEL_CONNECTORS
+                .unregister(tunnel_id, generation)
+                .await;
+            tracing::info!(%tunnel_id, "tunnel connector disconnected");
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     type SyncRulesStream = BoxedStream<RuleBundle>;
@@ -1345,9 +1652,15 @@ impl ControlPlaneTrait for ControlPlaneService {
                     "agent is not allowed to read this site",
                 ));
             }
-            build_site_config(&self.db, Some(&[id]))
+            let mut config = build_site_config(&self.db, Some(&[id]))
                 .await
-                .map_err(db_status)?
+                .map_err(db_status)?;
+            crate::grpc::scope_acme_for_agent(
+                &mut config,
+                row.id,
+                row.acme_issuer,
+            );
+            config
         };
 
         tracing::debug!(
@@ -1367,6 +1680,97 @@ impl ControlPlaneTrait for ControlPlaneService {
         }
 
         Ok(Response::new(config))
+    }
+
+    /// `PublishCertificate` — a designated issuer reports the material it
+    /// just issued.
+    ///
+    /// The caller must be an issuer and serve the site; the certificate row
+    /// must be ACME-managed, match the submitted hostname set and (when it
+    /// names one) be designated to this agent. The PEM/key pair and its
+    /// validity are checked before the row is promoted and the site config is
+    /// fanned out to every assigned agent.
+    async fn publish_certificate(
+        &self,
+        request: Request<PublishCertificateRequest>,
+    ) -> Result<Response<PublishCertificateResponse>, Status> {
+        let payload = request.into_inner();
+        let row = self.authorize(&payload.agent_token).await?;
+        if !row.acme_issuer {
+            return Err(Status::permission_denied(
+                "this agent is not an ACME issuer",
+            ));
+        }
+        let site_id = Uuid::parse_str(payload.site_id.trim())
+            .map_err(|_| Status::invalid_argument("site_id is not a UUID"))?;
+        let visible = self.visible_sites(&row).await?;
+        if !visible.iter().any(|site| site.id == site_id) {
+            return Err(Status::permission_denied(
+                "agent does not serve this site",
+            ));
+        }
+        const MAX_PEM_BYTES: usize = 1024 * 1024;
+        if payload.cert_pem.trim().is_empty()
+            || payload.key_pem.trim().is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "cert_pem and key_pem are required",
+            ));
+        }
+        if payload.cert_pem.len() > MAX_PEM_BYTES
+            || payload.key_pem.len() > MAX_PEM_BYTES
+        {
+            return Err(Status::invalid_argument(
+                "certificate material is too large",
+            ));
+        }
+
+        match crate::acme_state_sync::import_certificate(
+            &self.db,
+            site_id,
+            &payload.domains,
+            &payload.cert_pem,
+            &payload.key_pem,
+            Some(row.id),
+        )
+        .await
+        {
+            Ok(crate::acme_state_sync::ImportOutcome::Updated) => {
+                tracing::info!(
+                    agent_id = %row.id,
+                    %site_id,
+                    "certificate published by agent"
+                );
+                crate::grpc::notify_config_changed_for(
+                    &self.db,
+                    &self.agents,
+                    site_id,
+                    Some("agent-publish"),
+                )
+                .await;
+                Ok(Response::new(PublishCertificateResponse {
+                    accepted: true,
+                    message: "certificate published".to_string(),
+                }))
+            },
+            Ok(crate::acme_state_sync::ImportOutcome::Unchanged) => {
+                Ok(Response::new(PublishCertificateResponse {
+                    accepted: true,
+                    message: "certificate already current".to_string(),
+                }))
+            },
+            Ok(crate::acme_state_sync::ImportOutcome::Skipped(reason)) => {
+                let status = if reason.contains("designated") {
+                    Status::permission_denied(reason)
+                } else {
+                    Status::invalid_argument(reason)
+                };
+                Err(status)
+            },
+            Err(err) => Err(Status::internal(format!(
+                "could not store the published certificate: {err}"
+            ))),
+        }
     }
 
     // ── Visitor authentication ─────────────────────────────────────────
@@ -2719,6 +3123,32 @@ async fn mark_offline(db: &DatabaseConnection, agent_id: Uuid) {
     {
         tracing::warn!(%agent_id, error = %err, "could not mark agent offline");
     }
+    // Its tunnel listener is gone with the process: clearing the reported
+    // address and fingerprint stops `ingress_endpoints` from handing
+    // connectors a pin they can no longer reach. The operator's ingress
+    // address is kept — it is configuration, not a report.
+    let _ = agent::Entity::update_many()
+        .col_expr(
+            agent::Column::TunnelListenerAddr,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            agent::Column::TunnelCertSha256,
+            Expr::value(Option::<String>::None),
+        )
+        .filter(agent::Column::Id.eq(agent_id))
+        .exec(db)
+        .await;
+    // Its tunnel sessions ended with the stream; the heartbeat that reported
+    // them is not coming back, so the report is cleared here instead of
+    // lingering as connected on the tunnel page.
+    if let Err(err) = tunnel_session::Entity::delete_many()
+        .filter(tunnel_session::Column::AgentId.eq(agent_id))
+        .exec(db)
+        .await
+    {
+        tracing::warn!(%agent_id, error = %err, "could not clear the tunnel sessions of a disconnected agent");
+    }
 }
 
 /// Soft byte budget for one in-flight log batch. The row-count limit alone
@@ -3391,6 +3821,108 @@ fn positive_u32(value: u32) -> Option<u32> {
 ///
 /// `NotFound` is deliberately not logged at `error` level: a missing row is a
 /// routine race (an agent deleted between two statements), not an incident.
+/// Records what an agent reports about its tunnel listener and sessions.
+///
+/// The session list is a *report*, not a source of truth: the rows for this
+/// agent are replaced on every heartbeat, so a session that ended disappears
+/// instead of lingering as a permanently-connected ghost. The listener columns
+/// are the ones the tunnel page reads before offering an ingress.
+async fn persist_tunnel_state(
+    db: &DatabaseConnection,
+    agent_id: Uuid,
+    heartbeat: &AgentHeartbeat,
+) {
+    let listener = heartbeat.tunnel_listener.as_ref();
+    let (addr, fingerprint, listener_error) = match listener {
+        Some(listener) if listener.active => (
+            optional(&listener.addr),
+            optional(&listener.cert_sha256),
+            None,
+        ),
+        // A configured listener that failed to bind reports why; an agent with
+        // no listener at all reports nothing. Either way it is not an ingress
+        // right now, and `tunnel_ingress_addr` (the operator's) is untouched.
+        Some(listener) => (
+            None,
+            optional(&listener.cert_sha256),
+            optional(&listener.last_error),
+        ),
+        None => (None, None, None),
+    };
+    // A rotated certificate changes what connectors must pin. Read the old
+    // value first (one indexed lookup per heartbeat) so the change can be
+    // pushed instead of waiting for a connector to reconnect on its own.
+    let previous_fingerprint = agent::Entity::find_by_id(agent_id)
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.tunnel_cert_sha256);
+    let mut active: agent::ActiveModel = agent::ActiveModel {
+        id: Set(agent_id),
+        ..Default::default()
+    };
+    active.tunnel_listener_addr = Set(addr);
+    active.tunnel_cert_sha256 = Set(fingerprint.clone());
+    active.tunnel_listener_error = Set(listener_error);
+    if let Err(err) = active.update(db).await {
+        tracing::warn!(%agent_id, error = %err, "cannot record the tunnel listener state");
+    } else if fingerprint.is_some() && fingerprint != previous_fingerprint {
+        tracing::info!(
+            %agent_id,
+            "tunnel certificate fingerprint changed, pushing it to the connectors"
+        );
+        crate::grpc::notify_all_tunnel_connectors(db).await;
+    }
+
+    // The report is a snapshot, not a delta: replace it atomically so a reader
+    // never sees the agent with zero sessions between the delete and the
+    // inserts (the tunnel page would flash "no sessions" on every heartbeat).
+    let now = Utc::now();
+    let reports: Vec<(Uuid, tunnel_session::ActiveModel)> = heartbeat
+        .tunnel_sessions
+        .iter()
+        .filter_map(|report| {
+            let tunnel_id = Uuid::parse_str(report.tunnel_id.trim()).ok()?;
+            let session = tunnel_session::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                tunnel_id: Set(tunnel_id),
+                agent_id: Set(agent_id),
+                connected_at: Set(from_timestamp(report.connected_at.as_ref())),
+                last_seen_at: Set(now),
+                version: Set(optional(&report.connector_version)),
+                hostname: Set(optional(&report.hostname)),
+                streams_active: Set(
+                    report.streams_active.min(i32::MAX as u32) as i32
+                ),
+                rtt_ms: Set(report.rtt_ms.min(i32::MAX as u32) as i32),
+            };
+            Some((tunnel_id, session))
+        })
+        .collect();
+    let replaced = db
+        .transaction::<_, (), sea_orm::DbErr>(|txn| {
+            Box::pin(async move {
+                tunnel_session::Entity::delete_many()
+                    .filter(tunnel_session::Column::AgentId.eq(agent_id))
+                    .exec(txn)
+                    .await?;
+                for (tunnel_id, session) in reports {
+                    if let Err(err) = session.insert(txn).await {
+                        // A single bad row must not roll back the whole
+                        // report: the other tunnels' sessions are still true.
+                        tracing::warn!(%agent_id, %tunnel_id, error = %err, "cannot record a tunnel session");
+                    }
+                }
+                Ok(())
+            })
+        })
+        .await;
+    if let Err(err) = replaced {
+        tracing::warn!(%agent_id, error = %err, "cannot record the tunnel session report");
+    }
+}
+
 fn db_status(err: sea_orm::DbErr) -> Status {
     match err {
         sea_orm::DbErr::RecordNotFound(detail) => {

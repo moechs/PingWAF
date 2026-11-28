@@ -73,6 +73,10 @@ pub struct AgentResponse {
     pub site_domain: Option<String>,
     /// `all` (legacy: every site owned by the API key) or `selected`.
     pub site_scope: String,
+    /// Whether this agent may run ACME issuance and receive DNS provider
+    /// credentials. Consumer-only edges are false: they serve the PEM without
+    /// ever seeing the provider token.
+    pub acme_issuer: bool,
     /// Sites assigned to a `selected` agent (empty for `all`).
     pub site_ids: Vec<Uuid>,
     /// Domains matching `site_ids`, in the same order.
@@ -146,6 +150,17 @@ pub struct AgentResponse {
     /// Whether the gRPC control plane the agents connect to serves TLS.
     /// `false` means plaintext traffic (degraded mode).
     pub grpc_tls: bool,
+    /// Public `host:port` a tunnel connector dials to reach this node's tunnel
+    /// listener; `null` = the node is not offered as a tunnel ingress.
+    pub tunnel_ingress_addr: Option<String>,
+    /// The address the node's tunnel listener actually bound; `null` = off.
+    pub tunnel_listener_addr: Option<String>,
+    /// Lower-case hex SHA-256 of the listener's certificate leaf, which
+    /// connectors pin.
+    pub tunnel_cert_sha256: Option<String>,
+    /// Why a configured tunnel listener is not running; `null` when it is
+    /// active or was never configured.
+    pub tunnel_listener_error: Option<String>,
 }
 
 /// `PUT /agents/{agent_id}/sites` — narrow or widen an agent's site scope.
@@ -208,8 +223,55 @@ fn default_graceful() -> bool {
 /// the agent and cannot be changed here — registration matches on it.
 #[derive(Debug, Deserialize, Default)]
 pub struct UpdateAgentRequest {
+    /// Tri-state: absent leaves the stored label alone, `null` clears it, a
+    /// string sets it. It used to be a plain `Option<String>`, which made an
+    /// update that only touched another field silently clear the label.
+    #[serde(default, deserialize_with = "deserialize_present_nullable")]
+    pub display_name: Option<Option<String>>,
+    /// Public `host:port` a tunnel connector should dial to reach this agent's
+    /// tunnel listener. Absent leaves the stored value alone; an empty string
+    /// clears it (the agent stops being offered as a tunnel ingress).
     #[serde(default)]
-    pub display_name: Option<String>,
+    pub tunnel_ingress_addr: Option<String>,
+    /// Whether the agent may issue ACME certificates and receive DNS provider
+    /// credentials. Absent leaves the stored value alone. Turning it off makes
+    /// the agent a consumer: it keeps serving the distributed PEM but stops
+    /// receiving `acme_dns_config` and stops opening orders.
+    #[serde(default)]
+    pub acme_issuer: Option<bool>,
+}
+
+/// Deserializes a present-but-nullable field into `Option<Option<T>>`.
+///
+/// serde only calls this when the key is present, so the outer `Option`
+/// separates "absent" (`None`) from a JSON `null` (`Some(None)`).
+pub(crate) fn deserialize_present_nullable<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// Normalises an operator-supplied tunnel ingress address.
+///
+/// It is the address a connector dials, so it is validated as `host:port` by
+/// the same parser the tunnel data plane uses: an ingress the connector could
+/// not dial would be advertised to every connector and fail every session.
+fn normalise_ingress_addr(raw: &str) -> Result<Option<String>, ApiError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    pingwaf_tunnel::protocol::normalize_target(trimmed)
+        .map(Some)
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "tunnel_ingress_addr '{trimmed}' is not a host:port"
+            ))
+        })
 }
 
 /// Normalises an operator-supplied label: trimmed, blank becomes `None`, and
@@ -345,7 +407,10 @@ async fn enroll(
 /// The control plane only knows its bind address (`0.0.0.0:9090`), which is not
 /// routable from another server, so the port is combined with the host the
 /// operator reached the dashboard on.
-fn agent_server_url(state: &AppState, headers: &HeaderMap) -> String {
+pub(crate) fn agent_server_url(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> String {
     let port = state
         .config
         .grpc_addr
@@ -560,16 +625,54 @@ async fn update(
     let id = parse_uuid(&agent_id, "agent id")?;
     let row = load_agent(&state, id, &current).await?;
 
-    let display_name = normalise_display_name(payload.display_name)?;
+    let ingress = payload
+        .tunnel_ingress_addr
+        .as_deref()
+        .map(normalise_ingress_addr)
+        .transpose()?;
+    let previous_issuer = row.acme_issuer;
     let mut active: agent::ActiveModel = row.into();
-    active.display_name = Set(display_name.clone());
+    let mut renamed = false;
+    if let Some(display_name) = payload.display_name {
+        let display_name = normalise_display_name(display_name)?;
+        renamed = display_name.is_some();
+        active.display_name = Set(display_name);
+    }
+    let mut ingress_changed = false;
+    if let Some(ingress) = ingress {
+        ingress_changed = true;
+        active.tunnel_ingress_addr = Set(ingress);
+    }
+    let mut issuer_changed = false;
+    if let Some(acme_issuer) = payload.acme_issuer {
+        issuer_changed = previous_issuer != acme_issuer;
+        active.acme_issuer = Set(acme_issuer);
+    }
     active.update(&state.db).await?;
 
     tracing::info!(
         agent_id = %id,
-        renamed = display_name.is_some(),
-        "agent display name updated"
+        renamed,
+        ingress_changed,
+        issuer_changed,
+        "agent updated"
     );
+
+    // The flag decides whether the next bundle carries the ACME credentials
+    // and the issuance task, so the agent has to receive the new scope now.
+    if issuer_changed {
+        if let Err(err) =
+            crate::grpc::repush_agent_config(&state.db, &state.agents, id).await
+        {
+            tracing::warn!(agent_id = %id, error = %err, "could not push the ACME issuer scope change");
+        }
+    }
+
+    // A connector dials the address recorded here, so a change has to reach
+    // every connected connector now instead of on its next reconnect.
+    if ingress_changed {
+        crate::grpc::notify_all_tunnel_connectors(&state.db).await;
+    }
 
     let row = load_agent(&state, id, &current).await?;
     let mut items = enrich(&state, vec![row]).await?;
@@ -931,6 +1034,7 @@ async fn enrich(
             site_domain: row.site_id.and_then(|id| domains.get(&id).cloned()),
             site_id: row.site_id,
             site_scope: row.site_scope.clone(),
+            acme_issuer: row.acme_issuer,
             site_ids,
             site_domains,
             name: row
@@ -964,6 +1068,10 @@ async fn enrich(
             connected,
             pending_commands: state.agents.pending_count(&row.id).await,
             grpc_tls: state.config.grpc_tls_enabled(),
+            tunnel_ingress_addr: row.tunnel_ingress_addr,
+            tunnel_listener_addr: row.tunnel_listener_addr,
+            tunnel_cert_sha256: row.tunnel_cert_sha256,
+            tunnel_listener_error: row.tunnel_listener_error,
         });
     }
     Ok(out)

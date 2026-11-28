@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::api::ssl::cert_status;
 use crate::api::state::AppState;
-use crate::models::{site_certificates, site_ssl};
+use crate::models::{agent, site_certificates, site_ssl};
 use crate::site_cert;
 
 /// How often the file is checked. Issuance is rare; a 30 s delay only means
@@ -47,6 +47,7 @@ struct AcmeState {
 
 #[derive(Debug, Default, Deserialize)]
 struct AcmeCertificate {
+    acme: Option<String>,
     #[serde(default)]
     domains: String,
     #[serde(default)]
@@ -102,13 +103,13 @@ async fn sync_once(
     let text = std::fs::read_to_string(path)?;
     let parsed: AcmeState = match toml::from_str(&text) {
         Ok(parsed) => parsed,
-        Err(err) => {
+        Err(_) => {
             // The data plane writes atomically, but a malformed file must not
             // take the control plane down or retry in a tight loop. Wait for
             // the next write before trying again.
             *last_modified = modified;
             return Err(anyhow::anyhow!(
-                "cannot parse {}: {err}",
+                "cannot parse ACME state file {}",
                 path.display()
             ));
         },
@@ -119,20 +120,23 @@ async fn sync_once(
         let Some(site_id) = site_id_from_key(name) else {
             continue;
         };
-        if cert.domains.trim().is_empty()
+        if cert.acme.as_deref().is_none_or(str::is_empty)
+            || cert.domains.trim().is_empty()
             || cert.tls_cert.trim().is_empty()
             || cert.tls_key.trim().is_empty()
         {
             continue;
         }
-        if sync_certificate(
-            state,
+        if import_certificate(
+            &state.db,
             site_id,
             &cert.domains,
             &cert.tls_cert,
             &cert.tls_key,
+            None,
         )
         .await?
+            == ImportOutcome::Updated
         {
             updated += 1;
         }
@@ -149,36 +153,106 @@ async fn sync_once(
     Ok(updated)
 }
 
-async fn sync_certificate(
-    state: &AppState,
+/// What an ACME state entry did to the certificate row.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ImportOutcome {
+    /// The row now carries the submitted material.
+    Updated,
+    /// The row already carried exactly this material; no write happened.
+    Unchanged,
+    /// The entry was refused (or is not this file's to apply). The reason is
+    /// safe to log and, for the agent publication RPC, to return to the caller.
+    Skipped(&'static str),
+}
+
+/// Applies one ACME-issued certificate to the site's certificate row.
+///
+/// `expected_issuer` is the agent that published the material, or `None` for
+/// the local file sync. A row designated to another agent is skipped: only the
+/// designated issuer may replace its material.
+pub(crate) async fn import_certificate(
+    db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
     domains: &str,
     cert_pem: &str,
     key_pem: &str,
-) -> anyhow::Result<bool> {
-    let row = site_certificates::Entity::find()
-        .filter(site_certificates::Column::SiteId.eq(site_id))
-        .filter(site_certificates::Column::Domain.eq(domains.to_string()))
-        .one(&state.db)
-        .await?;
-    // Older rows may have the domains in another order or the alternate
-    // domain as the primary string. Fall back to the site's row only when the
-    // exact domain match found nothing.
-    let row = match row {
-        Some(row) => Some(row),
-        None => {
-            site_certificates::Entity::find()
-                .filter(site_certificates::Column::SiteId.eq(site_id))
-                .one(&state.db)
-                .await?
-        },
+    expected_issuer: Option<Uuid>,
+) -> anyhow::Result<ImportOutcome> {
+    // A site can own several certificates. Reordered SANs identify the same
+    // set, while an arbitrary first row can distribute another site's key.
+    let names = |value: &str| -> std::collections::BTreeSet<String> {
+        value
+            .split(',')
+            .map(|name| name.trim().to_ascii_lowercase())
+            .collect()
     };
+    let expected = names(domains);
+    let candidates = site_certificates::Entity::find()
+        .filter(site_certificates::Column::SiteId.eq(site_id))
+        .all(db)
+        .await?;
+    let has_candidates = !candidates.is_empty();
+    let mut matches = candidates
+        .into_iter()
+        .filter(|row| names(&row.domain) == expected);
+    let row = matches.next();
+    if matches.next().is_some() {
+        warn!(%site_id, domains, "ambiguous certificate rows for ACME state");
+        return Ok(ImportOutcome::Skipped(
+            "ambiguous certificate rows for the hostname set",
+        ));
+    }
     let Some(row) = row else {
         // The file can outlive a deleted certificate row. Not an error: the
-        // next issuance or a site edit removes it.
+        // next issuance or a site edit removes it. But a site that still owns
+        // certificate rows and none of them matches the ACME state's SAN set
+        // is a configuration drift an operator needs to see.
+        if has_candidates {
+            warn!(
+                %site_id,
+                domains,
+                "ACME certificate has no certificate row with this exact hostname set"
+            );
+            return Ok(ImportOutcome::Skipped(
+                "no certificate row matches the hostname set",
+            ));
+        }
         debug!(site_id = %site_id, domains, "ACME certificate has no row");
-        return Ok(false);
+        return Ok(ImportOutcome::Skipped("no certificate row for the site"));
     };
+
+    // A certificate designated to one agent is that agent's to publish. The
+    // local file sync (`expected_issuer == None`) must not overwrite it, and
+    // another agent must not either.
+    if let Some(designated) = row.acme_issuer_agent_id {
+        let accepted = match expected_issuer {
+            Some(issuer) => issuer == designated,
+            None => {
+                // The local file belongs to the embedded issuer. A
+                // certificate designated to that loopback-registered agent is
+                // still this file's to apply; one designated to a remote
+                // agent must wait for that agent's publication.
+                agent::Entity::find_by_id(designated)
+                    .one(db)
+                    .await?
+                    .is_some_and(|agent| {
+                        agent.peer_ip.as_deref().is_some_and(peer_is_loopback)
+                    })
+            },
+        };
+        if !accepted {
+            warn!(
+                %site_id,
+                domains,
+                designated = %designated,
+                caller = ?expected_issuer,
+                "ACME certificate is designated to another issuer"
+            );
+            return Ok(ImportOutcome::Skipped(
+                "the certificate is designated to another issuer",
+            ));
+        }
+    }
 
     // Only ACME-managed rows are this file's to update. A manual upload (or a
     // row whose auto-renew was turned off) must never be replaced by an old
@@ -190,28 +264,52 @@ async fn sync_certificate(
             .map(str::trim)
             .is_none_or(str::is_empty)
     {
-        return Ok(false);
+        return Ok(ImportOutcome::Skipped(
+            "the certificate row is not ACME-managed",
+        ));
     }
     if row.cert_pem.as_deref() == Some(cert_pem)
         && row.key_pem.as_deref() == Some(key_pem)
     {
-        return Ok(false);
+        return Ok(ImportOutcome::Unchanged);
     }
 
+    let hostnames: Vec<_> = expected.into_iter().collect();
+    if !site_cert::covers(cert_pem, &hostnames)
+        || crate::api::validation::validate_certificate_and_key(
+            cert_pem, key_pem,
+        )
+        .is_err()
+    {
+        warn!(%site_id, domains, "ACME state PEM or key does not match certificate configuration");
+        return Ok(ImportOutcome::Skipped(
+            "the PEM or key does not match the certificate configuration",
+        ));
+    }
+    let Some(meta) = parse_certificate_meta(cert_pem) else {
+        warn!(%site_id, domains, "ACME state PEM cannot be parsed");
+        return Ok(ImportOutcome::Skipped("the PEM cannot be parsed"));
+    };
+    if let Err(reason) = validate_imported_certificate(
+        &meta,
+        row.expires_at,
+        Utc::now(),
+        staging_allowed(),
+    ) {
+        warn!(%site_id, domains, reason, "ACME state certificate rejected");
+        return Ok(ImportOutcome::Skipped(reason));
+    }
     let mut active: site_certificates::ActiveModel = row.clone().into();
     active.cert_pem = Set(Some(cert_pem.to_string()));
     active.key_pem = Set(Some(key_pem.to_string()));
     active.status = Set(cert_status::ACTIVE.to_string());
     active.failure_reason = Set(None);
     active.updated_at = Set(Utc::now());
-    let meta = parse_certificate_meta(cert_pem);
-    if let Some(meta) = &meta {
-        active.issuer = Set(Some(meta.issuer.clone()));
-        active.not_before = Set(Some(meta.not_before));
-        active.expires_at = Set(Some(meta.expires_at));
-    }
+    active.issuer = Set(Some(meta.issuer.clone()));
+    active.not_before = Set(Some(meta.not_before));
+    active.expires_at = Set(Some(meta.expires_at));
     let certificate_id = row.id;
-    active.update(&state.db).await?;
+    active.update(db).await?;
 
     // The issued PEM is the site's certificate now. A generated self-signed
     // leaf would otherwise keep winning — the data plane prefers an inline PEM
@@ -219,7 +317,7 @@ async fn sync_certificate(
     // forever. Point the posture at this row and drop our generated material.
     let posture_row = site_ssl::Entity::find()
         .filter(site_ssl::Column::SiteId.eq(site_id))
-        .one(&state.db)
+        .one(db)
         .await?;
     if let Some(ssl) = posture_row {
         if ssl.self_signed || site_cert::is_generated(ssl.issuer.as_deref()) {
@@ -228,11 +326,9 @@ async fn sync_certificate(
             posture.certificate_id = Set(Some(certificate_id));
             posture.cert_pem = Set(None);
             posture.key_pem = Set(None);
-            if let Some(meta) = &meta {
-                posture.issuer = Set(Some(meta.issuer.clone()));
-                posture.expires_at = Set(Some(meta.expires_at));
-            }
-            posture.update(&state.db).await?;
+            posture.issuer = Set(Some(meta.issuer.clone()));
+            posture.expires_at = Set(Some(meta.expires_at));
+            posture.update(db).await?;
             info!(
                 site_id = %site_id,
                 cert_id = %certificate_id,
@@ -248,12 +344,73 @@ async fn sync_certificate(
         key_len = key_pem.len(),
         "synced ACME certificate into the control plane"
     );
-    Ok(true)
+    Ok(ImportOutcome::Updated)
 }
 
 fn site_id_from_key(name: &str) -> Option<Uuid> {
     let site = name.strip_suffix("_cert")?;
     Uuid::parse_str(site).ok()
+}
+
+/// How far a certificate may be from "now" before it is considered
+/// unusable. The issuer and the control plane run on different clocks.
+const IMPORT_CLOCK_LEEWAY_MINUTES: i64 = 5;
+
+/// Whether a stored peer address is the loopback registration of the
+/// embedded all-in-one agent. A dual-stack listener can report the mapped
+/// form, which `Ipv6Addr::is_loopback` alone does not cover.
+fn peer_is_loopback(peer: &str) -> bool {
+    peer.parse::<std::net::IpAddr>().is_ok_and(|ip| match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        },
+    })
+}
+
+/// Whether the deployment explicitly opted into the ACME staging directory.
+fn staging_allowed() -> bool {
+    std::env::var("PINGAP_ACME_STAGING").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "staging" | "stage"
+        )
+    })
+}
+
+/// Let's Encrypt staging intermediates carry a marker in the issuer DN.
+fn is_staging_issuer(issuer: &str) -> bool {
+    let upper = issuer.to_ascii_uppercase();
+    upper.contains("(STAGING)") || upper.contains("FAKE LE")
+}
+
+/// Refuses an ACME state entry that must not become the site's certificate.
+///
+/// The file is written by the issuer, but it can be stale, restored from a
+/// backup, or left behind by a staging run. Importing such material would
+/// mark an unusable certificate active and push it to every consumer.
+fn validate_imported_certificate(
+    meta: &CertificateMeta,
+    current_expires_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    staging_allowed: bool,
+) -> Result<(), &'static str> {
+    if meta.expires_at <= now {
+        return Err("the certificate has already expired");
+    }
+    if meta.not_before
+        > now + chrono::Duration::minutes(IMPORT_CLOCK_LEEWAY_MINUTES)
+    {
+        return Err("the certificate is not valid yet");
+    }
+    if current_expires_at.is_some_and(|current| meta.expires_at < current) {
+        return Err("the certificate is older than the stored one");
+    }
+    if !staging_allowed && is_staging_issuer(&meta.issuer) {
+        return Err("the certificate was issued by an ACME staging CA");
+    }
+    Ok(())
 }
 
 fn parse_certificate_meta(cert_pem: &str) -> Option<CertificateMeta> {
@@ -282,6 +439,84 @@ fn parse_certificate_meta(cert_pem: &str) -> Option<CertificateMeta> {
 mod tests {
     use super::*;
 
+    fn meta(
+        not_before: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        issuer: &str,
+    ) -> CertificateMeta {
+        CertificateMeta {
+            issuer: issuer.to_string(),
+            not_before,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn rejects_unusable_certificates_before_import() {
+        let now = Utc::now();
+        let day = chrono::Duration::days(1);
+        let valid = meta(
+            now - day,
+            now + chrono::Duration::days(60),
+            "CN=R3, O=Let's Encrypt",
+        );
+        assert!(validate_imported_certificate(&valid, None, now, false).is_ok());
+        // Re-importing the same certificate is idempotent, not "older".
+        assert!(validate_imported_certificate(
+            &valid,
+            Some(valid.expires_at),
+            now,
+            false
+        )
+        .is_ok());
+
+        let expired =
+            meta(now - chrono::Duration::days(60), now - day, "CN=R3");
+        assert_eq!(
+            validate_imported_certificate(&expired, None, now, false),
+            Err("the certificate has already expired")
+        );
+
+        let future = meta(now + day, now + chrono::Duration::days(60), "CN=R3");
+        assert_eq!(
+            validate_imported_certificate(&future, None, now, false),
+            Err("the certificate is not valid yet")
+        );
+
+        let older = meta(now - day, now + chrono::Duration::days(10), "CN=R3");
+        assert_eq!(
+            validate_imported_certificate(
+                &older,
+                Some(now + chrono::Duration::days(30)),
+                now,
+                false
+            ),
+            Err("the certificate is older than the stored one")
+        );
+
+        for issuer in
+            ["CN=(STAGING) Pretend Pear X1", "CN=Fake LE Intermediate X1"]
+        {
+            let staging =
+                meta(now - day, now + chrono::Duration::days(60), issuer);
+            assert_eq!(
+                validate_imported_certificate(&staging, None, now, false),
+                Err("the certificate was issued by an ACME staging CA")
+            );
+            assert!(validate_imported_certificate(&staging, None, now, true)
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn loopback_peer_detection_handles_mapped_v4() {
+        assert!(peer_is_loopback("127.0.0.1"));
+        assert!(peer_is_loopback("::1"));
+        assert!(peer_is_loopback("::ffff:127.0.0.1"));
+        assert!(!peer_is_loopback("10.0.0.1"));
+        assert!(!peer_is_loopback("not-an-ip"));
+    }
+
     #[test]
     fn parses_issued_certificate_metadata() {
         use rcgen::{CertificateParams, KeyPair};
@@ -301,6 +536,7 @@ mod tests {
             r#"
 [certificates.11111111-1111-1111-1111-111111111111_cert]
 domains = "example.com,www.example.com"
+acme = "enabled"
 tls_cert = "CERT"
 tls_key = "KEY"
 

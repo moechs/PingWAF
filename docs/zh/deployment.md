@@ -16,12 +16,20 @@
 | 80 | TCP | HTTP 业务 / ACME HTTP-01 | 代理站点需要 |
 | 443 | TCP | HTTPS 业务 | 代理站点需要 |
 | 9080 | TCP | 控制台 + REST API（HTTPS，自签证书） | 是 |
-| 9090 | TCP | gRPC 控制面（agent 连接） | 分布式模式需要 |
+| 9090 | TCP | gRPC 控制面（agent 与 tunnel 连接器） | 分布式模式需要 |
+| 9443 | TCP | 隧道监听（`agent.tunnel_addr`） | 仅作为隧道入口的边缘节点需要 |
 | 5432 | TCP | PostgreSQL | 仅内网 |
 
 - **9080 是管理面，不要直接暴露公网**：绑定 `127.0.0.1` 或私网，经 VPN/SSH 隧道或反代访问；
 - **9090 只允许 agent 主机访问**；
 - 5432 保持内网/Compose 内部网络。
+
+**隧道（Tunnel）端口**：`9443` 默认**关闭**，只有显式配置了
+`agent.tunnel_addr`（或 `--tunnel-addr 0.0.0.0:9443`）的边缘节点才接受连接器
+会话。该端口需要对连接器所在网络可达——这正是隧道的意义所在；连接器自身只需
+**出站** 9090（控制面）与 9443（入口边缘），不需要任何入站端口。接入步骤见
+[用户指南](user-guide.md#tunnel内网服务免入站端口接入) 与
+[英文部署文档](../deployment.md#firewall--port-requirements)。
 
 ## 3. Docker Compose
 

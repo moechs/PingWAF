@@ -899,9 +899,14 @@ mod tests {
         last_heartbeat: Option<DateTime<Utc>>,
     ) -> agent::Model {
         agent::Model {
+            tunnel_ingress_addr: None,
+            tunnel_listener_addr: None,
+            tunnel_cert_sha256: None,
+            tunnel_listener_error: None,
             id: Uuid::new_v4(),
             site_id: None,
             site_scope: "all".to_string(),
+            acme_issuer: false,
             hostname: hostname.to_string(),
             display_name: None,
             ip_address: "10.0.0.5".to_string(),

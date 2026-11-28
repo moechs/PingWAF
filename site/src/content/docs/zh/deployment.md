@@ -97,7 +97,40 @@ pingwaf agent
 
 当前 agent **未绑定站点**：会收到 API key 属主的全部站点，而不是单个站点；控制面自身的控制台站点（通常上游 `127.0.0.1:9080`）也会下发，在边缘节点上该回环地址没有控制台，站点会 502。尚无按节点绑定站点的 API，部署边缘时应使用专用控制面，或删除边缘不应运行的站点。
 
-如果控制面是 ACME 签发者，需 **0.32.40+** 才会把内嵌数据面签发的 PEM 同步并推送给 agent。旧控制面只下发 `acme_email`、没有 PEM，每个 agent 会自己发起 HTTP-01，验证请求落到控制面而不是 agent，最终 `acme_failed`。暂不能升级控制面时，可在 agent 单元设置 `PINGAP_DISABLE_ACME=true` 停止重试，并改用上传证书。安装器会把 `--server-ca-cert` 复制到 `/etc/pingwaf/grpc-ca.pem`，控制台生成的命令不含 CA / `--server-tls-name`，自签控制面需手动补上。
+如果控制面是 ACME 签发者，需 **0.32.40+** 才会把内嵌数据面签发的 PEM 同步并推送给 agent。旧控制面只下发 `acme_email`、没有 PEM，每个 agent 会自己发起 HTTP-01，验证请求落到控制面而不是 agent，最终 `acme_failed`。暂不能升级控制面时，可在 agent 单元设置 `PINGAP_DISABLE_ACME=true` 停止重试，并改用上传证书。只有标记为 ACME 签发者的 agent 才会收到 DNS 服务商凭据并发起订单；内嵌 all-in-one 签发者会自动标记，远程签发者需通过 `PATCH /api/v1/agents/{id}` 设置 `{"acme_issuer": true}`。消费型 agent 只使用下发的 PEM，不接触凭据。被标记的远程签发者会通过已认证的控制面通道回传签发的证书，控制面校验指定关系、站点分配、主机名集合与私钥后再分发。
+
+从 0.33.2 起支持 Amazon Route 53 的 DNS-01：选择 `dns-01` + `route53`，可用 `acme_dns_config.hosted_zone_id` 指定托管区域，签发进程需具备 AWS 凭证（最简单是 EC2 实例角色）。签发者只需该区域的 `GetHostedZone`、`ListResourceRecordSets`、`ChangeResourceRecordSets`（自动发现还需 `ListHostedZones`），消费型 agent 无需 AWS 权限。安装器会把 `--server-ca-cert` 复制到 `/etc/pingwaf/grpc-ca.pem`，控制台生成的命令不含 CA / `--server-tls-name`，自签控制面需手动补上。
+
+## 隧道（内网服务免入站端口）
+
+隧道让**内网服务**在不开放入站端口、也不需要公网 IP 的情况下接入：`pingwaf-tunnel` 连接器主动向控制面与边缘节点拨号，公网侧由边缘数据面终止并经回环桥接转发，WAF、限流、缓存、日志与证书与直连源站完全一致。
+
+**边缘节点**：只在需要终止隧道的边缘开启监听，并把端口限制到连接器所在网络：
+
+```toml
+[agent]
+tunnel_addr = "0.0.0.0:9443"   # 默认关闭
+```
+
+然后在 **边缘节点 → [节点] → 隧道入口地址** 填写连接器拨号的公网地址（`edge1.example.com:9443`）；该面板同时显示监听状态与连接器要固定的证书指纹。
+
+**连接器**：在 **边缘节点 → 隧道** 创建隧道，复制一次性配对命令并在内网主机执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh \
+  | sudo bash -s -- --mode tunnel \
+      --server-url https://control-plane:9090 \
+      --server-ca-cert control-plane.pem \
+      --token <pairing-token>
+```
+
+它会安装 `/usr/local/bin/pingwaf-tunnel`、写入 `/etc/pingwaf/tunnel.toml`（`0600`）并注册 `pingwaf-tunnel.service`。内网侧无需开放任何端口：连接器只发起出站连接（控制面 9090、入口边缘 9443）。
+
+**使用**：在站点的源站池对话框里把源站池绑定到该隧道，池内节点地址（`10.0.0.5:8080`、`app.internal:8443`）随后由连接器在内网解析。隧道的目标清单由绑定的源站池推导。
+
+主机退役时吊销隧道：凭据立即失效，所有边缘会在一次规则包重载内拒绝会话；删除隧道前若仍有源站池引用会被拒绝（`409`），`?force=true` 才会解绑并回退为直连源站。
+
+完整操作说明——三个独立状态、请求链路、连接器命令与配置项、无直接出网时的 SOCKS5、以及排查表——见 [隧道](/docs/tunnel/) 页面。
 
 ## systemd
 

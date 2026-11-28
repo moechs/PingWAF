@@ -39,6 +39,11 @@ pub mod agents {
         /// `all` (legacy: every site owned by the API key) or `selected`
         /// (only the rows in `agent_sites`; may be empty).
         pub site_scope: String,
+        /// Whether this agent may run ACME issuance and receive the site's
+        /// DNS provider credentials. The embedded all-in-one issuer is marked
+        /// automatically; consumer-only edges are not, so they serve the
+        /// distributed PEM without ever seeing a Cloudflare/Aliyun token.
+        pub acme_issuer: bool,
         pub hostname: String,
         /// Operator-editable label shown instead of `hostname` when set.
         ///
@@ -87,6 +92,19 @@ pub mod agents {
         /// When the agent last applied a per-site rule bundle.
         pub last_policy_sync_at: Option<DateTimeUtc>,
         pub registered_at: DateTimeUtc,
+        /// Public `host:port` a connector should dial to reach this agent's
+        /// tunnel listener; operator-set, `None` when the agent is not offered
+        /// as a tunnel ingress.
+        pub tunnel_ingress_addr: Option<String>,
+        /// The address the agent's tunnel listener actually bound, empty/`None`
+        /// when the listener is not enabled.
+        pub tunnel_listener_addr: Option<String>,
+        /// Lower-case hex SHA-256 of the leaf certificate the listener serves;
+        /// connectors pin it.
+        pub tunnel_cert_sha256: Option<String>,
+        /// Why a configured tunnel listener is not running (bind failure,
+        /// unusable certificate). `None` when it is active or never configured.
+        pub tunnel_listener_error: Option<String>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

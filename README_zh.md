@@ -82,6 +82,7 @@
 - **请求 / 响应改写**——头部、路径、查询参数、状态码与响应体查找替换。
 - **自定义错误页**，基于 Tera 模板渲染；对 WAF 拦截、站点暂停等边缘生成的响应同样生效。
 - **暂停站点**——在控制台一键暂停后，所有请求返回 `503` 维护页，证书照常握手、流量照常入日志。
+- **隧道（Tunnel）**——内网服务**无需入站端口、无需公网 IP** 即可接入：独立二进制 `pingwaf-tunnel` 主动向边缘节点拨号，绑定隧道的源站池经正常请求链路（WAF、限流、缓存、日志、证书）转发。配对与管理统一在 **边缘节点 → 隧道** 页；详见 [用户指南](docs/zh/user-guide.md#tunnel内网服务免入站端口接入)。
 
 ### 🔐 TLS 与证书
 - **ACME / Let's Encrypt 自动签发与续期**，直接在边缘完成（HTTP-01 与 DNS-01）。
@@ -191,7 +192,7 @@ PINGWAF_SECRET_KEY="$(openssl rand -hex 32)" \
 
 ## 🧭 运行模式
 
-PingWAF 是单一二进制（`pingwaf`），与 `pingap` 共享入口。它通过 CLI 子命令**或** `PINGWAF_MODE` 环境变量选择运行模式。发布包同时提供 **`pingwaf-agent`**（仅数据面的构建，不含 PostgreSQL、REST API 与控制台）；`install.sh --mode agent` 会下载它并以 `pingwaf` 名称安装。
+PingWAF 是单一二进制（`pingwaf`），与 `pingap` 共享入口。它通过 CLI 子命令**或** `PINGWAF_MODE` 环境变量选择运行模式。发布包同时提供 **`pingwaf-agent`**（仅数据面的构建，不含 PostgreSQL、REST API 与控制台）；`install.sh --mode agent` 会下载它并以 `pingwaf-agent` 名称安装（独立 systemd 单元），两个二进制都支持 `version` 与 `upgrade` 子命令。
 
 | 模式 | 命令 | 角色 |
 | --- | --- | --- |

@@ -272,7 +272,8 @@ the script resolved from your options.
 > all-in-one modes, and `pingwaf-agent-linux-{amd64,arm64}.tar.xz` / `.tar.gz`
 > for the agent-only build (no PostgreSQL, REST API or embedded dashboard),
 > each with a `.sha256` sidecar. `install.sh --mode agent` prefers the
-> `pingwaf-agent` asset and installs it as `/usr/local/bin/pingwaf`; a release
+> `pingwaf-agent` asset and installs it as `/usr/local/bin/pingwaf-agent`
+> (`pingwaf-agent.service`); a release
 > that predates it falls back to the full binary with a warning. The installer
 > prefers the `.tar.xz` asset, skips straight to `.tar.gz` when `xz(1)` is not
 > installed locally, and falls back on a failed download.
@@ -519,6 +520,46 @@ pingwaf server --db-url "postgres://..." --admin-addr 0.0.0.0:9080 --grpc-addr 0
 ```bash
 pingwaf agent --server-url "https://control-plane:9090" --server-ca-cert /var/lib/pingwaf/data/grpc-ca.pem --api-key "your-agent-key"
 ```
+
+**Tunnel connector (optional, for services inside a private network):**
+
+```bash
+# on a host inside the private network; the token comes from
+# Agents -> Tunnels -> Create tunnel
+pingwaf-tunnel pair --config /etc/pingwaf/tunnel.toml \
+  --token "<pairing-token>" --server-url "https://control-plane:9090" \
+  --server-ca-cert /etc/pingwaf/tunnel-ca.pem
+pingwaf-tunnel run --config /etc/pingwaf/tunnel.toml
+```
+
+The connector dials out only: it never needs an inbound port. On the edge side,
+enable the listener and give that edge a public ingress address:
+
+```toml
+[agent]
+tunnel_addr = "0.0.0.0:9443"
+```
+
+then set **Agents → [node] → Tunnel ingress** to `edge1.example.com:9443`.
+Bind an origin pool to the tunnel in the site's origin pool settings; its node
+addresses are then resolved by the connector inside the private network. See
+[user-guide.md](user-guide.md#tunnels-internal-services-without-an-inbound-port).
+
+In the compose deployment the listener is off unless the variable reaches the
+container — compose only passes the environment a service declares, so add
+`PINGWAF_TUNNEL_ADDR=0.0.0.0:9443` to the `pingwaf` service's `environment:`
+block (the shipped file already forwards `${PINGWAF_TUNNEL_ADDR}` and publishes
+`${PINGWAF_TUNNEL_BIND:-127.0.0.1}:9443:9443`), set
+`PINGWAF_TUNNEL_BIND=0.0.0.0` when the connectors are on other hosts, and open
+`9443` in the firewall and the cloud security group. A value in `.env` alone is
+never passed through.
+
+A connector host with **no direct egress** can reach both the control plane and
+the edges through a SOCKS5 proxy: add `socks5_proxy = "10.0.0.1:1080"` (plus
+`socks5_username` / `socks5_password` when the proxy requires them) to
+`tunnel.toml`, or pass `--socks5-proxy` to `install.sh --mode tunnel`. Target
+names are resolved by the proxy, the handshake is bounded, and a dial never
+falls back to a direct connection.
 
 The gRPC listener serves TLS by default, so `server_url` should be `https://`
 with the CA that signed the control plane's certificate in
@@ -969,7 +1010,8 @@ network — that sends agent traffic and credentials in plaintext.
 | 80 | TCP | HTTP traffic / ACME HTTP-01 | Yes (for proxied sites) |
 | 443 | TCP | HTTPS traffic | Yes (for proxied sites) |
 | 9080 | TCP | Admin dashboard + REST API (HTTPS) | Yes |
-| 9090 | TCP | gRPC control plane (agents) | Distributed mode |
+| 9090 | TCP | gRPC control plane (agents and tunnel connectors) | Distributed mode |
+| 9443 | TCP | Tunnel listener (`agent.tunnel_addr`) | Only on edges that terminate tunnels |
 | 5432 | TCP | PostgreSQL | Internal only |
 
 ```bash
@@ -978,7 +1020,16 @@ sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
 sudo ufw allow from 203.0.113.10 to any port 9080 proto tcp  # admin/VPN only
 sudo ufw allow from 203.0.113.0/24 to any port 9090 proto tcp # agent nodes only
+sudo ufw allow 9443/tcp                                       # tunnel connectors (see below)
 ```
+
+`9443` is the tunnel listener and is **off by default**: only an edge that an
+operator explicitly made a tunnel ingress accepts connector sessions
+(`agent.tunnel_addr`, or `--tunnel-addr 0.0.0.0:9443`). It must be reachable
+from wherever the connectors run — that is the whole point of the tunnel, and
+the only port a private-network host needs to reach. The connectors themselves
+need **outbound** 9090 (control plane) and 9443 (ingress edges) and nothing
+inbound.
 
 `9080` is the authenticated admin console, not a public API. Prefer binding it
 to a private interface or loopback and reaching it through a VPN/SSH tunnel

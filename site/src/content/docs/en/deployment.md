@@ -99,7 +99,42 @@ Agents are currently **unbound**: an agent receives every site owned by the API 
 
 For ACME, the control plane must be **0.32.40 or newer** so the PEMs issued by its embedded data plane are synced into `site_certificates` and pushed to agents. An older control plane sends `acme_email` without a PEM, so each agent starts its own HTTP-01 order; the CA validation request reaches the host that owns port 80 (usually the control plane), not the agent, and fails. If the control plane cannot be upgraded yet, set `PINGAP_DISABLE_ACME=true` in the agent unit and upload certificates instead.
 
+Only an agent marked as an ACME issuer receives the DNS provider credentials and opens orders; the embedded all-in-one issuer is marked automatically, and a remote issuer is marked with `PATCH /api/v1/agents/{id}` and `{"acme_issuer": true}`. Consumer agents serve the distributed PEM without the credential. A marked remote issuer reports its issued certificate back over the authenticated control-plane channel, and the control plane validates the designation, site assignment, hostname set and key before fanning it out.
+
+DNS-01 with Amazon Route 53 is supported from 0.33.2: select `dns-01` + `route53`, optionally pin `acme_dns_config.hosted_zone_id`, and give the issuing process an AWS credential (an EC2 instance role is the simplest). The issuer needs `GetHostedZone`, `ListResourceRecordSets` and `ChangeResourceRecordSets` on the zone (plus `ListHostedZones` for discovery); consumer agents need no AWS permission.
+
 The installer copies `--server-ca-cert` to `/etc/pingwaf/grpc-ca.pem` and references that durable path; the console's generated command does not include the CA or `--server-tls-name`, so add them for a self-signed control plane.
+
+## Tunnels (internal services without an inbound port)
+
+A tunnel reaches a service inside a private network **without an inbound port and without a public IP on that host**. The `pingwaf-tunnel` connector dials out to the control plane and to the edge; the edge terminates the public side and proxies through a loopback bridge, so the WAF, rate limiting, cache, logs and certificates all apply exactly as they do for a direct origin.
+
+**Edge:** enable the listener only on the edges that should terminate tunnels, and firewall the port to where the connectors run:
+
+```toml
+[agent]
+tunnel_addr = "0.0.0.0:9443"   # off by default
+```
+
+Then give that edge a public ingress address in **Agents → [node] → Tunnel ingress** (`edge1.example.com:9443`); the panel also shows the listener state and the certificate fingerprint connectors pin.
+
+**Connector:** create the tunnel in **Agents → Tunnels**, copy the one-time pairing command and run it inside the private network:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh \
+  | sudo bash -s -- --mode tunnel \
+      --server-url https://control-plane:9090 \
+      --server-ca-cert control-plane.pem \
+      --token <pairing-token>
+```
+
+It installs `/usr/local/bin/pingwaf-tunnel`, writes `/etc/pingwaf/tunnel.toml` (`0600`) and registers `pingwaf-tunnel.service`. Nothing needs to be open on the private-network side; the connector only makes outbound connections (9090 to the control plane, 9443 to the ingress edges).
+
+**Use it:** bind an origin pool to the tunnel in the site's origin-pool dialog. Its node addresses (`10.0.0.5:8080`, `app.internal:8443`) are then resolved by the connector inside the private network instead of by the edge. The tunnel's target list is derived from the bound pools.
+
+Revoke a tunnel when its host is decommissioned: the credential stops working and every edge refuses the session within one rule-bundle reload. Deleting the tunnel is refused while origin pools still reference it (`409`); `?force=true` unbinds them and they fall back to direct origins.
+
+The complete operating guide — the three independent states, the request path, the connector's commands and config keys, SOCKS5 egress for a host with no direct route, and the troubleshooting table — is the [Tunnels](/docs/tunnel/) page.
 
 ## systemd
 

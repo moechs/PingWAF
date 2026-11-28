@@ -59,7 +59,7 @@ use pingwaf_agent::cache::{
 use pingwaf_agent::config::AgentConfig;
 #[cfg(not(feature = "edge"))]
 use pingwaf_server::ServerConfig;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Stable tracing target for the shared startup and data-plane logs.
 ///
@@ -167,7 +167,14 @@ pub(crate) fn agent_config_from_opts(opts: &AgentOpts) -> AgentConfig {
         metrics_ship_interval_secs: opts.metrics_ship_interval_secs,
         auto_upgrade: opts.auto_upgrade,
         upgrade_url: opts.upgrade_url.clone(),
+        tunnel_addr: non_empty_opt(&opts.tunnel_addr),
     }
+}
+
+/// `Some(trimmed)` for a non-empty value.
+fn non_empty_opt(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Convert CLI all-in-one options into an `AgentConfig`.
@@ -204,6 +211,7 @@ fn agent_config_from_all_in_one(opts: &AllInOneOpts) -> AgentConfig {
         // The embedded agent dials loopback, which the generated certificate
         // always covers.
         server_tls_name: None,
+        tunnel_addr: non_empty_opt(&opts.tunnel_addr),
         heartbeat_interval_secs: opts.heartbeat_interval_secs,
         cache_dir: opts.cache_dir.clone(),
         log_batch_size: opts.log_batch_size,
@@ -318,7 +326,9 @@ fn is_maintenance_command(command: &PingWafCommand) -> bool {
         PingWafCommand::User { .. }
         | PingWafCommand::Mode { .. }
         | PingWafCommand::Security { .. }
-        | PingWafCommand::Config { .. } => true,
+        | PingWafCommand::Config { .. }
+        | PingWafCommand::Version { .. }
+        | PingWafCommand::Upgrade(_) => true,
     }
 }
 
@@ -344,7 +354,9 @@ pub fn build_run_mode(cli: PingWafCli) -> RunMode {
         PingWafCommand::User { .. }
         | PingWafCommand::Mode { .. }
         | PingWafCommand::Security { .. }
-        | PingWafCommand::Config { .. } => {
+        | PingWafCommand::Config { .. }
+        | PingWafCommand::Version { .. }
+        | PingWafCommand::Upgrade(_) => {
             unreachable!("maintenance commands do not build a run mode")
         },
     }
@@ -898,6 +910,119 @@ fn site_has_cache_policy(site: &pingwaf_agent::cache::SiteRules) -> bool {
 
 /// Startup view of the cache: `None` while there is nothing to serve, so the
 /// proxy is not started on an empty or unusable configuration.
+/// The loopback address a tunnel target is reached at, when a session is live.
+fn tunnel_bridge_addr(
+    tunnel_id: &str,
+    target: &str,
+) -> Option<std::net::SocketAddr> {
+    pingwaf_tunnel::installed_registry()
+        .and_then(|registry| registry.bridge_addr(tunnel_id, target))
+}
+
+/// Reconciles the tunnel registry with the policy in the rule cache.
+///
+/// Called before every configuration build: the registry is what the address
+/// substitution reads, so it has to reflect the cache the build is about to
+/// use.
+fn apply_tunnel_policies(cached: &CachedRules) {
+    let Some(registry) = pingwaf_tunnel::installed_registry() else {
+        return;
+    };
+    let settings = cached
+        .tunnel_settings
+        .map(|settings| pingwaf_tunnel::TunnelSettings {
+            max_streams: settings.max_streams.max(1),
+            idle_timeout_secs: settings.idle_timeout_secs.max(10),
+            heartbeat_secs: settings.heartbeat_secs.max(5),
+        })
+        .unwrap_or_default();
+    let policies: Vec<pingwaf_tunnel::TunnelPolicy> = cached
+        .tunnels
+        .iter()
+        .map(|tunnel| pingwaf_tunnel::TunnelPolicy {
+            tunnel_id: tunnel.tunnel_id.clone(),
+            name: tunnel.name.clone(),
+            enabled: tunnel.enabled,
+            session_public_key: tunnel.session_public_key.clone(),
+            targets: tunnel.targets.clone(),
+            settings: settings.clone(),
+        })
+        .collect();
+    registry.apply_policies(policies);
+}
+
+/// Starts the tunnel listener when the agent was configured for one.
+///
+/// Returns the registry so the caller can keep it alive; the process-wide
+/// handle is what the heartbeat and the configuration generator read.
+async fn start_tunnel_listener(
+    addr: &str,
+    cache_dir: &str,
+) -> Option<Arc<pingwaf_tunnel::TunnelRegistry>> {
+    let dir = std::path::Path::new(cache_dir).join("tunnel");
+    let names = tunnel_certificate_names();
+    let cert = match pingwaf_tunnel::TunnelCertificate::load_or_generate(
+        &dir, &names,
+    ) {
+        Ok(cert) => cert,
+        Err(error) => {
+            error!(target: LOG_TARGET, error = %error, "cannot prepare the tunnel certificate");
+            return None;
+        },
+    };
+    let registry = pingwaf_tunnel::TunnelRegistry::new();
+    let acceptor = match pingwaf_tunnel::TunnelAcceptor::bind(
+        addr,
+        &cert,
+        Arc::clone(&registry),
+    )
+    .await
+    {
+        Ok(acceptor) => acceptor,
+        Err(error) => {
+            error!(target: LOG_TARGET, addr, error = %error, "cannot start the tunnel listener");
+            // Report the failure instead of looking like "never configured":
+            // the console can then say why no edge is offering an ingress.
+            pingwaf_tunnel::install_runtime(pingwaf_tunnel::TunnelRuntime {
+                registry: Arc::clone(&registry),
+                listener_addr: None,
+                cert_fingerprint: cert.fingerprint_sha256.clone(),
+                listener_error: Some(error.to_string()),
+            });
+            return Some(registry);
+        },
+    };
+    let listener_addr = acceptor.local_addr();
+    let fingerprint = cert.fingerprint_sha256.clone();
+    drop(acceptor.spawn());
+    pingwaf_tunnel::install_runtime(pingwaf_tunnel::TunnelRuntime {
+        registry: Arc::clone(&registry),
+        listener_addr: Some(listener_addr),
+        cert_fingerprint: fingerprint.clone(),
+        listener_error: None,
+    });
+    info!(target: LOG_TARGET,
+        addr = %listener_addr,
+        fingerprint = %fingerprint,
+        "tunnel listener started"
+    );
+    Some(registry)
+}
+
+/// Subject alternative names for the tunnel certificate.
+///
+/// Cosmetic only: connectors pin the leaf's SHA-256, they do not check a name.
+/// The host name makes `openssl s_client` output explain what the listener is.
+fn tunnel_certificate_names() -> Vec<String> {
+    let mut names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    if let Some(host) = sysinfo::System::host_name()
+        && !host.trim().is_empty()
+    {
+        names.push(host);
+    }
+    names
+}
+
 fn cached_rules_to_pingap_config(
     cached: &CachedRules,
     cache_dir: &Path,
@@ -923,6 +1048,14 @@ fn convert_cached_rules(
     cached: &CachedRules,
     cache_dir: &Path,
 ) -> PingapConfig {
+    // Opt-in: forward standard reverse-proxy headers to upstreams.
+    // Disabled by default for backward compatibility.
+    let enable_reverse_proxy_headers = env_flag_is_true(
+        std::env::var("PINGWAF_ENABLE_REVERSE_PROXY_HEADERS")
+            .ok()
+            .as_deref(),
+    );
+
     // The cache plugin carries no per-site settings of its own — rules,
     // namespaces and quotas all flow from the agent's rule cache at request
     // time. It only earns a slot in the config when some site actually has
@@ -1078,22 +1211,49 @@ fn convert_cached_rules(
                 up.pool_id.clone()
             };
 
+            // A pool bound to a tunnel is reached through the loopback bridge
+            // the tunnel registry owns; a pool with no live session on this
+            // edge has no upstream at all, which is what makes a probe report
+            // the truth instead of "port open, backend dead".
             let addrs: Vec<String> = up
                 .peers
                 .iter()
-                .map(|p| {
+                .filter_map(|p| {
                     let addr = p
                         .address
                         .strip_prefix("https://")
                         .or_else(|| p.address.strip_prefix("http://"))
                         .unwrap_or(&p.address);
-                    if p.weight > 1 {
+                    let addr = if up.tunnel_id.is_empty() {
+                        addr.to_string()
+                    } else {
+                        // Same normalization the control plane used to derive
+                        // the target list: a bare host gets the default port of
+                        // its TLS flag, or the lookup could never match.
+                        let target =
+                            pingwaf_tunnel::protocol::normalize_pool_target(
+                                addr, p.tls,
+                            )?;
+                        match tunnel_bridge_addr(&up.tunnel_id, &target) {
+                            Some(bridge) => bridge.to_string(),
+                            None => return None,
+                        }
+                    };
+                    Some(if p.weight > 1 {
                         format!("{} {}", addr, p.weight)
                     } else {
-                        addr.to_string()
-                    }
+                        addr
+                    })
                 })
                 .collect();
+            if addrs.is_empty() {
+                debug!(target: LOG_TARGET,
+                    tunnel = %up.tunnel_id,
+                    pool = %name,
+                    "tunnel has no session on this edge, pool has no upstream"
+                );
+                continue;
+            }
 
             // Multi-node pools get request-level protection by default:
             // without backend stats the circuit breaker can never observe
@@ -1246,6 +1406,9 @@ fn convert_cached_rules(
                     host: Some(host.clone()),
                     path: Some("/".to_string()),
                     plugins: Some(site_plugins.clone()),
+                    enable_reverse_proxy_headers: Some(
+                        enable_reverse_proxy_headers,
+                    ),
                     // The fallback must sort behind every route: with the
                     // auto weight (128) any route whose priority was 127 or
                     // less ranked below this catch-all `/` location and
@@ -1266,7 +1429,24 @@ fn convert_cached_rules(
             // Route only to pools this site actually built — an empty pool
             // has no upstream to receive traffic. Fall back to the site's
             // default pool instead of silently dropping the route.
+            //
+            // A *tunneled* pool is the exception: its absence means the
+            // connector is offline, not that the pool is empty. Falling back
+            // would send the request — Host, cookies, Authorization and all —
+            // to a different origin, so the route keeps pointing at the
+            // missing pool and answers 503 instead.
+            let tunneled = site.upstreams.iter().any(|up| {
+                up.pool_id == route.pool_id && !up.tunnel_id.is_empty()
+            });
             let target = if pool_keys.contains(&route.pool_id) {
+                route.pool_id.clone()
+            } else if tunneled {
+                warn!(target: LOG_TARGET,
+                    site = %site.domain,
+                    route = %route.id,
+                    pool = %route.pool_id,
+                    "route pool is bound to a tunnel with no live session; the route answers 503 instead of falling back"
+                );
                 route.pool_id.clone()
             } else {
                 match default_key.clone().or_else(|| pool_keys.first().cloned())
@@ -1302,6 +1482,9 @@ fn convert_cached_rules(
                     upstream: Some(target),
                     host: Some(host.clone()),
                     path: Some(path),
+                    enable_reverse_proxy_headers: Some(
+                        enable_reverse_proxy_headers,
+                    ),
                     weight: route
                         .priority
                         .map(|p| p.clamp(1, u16::MAX as i32) as u16),
@@ -1340,10 +1523,7 @@ fn convert_cached_rules(
             location_names.push(loc_name);
         }
 
-        // Convert SSL certificate: an uploaded PEM is served as-is, while a
-        // site asking for ACME without one gets a certificate entry the
-        // lets-encrypt task issues against — and later fills in — inside
-        // this config.
+        // Convert the TLS material and renewal settings for the site.
         if let Some(ref ssl) = site.ssl_config
             && ssl.enabled
         {
@@ -1358,18 +1538,7 @@ fn convert_cached_rules(
                 );
                 d.join(",")
             };
-            let cert = if !ssl.cert_pem.is_empty() {
-                Some(CertificateConf {
-                    domains: Some(domains),
-                    tls_cert: Some(ssl.cert_pem.clone()),
-                    tls_key: Some(ssl.key_pem.clone()),
-                    ..Default::default()
-                })
-            } else if ssl.acme_enabled && !ssl.acme_email.is_empty() {
-                acme_certificate_conf(ssl, domains)
-            } else {
-                None
-            };
+            let cert = site_certificate_conf(ssl, domains);
             if let Some(cert) = cert {
                 certificates.insert(format!("{site_id}_cert"), cert);
             }
@@ -1565,13 +1734,43 @@ fn build_reload_config(rule_cache: &RuleCache) -> PingapConfig {
     convert_cached_rules(&rule_cache.all_sites(), rule_cache.cache_dir())
 }
 
+fn site_certificate_conf(
+    ssl: &SslConfig,
+    domains: String,
+) -> Option<CertificateConf> {
+    let acme_enabled = ssl.acme_enabled && !ssl.acme_email.is_empty();
+    if ssl.cert_pem.is_empty() {
+        return acme_enabled
+            .then(|| acme_certificate_conf(ssl, domains))
+            .flatten();
+    }
+
+    // An issued PEM comes back through config sync (the control plane imports
+    // the issuer's ACME state and pushes the material back). Keep its ACME
+    // settings so the issuer can check expiry and renew it after reload; the
+    // previous provider-specific gate silently stopped renewal for every other
+    // DNS provider (and for HTTP-01) once the synced PEM reached the config.
+    if acme_enabled
+        && let Some(mut config) = acme_certificate_conf(ssl, domains.clone())
+    {
+        config.tls_cert = Some(ssl.cert_pem.clone());
+        config.tls_key = Some(ssl.key_pem.clone());
+        return Some(config);
+    }
+    Some(CertificateConf {
+        domains: Some(domains),
+        tls_cert: Some(ssl.cert_pem.clone()),
+        tls_key: Some(ssl.key_pem.clone()),
+        ..Default::default()
+    })
+}
+
 /// Build the certificate entry a lets-encrypt issuance is driven by.
 ///
 /// `acme` is only a marker (never parsed); the email keeps the convention
 /// legacy pingap used so operators recognize it in a config dump. DNS-01
-/// carries the provider plus credentials: the endpoint defaults to the
-/// provider's API host and every `acme_dns_config` entry becomes a query
-/// pair — the layout pingap's DNS tasks parse.
+/// passes provider options through `dns_service_url`. Route 53 uses the AWS
+/// credential chain and only passes the optional hosted zone ID.
 /// Returns `None` when the order cannot be issued and must be skipped:
 /// a wildcard hostname only validates through DNS-01, so an entry that would
 /// fall back to HTTP-01 is dropped (with an error log) instead of making the
@@ -1632,23 +1831,32 @@ fn acme_certificate_conf(
     Some(cert)
 }
 
-/// The DNS provider endpoint with credentials appended as query pairs.
+/// The DNS provider endpoint with provider-specific options as query pairs.
 ///
-/// An explicit `endpoint` entry (full URL, or host getting the default
-/// scheme) wins; `region` is only used to build the Huawei cloud host.
-/// Without either, the provider's documented API host applies — Huawei has
-/// per-region hosts and cannot have one. Every other entry becomes
-/// `key=value` — names match what the provider task expects, e.g.
-/// `access_key_id` / `access_key_secret` / `token`.
+/// Route 53 uses its fixed service endpoint and the optional hosted zone ID.
+/// Other providers accept an explicit `endpoint` and pass their remaining
+/// options as query pairs. Huawei uses `region` to build the endpoint when
+/// one is absent.
 fn acme_dns_service_url(
     provider: &str,
     config: &HashMap<String, String>,
 ) -> Option<String> {
+    if provider == "route53" {
+        let base = pingap_config::ROUTE53_SERVICE_URL;
+        return Some(match config.get("hosted_zone_id") {
+            Some(id) => {
+                format!("{base}?hosted_zone_id={}", urlencoding::encode(id))
+            },
+            None => base.to_string(),
+        });
+    }
     let base = match config.get("endpoint").filter(|v| !v.is_empty()) {
         Some(v) if v.contains("://") => v.clone(),
         Some(v) => format!("https://{v}"),
         None => {
-            if let Some(region) = config.get("region").filter(|r| !r.is_empty())
+            if provider == "huawei"
+                && let Some(region) =
+                    config.get("region").filter(|r| !r.is_empty())
             {
                 format!("https://dns.{region}.myhuaweicloud.com")
             } else if provider == "huawei" {
@@ -1779,6 +1987,9 @@ pub async fn start_data_plane(
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
+    // The registry has to reflect the cache the first build reads.
+    apply_tunnel_policies(&rule_cache.all_sites());
+
     let config = match build_pingap_config(&rule_cache) {
         Some(config) => config,
         None => {
@@ -1820,7 +2031,7 @@ pub async fn start_data_plane(
     );
     let config_manager =
         try_init_memory_config_manager(&toml_str, Some(acme_state)).map_err(
-            |e| anyhow::anyhow!("failed to init config manager: {}", e),
+            |_| anyhow::anyhow!("failed to initialize proxy configuration"),
         )?;
 
     // The lets-encrypt task scans current_config for certificates to issue,
@@ -1830,9 +2041,8 @@ pub async fn start_data_plane(
         .and_then(|toml_config| toml_config.to_pingap_config(true))
     {
         Ok(merged) => merged,
-        Err(e) => {
+        Err(_) => {
             warn!(target: LOG_TARGET,
-                error = %e,
                 "data plane: merged config failed validation, using freshly converted config"
             );
             config
@@ -2023,6 +2233,32 @@ pub async fn start_data_plane(
             logger: None,
         };
         let mut ps = ProxyServer::new(&server_conf, ctx)?;
+        if env_flag_is_true(
+            std::env::var("PINGWAF_ENABLE_REVERSE_PROXY_HEADERS")
+                .ok()
+                .as_deref(),
+        ) {
+            ps.site_proxy_trust = Some(|host| {
+                let Some(site) = pingwaf_agent::PingWafAgent::instance()
+                    .and_then(|agent| agent.get_rules_for_domain(host))
+                else {
+                    return pingap_core::ProxyTrust::default();
+                };
+                let trust = &site.proxy_trust;
+                // Most sites do not configure a trust boundary. Return the
+                // disabled policy without parsing CIDR strings and allocating
+                // a header name on every request.
+                if !trust.enabled {
+                    return pingap_core::ProxyTrust::default();
+                }
+                pingap_core::ProxyTrust::new(
+                    trust.enabled,
+                    trust.effective_header(),
+                    trust.last_hop_only,
+                    &trust.trusted_ranges,
+                )
+            });
+        }
         // The HTTP-01 challenge must be reachable on port 80, so every
         // data-plane server whose address list includes :80 intercepts
         // /.well-known/acme-challenge before proxying.
@@ -2103,11 +2339,11 @@ pub async fn start_data_plane(
     // key) and set as current, so the ACME renewal task keeps working.
     let watcher_cache = Arc::clone(&rule_cache);
     let watcher_config_manager = Arc::clone(&config_manager);
-    let mut tracker = ReloadTracker::new(watcher_cache.config_hash());
+    let mut tracker = ReloadTracker::new(reload_key(&watcher_cache));
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(RELOAD_POLL_INTERVAL).await;
-            let hash = watcher_cache.config_hash();
+            let hash = reload_key(&watcher_cache);
             if !tracker.is_due(&hash, Instant::now()) {
                 continue;
             }
@@ -2117,6 +2353,11 @@ pub async fn start_data_plane(
                 retry = tracker.failure.is_some(),
                 "data plane: rule change detected, reloading"
             );
+            // The tunnel registry decides which pools have an upstream at
+            // all, so it is reconciled before the config is rebuilt: a
+            // connector that just connected must be reflected in the build
+            // this pass produces.
+            apply_tunnel_policies(&watcher_cache.all_sites());
             let converted = build_reload_config(&watcher_cache);
             let errors = apply_reload(&watcher_config_manager, converted).await;
             if errors.is_empty() {
@@ -2151,6 +2392,52 @@ const RELOAD_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// failure that will not go away on its own (a certificate that does not
 /// parse) then costs one reload every five minutes, not one every poll.
 const RELOAD_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// The key the hot-reload watcher compares.
+///
+/// The rule cache's hash alone is not enough once tunnels exist: a connector
+/// connecting or dropping changes which pools have an upstream without
+/// touching the cache, so the registry's generation is folded in.
+fn reload_key(rule_cache: &RuleCache) -> Arc<str> {
+    let hash = rule_cache.config_hash();
+    match pingwaf_tunnel::installed_registry() {
+        Some(registry) => Arc::from(format!(
+            "{}#{}#{:016x}",
+            hash,
+            registry.generation(),
+            tunnel_policy_fingerprint(&rule_cache.all_sites())
+        )),
+        None => hash,
+    }
+}
+
+/// Fingerprint of the tunnel policy the edge holds.
+///
+/// The reload pass is the only place that reconciles the registry with the
+/// cache, so a policy change that does not move the config hash (a credential
+/// rotation, a disable, a new target list) must move the key too — otherwise a
+/// revoked tunnel would keep its live session until some unrelated change
+/// happened to trigger a reload, and the documented ≤5s convergence would be
+/// a lie.
+fn tunnel_policy_fingerprint(cached: &CachedRules) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for tunnel in cached.tunnels.iter() {
+        tunnel.tunnel_id.hash(&mut hasher);
+        tunnel.enabled.hash(&mut hasher);
+        tunnel.session_public_key.hash(&mut hasher);
+        tunnel.targets.hash(&mut hasher);
+    }
+    if let Some(settings) = cached.tunnel_settings {
+        (
+            settings.max_streams,
+            settings.idle_timeout_secs,
+            settings.heartbeat_secs,
+        )
+            .hash(&mut hasher);
+    }
+    hasher.finish()
+}
 
 /// Decides when the hot-reload watcher applies the rule cache to the proxy.
 ///
@@ -2253,12 +2540,11 @@ async fn apply_reload(
         .await
     {
         Ok(config) => config,
-        Err(e) => {
+        Err(_) => {
             warn!(target: LOG_TARGET,
-                error = %e,
                 "data plane: merged reload config failed, using freshly converted config"
             );
-            errors.push(format!("merge config: {e}"));
+            errors.push("merge config failed".to_string());
             converted
         },
     };
@@ -2359,6 +2645,15 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
                 },
             }
 
+            // The tunnel listener (when configured) starts before the data
+            // plane: the registry it installs is what the configuration build
+            // asks for bridge addresses, and the heartbeat reports it from the
+            // first tick.
+            if let Some(addr) = agent_config.tunnel_addr.clone() {
+                let _ =
+                    start_tunnel_listener(&addr, &agent_config.cache_dir).await;
+            }
+
             // Start the agent in the background first.
             // It will retry connecting to the server until it comes up.
             let agent = match pingwaf_agent::start_agent(*agent_config).await {
@@ -2408,6 +2703,12 @@ pub(crate) async fn run_agent(config: AgentConfig) -> anyhow::Result<()> {
         cache_dir = %config.cache_dir,
         "starting PingWAF in Agent mode (data plane only)"
     );
+    // The tunnel listener starts before the data plane: the registry it
+    // installs is what the configuration build asks for bridge addresses, and
+    // the heartbeat reports it from the first tick.
+    if let Some(addr) = config.tunnel_addr.clone() {
+        let _ = start_tunnel_listener(&addr, &config.cache_dir).await;
+    }
     let agent = pingwaf_agent::start_agent(config).await?;
     // Opt-in self-upgrade: follows the control plane's build, then re-execs
     // this process (see `pingwaf_agent::upgrade`).
@@ -2847,6 +3148,7 @@ mod tests {
             sni: String::new(),
             verify_cert: None,
             address_family: "auto".to_string(),
+            tunnel_id: String::new(),
             is_default: false,
         }
     }
@@ -2964,6 +3266,71 @@ mod tests {
                 .unwrap()
                 .contains("{{ host }}"),
             "the control-plane template must pass through untouched"
+        );
+    }
+
+    #[test]
+    fn the_reload_key_moves_when_only_the_tunnel_policy_changes() {
+        // The config hash is identical; only the tunnel policy differs. Without
+        // the policy in the key, the reload pass (the only place that applies
+        // it) would never run and a revoked tunnel would keep its session.
+        let site = site_rules("site1", "a.example.com");
+        let mut cached = one_site_cache(site);
+        let base = tunnel_policy_fingerprint(&cached);
+
+        let tunnel = |key: &str| pingwaf_agent::cache::TunnelConfig {
+            tunnel_id: "tunnel-1".to_string(),
+            name: "branch".to_string(),
+            session_public_key: key.to_string(),
+            enabled: true,
+            targets: vec!["10.0.0.5:8080".to_string()],
+        };
+        cached.tunnels = std::sync::Arc::new(vec![tunnel(&"aa".repeat(32))]);
+        let rotated = tunnel_policy_fingerprint(&cached);
+        assert_ne!(base, rotated, "a new public key must move the key");
+
+        let mut disabled = tunnel(&"bb".repeat(32));
+        disabled.enabled = false;
+        cached.tunnels = std::sync::Arc::new(vec![disabled]);
+        assert_ne!(
+            rotated,
+            tunnel_policy_fingerprint(&cached),
+            "disabling a tunnel must move the key"
+        );
+    }
+
+    #[test]
+    fn a_tunnel_pool_without_a_session_never_falls_back_to_the_default_pool() {
+        // A route whose pool is bound to a tunnel has no upstream while the
+        // connector is offline. Falling back to the site's default pool would
+        // send the request — Host, cookies, Authorization — to a different
+        // origin, so the route must keep pointing at the missing pool and
+        // answer 503 instead.
+        let mut site = site_rules("site1", "a.example.com");
+        site.upstreams = vec![pool("", vec![peer("10.0.0.1:8080")])];
+        let mut tunneled = pool("pool_t", vec![peer("10.0.0.5:8080")]);
+        tunneled.tunnel_id = "tunnel-1".to_string();
+        site.upstreams.push(tunneled);
+        site.routes = vec![route("r1", "prefix", "/api", "pool_t")];
+        let cached = one_site_cache(site);
+        let dir = tempfile::tempdir().unwrap();
+        let config =
+            cached_rules_to_pingap_config(&cached, dir.path()).unwrap();
+
+        // The tunnel pool has no upstream on this edge (no session).
+        assert!(
+            !config.upstreams.contains_key("pool_t"),
+            "a tunnel pool with no session must not have an upstream"
+        );
+        // …and the route still targets it, not the default pool.
+        let location = config
+            .locations
+            .get("site1_route_r1")
+            .expect("route location");
+        assert_eq!(
+            location.upstream.as_deref(),
+            Some("pool_t"),
+            "the route must not fall back to another origin"
         );
     }
 
@@ -4906,6 +5273,79 @@ mod tests {
         assert!(url.starts_with("https://alidns.aliyuncs.com?"), "{url}");
         assert!(url.contains("access_key_id=AK%201%2F2"), "{url}");
         assert!(url.contains("access_key_secret=s3cret"), "{url}");
+    }
+
+    #[test]
+    fn route53_keeps_apex_and_wildcard_in_one_dns_order() {
+        let mut ssl = acme_ssl();
+        ssl.acme_challenge_type = "AcmeDns01".to_string();
+        ssl.acme_dns_provider = "Route53".to_string();
+        ssl.acme_dns_config
+            .insert("hosted_zone_id".into(), "/hostedzone/Z123".into());
+        let domains = "example.com,*.example.com";
+        let cert = acme_certificate_conf(&ssl, domains.into()).unwrap();
+        assert_eq!(cert.domains.as_deref(), Some(domains));
+        assert_eq!(cert.dns_challenge, Some(true));
+        assert_eq!(cert.dns_provider.as_deref(), Some("route53"));
+        assert_eq!(
+            pingap_config::parse_route53_service_url(
+                cert.dns_service_url.as_deref().unwrap()
+            )
+            .unwrap(),
+            Some("Z123".into()),
+        );
+    }
+
+    #[test]
+    fn synced_route53_pem_retains_renewal_configuration() {
+        let mut ssl = acme_ssl();
+        ssl.acme_enabled = true;
+        ssl.acme_challenge_type = "AcmeDns01".into();
+        ssl.acme_dns_provider = "route53".into();
+        ssl.cert_pem = "issued PEM".into();
+        ssl.key_pem = "issued key".into();
+        let domains = "example.com,*.example.com";
+        let cert = site_certificate_conf(&ssl, domains.into()).unwrap();
+        assert_eq!(cert.tls_cert.as_deref(), Some("issued PEM"));
+        assert!(cert.acme.is_some());
+        assert_eq!(cert.dns_provider.as_deref(), Some("route53"));
+
+        // Every managed provider keeps renewing after the synced PEM comes
+        // back, not just Route 53.
+        ssl.acme_dns_provider = "cf".into();
+        let cert = site_certificate_conf(&ssl, domains.into()).unwrap();
+        assert!(cert.acme.is_some());
+        assert_eq!(cert.dns_provider.as_deref(), Some("cf"));
+
+        // HTTP-01 certificates are managed the same way. The wildcard domain set
+        // cannot be validated over HTTP-01, so use an apex-only set here.
+        ssl.acme_challenge_type = "AcmeHttp01".into();
+        ssl.acme_dns_provider.clear();
+        let cert = site_certificate_conf(&ssl, "example.com".into()).unwrap();
+        assert!(cert.acme.is_some());
+        assert_eq!(cert.dns_challenge, None);
+
+        ssl.acme_enabled = false;
+        let cert = site_certificate_conf(&ssl, domains.into()).unwrap();
+        assert_eq!(cert.tls_cert.as_deref(), Some("issued PEM"));
+        assert!(cert.acme.is_none());
+    }
+
+    #[test]
+    fn regional_endpoint_applies_only_to_huawei() {
+        let config = HashMap::from([("region".into(), "test-region".into())]);
+        for (provider, endpoint) in [
+            ("huawei", "https://dns.test-region.myhuaweicloud.com"),
+            ("route53", "https://route53.amazonaws.com"),
+            ("cf", "https://api.cloudflare.com"),
+            ("ali", "https://alidns.aliyuncs.com"),
+            ("tencent", "https://dnspod.tencentcloudapi.com"),
+        ] {
+            assert_eq!(
+                acme_dns_service_url(provider, &config).as_deref(),
+                Some(endpoint)
+            );
+        }
     }
 
     #[test]

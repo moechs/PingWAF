@@ -4,6 +4,13 @@
 //! [`Migrator::up`]; `sea-orm-migration` records the applied versions in the
 //! `seaql_migrations` table, so restarting the control plane is a no-op once the
 //! schema is current.
+//!
+//! **Migrations are append-only.** Once a version has shipped — even to a single
+//! test host — never edit it: SeaORM keys on the version string, so a change is
+//! invisible to every database that already recorded it, and the model that
+//! expected the new column starts failing on every query. Fix a shipped
+//! migration with a new, idempotent one (see
+//! `m20240101_000107_tunnel_listener_error` for the shape of such a repair).
 
 pub mod m20240101_000001_create_users;
 pub mod m20240101_000002_create_sites;
@@ -109,6 +116,12 @@ mod m20240101_000101_agent_site_assignments;
 mod m20240101_000102_access_log_asn;
 mod m20240101_000103_challenge_adaptive_pow;
 mod m20240101_000104_site_ssl_self_signed_backfill;
+mod m20240101_000105_tunnel_connectors;
+mod m20240101_000106_tunnel_sessions;
+mod m20240101_000107_tunnel_listener_error;
+mod m20240101_000108_acme_dns_provider_backfill;
+mod m20240101_000109_agent_acme_issuer;
+mod m20240101_000110_certificate_issuer_agent;
 
 use sea_orm_migration::prelude::*;
 
@@ -233,6 +246,12 @@ impl MigratorTrait for Migrator {
             Box::new(m20240101_000102_access_log_asn::Migration),
             Box::new(m20240101_000103_challenge_adaptive_pow::Migration),
             Box::new(m20240101_000104_site_ssl_self_signed_backfill::Migration),
+            Box::new(m20240101_000105_tunnel_connectors::Migration),
+            Box::new(m20240101_000106_tunnel_sessions::Migration),
+            Box::new(m20240101_000107_tunnel_listener_error::Migration),
+            Box::new(m20240101_000108_acme_dns_provider_backfill::Migration),
+            Box::new(m20240101_000109_agent_acme_issuer::Migration),
+            Box::new(m20240101_000110_certificate_issuer_agent::Migration),
         ]
     }
 }
@@ -244,7 +263,7 @@ mod tests {
     #[test]
     fn migrations_are_ordered_and_unique() {
         let migrations = Migrator::migrations();
-        assert_eq!(migrations.len(), 104);
+        assert_eq!(migrations.len(), 110);
         let names: Vec<String> =
             migrations.iter().map(|m| m.name().to_owned()).collect();
         let mut sorted = names.clone();

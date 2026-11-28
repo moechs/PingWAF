@@ -1,10 +1,10 @@
 # Pingap Modules
 
 > PingWAF's workspace contains the upstream `pingap-*` crates below **plus**
-> seven WAF-specific crates. The two are listed separately in
+> eight WAF-specific crates. The two are listed separately in
 > [docs/README.md](README.md#-crate-documentation): `pingwaf-proto`,
 > `pingwaf-server`, `pingwaf-agent`, `pingwaf-waf`, `pingwaf-challenge`,
-> `pingwaf-profiler` and `pingwaf-system`.
+> `pingwaf-profiler`, `pingwaf-system` and `pingwaf-tunnel`.
 
 ## Trust boundaries
 
@@ -44,6 +44,23 @@ The data plane also ships as its own binary, `pingwaf-agent`
 control-plane modules and the dashboard-embedding admin plugin compiled out.
 `install.sh --mode agent` installs it; it never links `pingwaf-server`.
 
+### Tunnel connector (`pingwaf-tunnel`)
+
+The connector runs **inside** the private network and holds the credential for
+one tunnel plus the list of targets it may dial. It has no database access and
+no control-plane read surface: it pairs once (`PairTunnel`), then holds a
+`TunnelControl` stream for policy and pushes nothing but heartbeats.
+
+The edge half of the same crate (`server`/`registry`, always compiled into the
+agent) accepts those sessions. It never sees the connector's credential: the
+control plane mints a **short-lived Ed25519 session token**, the connector
+presents it, and the edge verifies it against the public key that arrived in
+the rule bundle. A compromised edge therefore learns a token that expires
+(one hour by default) and is bound to one tunnel. The edge opens a data stream
+only for a target one of its own sites references. The two halves share one
+wire protocol (`protocol.rs`) so a change to a frame cannot land on one side
+only.
+
 ### PostgreSQL
 
 The database is a **secret store**: site TLS private keys, HTTP basic-auth
@@ -71,6 +88,7 @@ reviewed as an egress path:
 | --- | --- | --- |
 | AI provider (OpenAI-compatible) | Chat messages and MCP tool results: site metadata, access logs, WAF events, and for administrators control-plane audit entries | Only when the assistant is enabled; write tools are off by default. See [user-guide.md → AI Assistant](user-guide.md#ai-assistant) |
 | Webhooks (WeCom/DingTalk/generic) | Alert title/message/details | URLs are SSRF-checked against private ranges |
+| Telegram bot | Alert title, message, severity, event type and time as plain text (no `parse_mode`); the structured `details` payload is not sent | Fixed `api.telegram.org` endpoint, no user-controlled URL and therefore no SSRF surface; HTTP 429 counts as a delivery failure with no retry |
 | SMTP relay | Notification e-mails | Credentials sealed with `PINGWAF_SECRET_KEY` |
 | Elasticsearch | The same log documents as PostgreSQL (headers and bodies included) | Optional shipper; index retention is independent |
 | ACME / DNS provider, GeoIP | Certificate order data / login IPs | Credentials sealed; GeoIP URL is SSRF-checked |
@@ -167,4 +185,6 @@ graph TD
     upstream --> util
 
     webhook --> core
+
+    tunnel --> proto
 ```

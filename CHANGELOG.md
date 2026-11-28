@@ -1,3 +1,5 @@
+## [Unreleased]
+
 # Changelog
 
 This file is the change log of **PingWAF** — the distributed, centrally managed
@@ -8,7 +10,324 @@ PingWAF entries are listed first. The `pingap` history below the divider is
 inherited from the upstream proxy that provides PingWAF's data plane; it is kept
 verbatim for reference and attribution, and is not maintained here.
 
-## [Unreleased]
+## [PingWAF 0.33.5] — 2026-11-28
+
+### Added
+
+- **`version` and `upgrade` on the command line.** Both binaries now answer
+  `version` (version, build commit, TLS backend, target, and with `--check` the
+  newest published release) and `upgrade` (`--check`, `--version <tag>`,
+  `--force`, `--no-restart`, `--service`, `--binary`, `--repo`). The agent had
+  no way to ask for either; its only update path was the opt-in
+  `agent.auto_upgrade`, which follows the control plane's *full* build.
+  `upgrade` follows GitHub releases instead and installs the agent-only
+  artifact: it verifies the release's `.sha256` sidecar before extracting, asks
+  the extracted binary for its version before replacing anything, keeps the
+  current file as `<binary>.prev`, stages the new file next to the target (an
+  interrupted upgrade leaves the old binary in place) and restarts the systemd
+  unit unless told not to.
+
+### Changed
+
+- **The agent-only build installs as `pingwaf-agent`.** `install.sh --mode
+  agent` used to install the data-plane archive as `/usr/local/bin/pingwaf`,
+  which left an edge node carrying a binary that looked like the console
+  server. It now installs `/usr/local/bin/pingwaf-agent` with its own
+  `pingwaf-agent.service` (still reading `/etc/pingwaf/pingwaf.toml`), and an
+  upgrade retires a legacy `pingwaf.service` agent unit so the two cannot fight
+  over the ports. `server`/`all-in-one` keep `pingwaf`.
+
+## [PingWAF 0.33.4] — 2026-11-27
+
+### Added
+
+- **Telegram notification channel.** Alerts can now be delivered to a Telegram
+  bot (`kind = "telegram"`), to a private chat, a group, a supergroup, a channel
+  or a forum topic. The channel takes `config.bot_token` (issued by `@BotFather`,
+  shaped `<numeric bot id>:<secret>`), `config.chat_id` (a numeric id, quoted or
+  not, or `@channelusername`) and an optional `config.message_thread_id` for
+  forum topics. The destination is fixed to `api.telegram.org`: there is no
+  configurable URL, so this channel adds no SSRF surface. Messages are plain
+  text — `parse_mode` is never set, so `<`, `*` and `_` in an alert body are not
+  interpreted as markup — carry a severity indicator and a UTC timestamp, are
+  truncated at Telegram's 4096 UTF-16-unit limit, and leave link previews off.
+  `bot_token` is sealed at rest with `PINGWAF_SECRET_KEY` and masked in API
+  responses exactly like `smtp_pass`, `secret` and `secret_token`; the dashboard
+  form asks for it as a password field in all three languages. Note that any
+  existing channel whose config already carries a field named `bot_token` is now
+  treated as a secret on read and on write, even for the other kinds.
+- **A failed delivery says why.** Telegram returns the reason in its response
+  body (`chat not found`, `message thread not found`, `bot was blocked by the
+  user`, …), and the test button now surfaces it instead of collapsing every
+  refusal into `HTTP 400 Bad Request`. The text is capped at 200 characters, has
+  control characters stripped and any appearance of the bot token redacted, so
+  it is safe in the console and in the log. HTTP 429 is reported as a rate limit
+  and is deliberately not retried in this release.
+
+### Changed
+
+- **Dashboard dependencies.** Fifteen npm packages moved to their latest minor or
+  patch release (`react-router-dom`, `recharts`, `vite`, `vitest`, the Tailwind
+  Vite plugin, `eslint`, `@tanstack/react-query`, `zustand` and others). No major
+  bump, no schema change and no API change; the dashboard build and the frontend
+  test suite are unchanged in shape.
+
+### Fixed
+
+- **"Send test message" no longer sends the sealed secret.** With
+  `PINGWAF_SECRET_KEY` set, the test path read the channel row straight from the
+  database and handed the delivery code the `enc:v1:…` ciphertext as the SMTP
+  password, the DingTalk signing key or the webhook secret, so a working channel
+  reported a failure. The test path now opens the stored config before
+  delivering, the same way the periodic reload does.
+
+## [PingWAF 0.33.3] — 2026-11-26
+
+### Added
+
+- **ACME issuer scope per agent.** An agent either issues certificates or only
+  serves them. Only an issuer receives the site's `acme_dns_config` (the
+  Cloudflare/Aliyun/Tencent/Huawei token) and only an issuer opens orders; a
+  consumer keeps serving the distributed PEM and never sees the credential.
+  The embedded all-in-one issuer is marked automatically because it registers
+  over loopback; a remote issuer is marked with
+  `PATCH /api/v1/agents/{id}` (`{"acme_issuer": true}`) or the toggle in the
+  agent detail panel. Migration `000109` adds the column and keeps an existing
+  single-agent deployment issuing. Route 53 is unaffected in the config (its
+  `acme_dns_config` carries only a hosted-zone ID; AWS credentials stay in the
+  issuer's runtime).
+- **ACME state import validation.** The control plane now refuses an entry
+  that is expired, not yet valid, older than the certificate already stored, or
+  issued by an ACME staging CA (unless `PINGAP_ACME_STAGING` is set), instead
+  of marking it active and pushing it to every agent.
+- **Per-certificate issuer and certificate publication.** A managed
+  certificate can name one issuer agent (`site_certificates.acme_issuer_agent_id`,
+  migration `000110`); only that agent receives the ACME material and only its
+  publication is accepted. The designated issuer reports the issued chain and
+  key over the authenticated `PublishCertificate` gRPC call; the control plane
+  validates the caller, the site assignment, the exact hostname set, the
+  key/leaf pair and the certificate's validity, then promotes it and fans it
+  out. The embedded all-in-one issuer keeps using its local ACME state file;
+  the two paths are idempotent. The certificate form exposes the optional
+  issuer selector.
+
+### Changed
+
+- A non-issuer agent's bundle no longer carries `acme_dns_config` or
+  `acme_enabled`, so consumer-only edges cannot read the provider token or
+  start a duplicate order.
+- **The edge page hosts agents and tunnels under one header.** "Create tunnel"
+  and "Add node" sit side by side in the shared header (the active tab's action
+  is primary), the tunnel tab no longer renders its own header/tabs, and the
+  page description now covers both. The agents tab's refresh moved next to
+  its filters and its empty state offers "Add node" like the tunnel empty state
+  offers "Create tunnel".
+- A certificate designated to one agent is skipped by the local ACME state
+  import: the file sync cannot overwrite another agent's certificate.
+
+## [PingWAF 0.33.2] — 2026-11-26
+
+### Added
+
+- **Route 53 DNS-01 issuance.** `acme_dns_provider = "route53"` now works for
+  managed certificates, including a single order covering an apex and its
+  wildcard. The issuer uses the AWS SDK credential chain (an EC2 instance role
+  needs no configuration), pins the commercial Route 53 endpoint and signs in
+  `us-east-1`, and accepts an optional `acme_dns_config.hosted_zone_id`. With
+  no zone ID it lists public hosted zones, selects the closest DNS-label
+  match and verifies the zone's public NS delegation before touching it. TXT
+  updates read the current record set and submit an exact `DELETE` + `CREATE`
+  in one batch, so an unrelated value, the TTL and a concurrent writer's edit
+  survive; cleanup removes only the value the task added. Failed orders carry
+  the bounded, query-redacted Route 53 error code (for example `AccessDenied`
+  or `InvalidChangeBatch`) instead of a generic message.
+- **Reverse-proxy identity for trusted hops.** The standard origin headers
+  (`X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`, `X-Forwarded-Host`)
+  are now derived from the configured trust boundary instead of echoing the
+  client's fields: the chain starts at the first untrusted hop, the RFC 7239
+  `Forwarded` header is cleared, and a duplicate or malformed forwarding field
+  is ignored. The behaviour is opt-in per location
+  (`enable_reverse_proxy_headers`, or `PINGWAF_ENABLE_REVERSE_PROXY_HEADERS=true`
+  for generated data-plane routes) and follows the site's trusted-proxy ranges
+  when set, falling back to the legacy private/loopback rule otherwise.
+- **ACME state import is validated.** The control plane only imports a
+  certificate whose state entry is ACME-managed, whose hostname set exactly
+  matches the database row, and whose key matches the leaf; ambiguous rows and
+  malformed material are skipped with a warning instead of overwriting another
+  certificate's key.
+
+### Changed
+
+- The managed certificate API rejects an unknown DNS provider, `manual` with
+  `dns-01`, and a Route 53 row without `dns-01` (`400`), matching what the data
+  plane can actually issue. The console's provider list now offers only the
+  supported values and no longer defaults a new certificate to Cloudflare.
+- Migration `000108` clears provider values the data plane never implemented
+  (`digitalocean`, `cloudxns`, `manual`) and moves their DNS-01 challenge back
+  to HTTP-01 — the behaviour those rows already had — so existing certificates
+  remain editable. Route 53 rows stored with HTTP-01 are cleared the same way.
+- A synced ACME PEM keeps its renewal settings for every provider and for
+  HTTP-01, not only Route 53. Previously the first config sync after issuance
+  dropped the ACME marker and renewal stopped silently.
+- Turning on the reverse-proxy headers no longer changes the WAF, rate-limit or
+  GeoIP client identity of locations that did not enable them.
+
+### Fixed
+
+- **The forwarded chain and the logged client IP now agree** when
+  `basic.trusted_proxies` is unset: both use the private/loopback peer rule, so
+  a same-host or private-network proxy forwards the real client instead of
+  only its own address.
+- The Huawei `region` option no longer rewrites the endpoint of other DNS
+  providers, and Route 53 configuration only accepts `hosted_zone_id` (the AWS
+  credential chain replaces the URL-embedded credentials the other providers
+  use).
+
+## [PingWAF 0.33.1] — 2026-11-25
+
+### Fixed
+
+- **0.33.0 answered 500 on every query that touched an agent.** Migration
+  `000106` added the three tunnel identity columns an edge reports
+  (`tunnel_ingress_addr`, `tunnel_listener_addr`, `tunnel_cert_sha256`) but not
+  `agents.tunnel_listener_error`, which the model selects on every read. The
+  console's agent page and the tunnel page returned `500`, the gRPC
+  register/heartbeat path answered `Internal error`, and the health monitor
+  failed every 15 s — no agent could connect, so no rule update reached an edge.
+  The column is added by the new idempotent migration `000107`, which also
+  repairs a database already upgraded to 0.33.0. A deployment that was fixed by
+  hand (`ALTER TABLE agents ADD COLUMN IF NOT EXISTS tunnel_listener_error
+  text;`) is unaffected, and no restart is needed once the column exists.
+- **The release process now runs a schema gate.** `cargo test -p pingwaf-server
+  --test schema_matches_models -- --ignored` (also the first step of
+  `scripts/tunnel-smoke.sh`) applies every migration and then reads every model,
+  so a model column no migration creates fails before a tag is cut instead of
+  in production.
+
+## [PingWAF 0.33.0] — 2026-11-25
+
+### Added
+
+- **Tunnels: internal services without an inbound port.** A new standalone
+  `pingwaf-tunnel` binary runs inside a private network, pairs with the control
+  plane once and dials the edges outbound — no inbound port, no public IP on
+  that host. An origin pool can be bound to a tunnel (`site_upstream_pools.tunnel_id`,
+  the new **Tunnel** selector in the origin-pool dialog), and the edge then
+  reaches the origin through a loopback bridge it creates per tunnel target, so
+  WAF, rate limiting, challenges, cache, logs, certificates and TLS-to-origin
+  are the untouched request path. A tunnel has three independent states the
+  console shows separately — paired, enabled and connector-online — and the
+  page (**Agents → Tunnels**) creates tunnels, mints one-time pairing commands,
+  rotates and revokes credentials, disables and deletes them, lists the edges
+  holding a session, and carries the deployment-wide limits
+  (`tunnel_settings`).
+  - Edge side: `agent.tunnel_addr` / `--tunnel-addr` / `PINGWAF_TUNNEL_ADDR`
+    (off by default) starts the TLS listener; the edge generates its own
+    self-signed certificate on first boot (persisted, so restarts keep the same
+    fingerprint) and reports its SHA-256, which connectors pin. Deleting the
+    certificate files and restarting rotates it; the new fingerprint reaches the
+    connectors on the next heartbeat.
+  - Auth: a one-time pairing token is redeemed over the new `PairTunnel` gRPC
+    RPC for a 32-byte credential (stored only as its SHA-256), which
+    authenticates the connector's control stream. Edges never see it: the
+    control plane mints a short-lived **Ed25519 session token** (key derived
+    from `jwt_secret`, TTL `session_token_ttl_seconds`, one hour by default) and
+    the edge verifies the signature, the tunnel id and the expiry against the
+    public key in its rule bundle. The long-lived `TunnelControl` stream pushes
+    ingress endpoints, the target policy, a refreshed token and revocations.
+  - Agent heartbeat gained `tunnel_listener` and `tunnel_sessions`; the agent
+    detail panel shows the listener state, the pinned fingerprint and an
+    operator-set **Tunnel ingress** address, and the access log renders a bridged
+    origin as `tunnel://<name>/<target>` instead of a loopback port.
+  - `install.sh --mode tunnel` installs the connector, pairs it and registers
+    `pingwaf-tunnel.service`; the release pipeline publishes
+    `pingwaf-tunnel-linux-{amd64,arm64}.tar.{xz,gz}` with `.sha256` sidecars and
+    provenance attestations.
+
+- **Tunnels can reach out through a SOCKS5 proxy.** A connector on a host with
+  no direct egress sends both its control-plane channel and every edge session
+  through the proxy configured in `tunnel.toml` (`socks5_proxy` /
+  `socks5_username` / `socks5_password`, or `--socks5-proxy` and friends, also
+  accepted by `install.sh --mode tunnel`). SOCKS5 CONNECT with no-auth and
+  RFC 1929 username/password, target names resolved by the proxy (ATYP 3),
+  bracketed IPv6 supported, and a bounded handshake with a distinct error for
+  every failure (refused methods, rejected credentials, CONNECT reply code,
+  early close, timeout) — never a silent direct dial. Covered by an in-process
+  mock proxy: domain/IPv4 targets, auth success and rejection, refusal codes,
+  early close, stall and unreachable proxy.
+- Tunnel console: the detail panel lists the **sites bound to the tunnel** (the
+  blast radius of disabling or deleting it) and the delete confirmation names
+  them; the pairing dialog carries a three-step checklist (run the command,
+  enable the edge listener + ingress, bind an origin pool); the empty state
+  offers **Create tunnel**; clickable table rows are keyboard-operable and
+  icon-only buttons have accessible names.
+
+### Changed
+
+- `PATCH /api/v1/agents/{agent_id}` treats `display_name` as tri-state (absent
+  leaves it alone) and accepts `tunnel_ingress_addr`. Previously any update
+  omitted the field and silently cleared the label.
+
+### Fixed
+
+- **A tunnel target stored as a bare hostname had no upstream.** The origin-pool
+  API accepts `app.internal`, but the control plane derived tunnel targets with
+  the strict `host:port` normalizer, so the target never reached the rule
+  bundle and the edge could not find a bridge for it: the pool silently had no
+  upstream while the connector refused to dial the address. Both sides now use
+  the same normalizer, which appends the default port of the node's TLS flag
+  (80/443), exactly as a direct origin would.
+- **A shared tunnel no longer leaks other tenants' sites and internal
+  addresses.** The derived `sites` and `targets` a non-administrator sees are
+  scoped to that account's own sites.
+- **The per-edge session report is replaced in one transaction**, so the tunnel
+  page cannot flash "no sessions" between a heartbeat's delete and inserts, and
+  a deleted tunnel's session rows are cleared instead of lingering until a
+  heartbeat that may never arrive.
+- **Disabling tunnels deployment-wide no longer makes connectors redial.** The
+  edge closes the live session on the next reload and the connector now waits
+  for the next policy push instead of producing a refusal every backoff window.
+- **Revocation is immediate again, not bounded by the token's lifetime.** The
+  bundle now carries no session-token public key for an unpaired or revoked
+  tunnel, so the edge refuses its next handshake instead of accepting a token
+  minted before the revocation. The reload key also includes the tunnel policy,
+  so a rotation or a disable reaches the edge on the next poll (≤5s) rather
+  than waiting for an unrelated configuration change to trigger a reload.
+
+## [PingWAF 0.32.52] — 2026-11-25
+
+### Fixed
+
+- **The cache tests' access-time helper stays inside the MSRV.** 0.32.51's CI
+  was red on the Rust 1.96 job that enforces `rust-version = "1.96"`:
+  `std::fs::set_times` is still behind `feature(fs_set_times)` there even
+  though it is accepted by newer toolchains. The helper now uses
+  `File::set_times` with `FileTimes::set_accessed` (stable since 1.75). Shipped
+  binaries were never affected — the code is `#[cfg(test)]`.
+
+## [PingWAF 0.32.51] — 2026-11-25
+
+### Security
+
+- **`cookie` 0.18.2 → 0.18.3 (RUSTSEC-2026-0594, medium 6.5).** Private cookie
+  nonces can repeat in processes that fork. PingWAF never forks (it is one
+  process per edge), and the console uses the crate for parsing and
+  serialisation rather than for `PrivateCookieJar` state, so the practical
+  exposure was nil — but the advisory turns `cargo audit` red on every push, so
+  the dependency is now on the patched release.
+
+### Changed
+
+- **Dependency refresh (29 crates).** tokio `1.53.3` → `1.54.1` (the staged
+  hold for cloudflare/pingora#1059 is lifted now that pingora 0.9.1 ships the
+  fix, and the note in `.github/dependabot.yml` is gone), tonic/tonic-prost
+  `0.14.9`, clap `4.6.9`, rust-embed `8.14`, bytes `1.12.2`, regex `1.13.2`,
+  uuid `1.29.3`, TinyUFO `0.9.1`, `toml` `1.2`, `rand` `0.10.4`, `psl`
+  `2.1.260` and the rest of the patch group.
+- **`filetime` dropped.** The two cache tests that backdated a file's access
+  time used `filetime::set_file_atime`, which the crate deprecated; they now use
+  `std::fs::set_times` with `FileTimes::set_accessed`, and the dependency is
+  gone from the workspace.
 
 ## [PingWAF 0.32.50] — 2026-11-25
 
@@ -2347,12 +2666,12 @@ that table up if you may need to roll back.
   built from `site/` (Astro), whose deployment pages now document both install
   modes.
 
-## [PingWAF 0.33.0] — 2026-10-31
+### Also in this release
 
-Feature release: static-asset access-log filtering, AI bots as a first-class
-client type, and regex support in rewrite body replacement. One migration
-ships automatically; the `RuleBundle` proto gains an optional field, so old
-agents keep working against a new control plane.
+Static-asset access-log filtering, AI bots as a first-class client type, and
+regex support in rewrite body replacement. One migration ships automatically;
+the `RuleBundle` proto gains an optional field, so old agents keep working
+against a new control plane.
 
 ### Added
 

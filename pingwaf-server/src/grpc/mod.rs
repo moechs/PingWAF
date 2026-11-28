@@ -12,6 +12,7 @@ pub mod cache_status;
 pub mod config;
 pub mod control_plane;
 pub mod registry;
+pub mod tunnel_registry;
 pub mod visitor_auth;
 
 pub use cache_status::{CacheStatusRegistry, SiteCacheStatus};
@@ -19,6 +20,7 @@ pub use control_plane::ControlPlaneService;
 pub use registry::{
     AgentRegistry, ConfigDrift, ConnectedAgent, COMMAND_CHANNEL_CAPACITY,
 };
+pub use tunnel_registry::TUNNEL_CONNECTORS;
 
 use pingwaf_proto::control_plane::{
     server_command::Payload, ServerCommand, SiteConfig, UpdateSiteCommand,
@@ -90,6 +92,45 @@ where
     Ok(sites.iter().map(|row| row.id).collect())
 }
 
+/// Removes ACME issuance material from a bundle an agent must not use to
+/// issue.
+///
+/// A consumer keeps `cert_pem`/`key_pem` and serves TLS, but it never receives
+/// the site's DNS provider credentials (`acme_dns_config`) and never starts an
+/// order. The embedded all-in-one issuer keeps the full bundle.
+pub(crate) fn scope_acme_for_agent(
+    config: &mut SiteConfig,
+    agent_id: Uuid,
+    acme_issuer: bool,
+) {
+    let agent_id = agent_id.to_string();
+    for site in &mut config.sites {
+        let Some(rules) = site.rules.as_mut() else {
+            continue;
+        };
+        let Some(ssl) = rules.ssl.as_mut() else {
+            continue;
+        };
+        // A per-certificate designation wins over the agent-level flag: only
+        // the named agent may issue that certificate. Without one, the agent
+        // must be marked as an issuer.
+        let designated = ssl.acme_issuer_agent_id.trim();
+        let allowed = if designated.is_empty() {
+            acme_issuer
+        } else {
+            designated == agent_id
+        };
+        if allowed {
+            continue;
+        }
+        ssl.acme_enabled = false;
+        ssl.acme_email.clear();
+        ssl.acme_challenge_type = 0;
+        ssl.acme_dns_provider.clear();
+        ssl.acme_dns_config.clear();
+    }
+}
+
 /// Builds the `UpdateSite` payload one agent should receive for a change on
 /// `site_id`: its bound site's bundle, or the full visible bundle for an
 /// unbound agent. `None` when the agent does not serve the site.
@@ -107,12 +148,15 @@ async fn update_payload_for_agent(
         && visible.len() == 1
         && agent_row.site_id == Some(site_id)
     {
-        return Ok(Some(changed_site_config.clone()));
+        let mut config = changed_site_config.clone();
+        scope_acme_for_agent(&mut config, agent_row.id, agent_row.acme_issuer);
+        return Ok(Some(config));
     }
     // A selected or unbound agent carries every visible site: the payload is
     // authoritative, so it must list them all or the agent would drop the
     // sites it does not carry.
-    let config = build_site_config(db, Some(&visible)).await?;
+    let mut config = build_site_config(db, Some(&visible)).await?;
+    scope_acme_for_agent(&mut config, agent_row.id, agent_row.acme_issuer);
     Ok(Some(config))
 }
 
@@ -144,7 +188,8 @@ pub(crate) async fn repush_agent_config(
         return Ok(false);
     };
     let visible = agent_visible_site_ids(db, &row).await?;
-    let config = build_site_config(db, Some(&visible)).await?;
+    let mut config = build_site_config(db, Some(&visible)).await?;
+    scope_acme_for_agent(&mut config, row.id, row.acme_issuer);
     Ok(registry
         .send_command(&agent_id, update_site_command(config))
         .await)
@@ -166,10 +211,20 @@ pub async fn notify_config_changed(
     site_id: Uuid,
     actor: Option<&str>,
 ) {
+    notify_config_changed_for(&state.db, &state.agents, site_id, actor).await;
+}
+
+/// The same push, for callers that hold the database and registry directly
+/// (the gRPC plane has no REST `AppState`).
+pub(crate) async fn notify_config_changed_for(
+    db: &DatabaseConnection,
+    registry: &AgentRegistry,
+    site_id: Uuid,
+    actor: Option<&str>,
+) {
     // Build the new configuration. If the database is unhappy there is nothing
     // worth sending, so bail out with a warning.
-    let site_config = match build_site_config(&state.db, Some(&[site_id])).await
-    {
+    let site_config = match build_site_config(db, Some(&[site_id])).await {
         Ok(config) => config,
         Err(err) => {
             tracing::warn!(%site_id, error = %err, "failed to build site config for push");
@@ -183,12 +238,12 @@ pub async fn notify_config_changed(
     // detached-task pattern as notification delivery): a slow capture must
     // not stretch every API mutation. Hash-based dedup happens inside
     // record_version, so repeat pushes stay cheap even when two spawns race.
-    let db = state.db.clone();
+    let history_db = db.clone();
     let config_hash = site_config.config_hash.clone();
     let actor = actor.map(str::to_string);
     tokio::spawn(async move {
         if let Err(err) = config_history::record_version(
-            &db,
+            &history_db,
             VersionScope::Site(site_id),
             config_version::source::API,
             actor.as_deref(),
@@ -202,7 +257,7 @@ pub async fn notify_config_changed(
 
     // Deliver to every agent that serves this site: agents bound to it, and
     // unbound agents of the owning user (they run all of the owner's sites).
-    let agents = match agent::Entity::find().all(&state.db).await {
+    let agents = match agent::Entity::find().all(db).await {
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!(%site_id, error = %err, "failed to list agents for config push");
@@ -213,7 +268,7 @@ pub async fn notify_config_changed(
     let mut delivered = 0usize;
     for row in &agents {
         let payload = match update_payload_for_agent(
-            &state.db,
+            db,
             &site_config,
             row,
             site_id,
@@ -235,7 +290,7 @@ pub async fn notify_config_changed(
             continue;
         };
         let command = update_site_command(site_config_for_agent);
-        if state.agents.send_command(&row.id, command).await {
+        if registry.send_command(&row.id, command).await {
             delivered += 1;
         }
     }
@@ -344,7 +399,15 @@ pub async fn notify_all_config_changed(state: &AppState, actor: Option<&str>) {
         let Some(visible) = visible_per_agent.get(&row.id.to_string()) else {
             continue;
         };
-        if push_visible_bundle(state, row, visible, &mut bundle_cache).await {
+        if push_visible_bundle(
+            &state.db,
+            &state.agents,
+            row,
+            visible,
+            &mut bundle_cache,
+        )
+        .await
+        {
             delivered += 1;
         }
     }
@@ -357,22 +420,110 @@ pub async fn notify_all_config_changed(state: &AppState, actor: Option<&str>) {
     );
 }
 
+/// Pushes the current configuration to every registered agent.
+///
+/// Used by the gRPC pairing path, which has no `AppState` to hand to
+/// [`notify_all_config_changed`]. No configuration version is recorded: pairing
+/// changes no site, it only changes the tunnel policy a bundle carries.
+pub async fn push_config_to_all(
+    db: &DatabaseConnection,
+    registry: &AgentRegistry,
+) -> usize {
+    let agents = match agent::Entity::find().all(db).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to list agents for config push");
+            return 0;
+        },
+    };
+    let mut bundle_cache: HashMap<Vec<Uuid>, SiteConfig> = HashMap::new();
+    let mut delivered = 0usize;
+    for row in &agents {
+        let visible = match agent_visible_site_ids(db, row).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(
+                    agent_id = %row.id,
+                    error = %err,
+                    "failed to resolve the sites of an agent"
+                );
+                continue;
+            },
+        };
+        if push_visible_bundle(db, registry, row, &visible, &mut bundle_cache)
+            .await
+        {
+            delivered += 1;
+        }
+    }
+    delivered
+}
+
+/// Pushes one connector's current policy, or a revocation, over its control
+/// stream. Returns whether a live stream received it.
+pub async fn notify_tunnel_connectors(
+    db: &DatabaseConnection,
+    tunnel_id: Uuid,
+    revoked: Option<String>,
+) -> bool {
+    use pingwaf_proto::control_plane::{
+        tunnel_connector_command, TunnelConnectorCommand,
+        TunnelConnectorRevoked,
+    };
+    let command = match revoked {
+        Some(message) => TunnelConnectorCommand {
+            kind: Some(tunnel_connector_command::Kind::Revoked(
+                TunnelConnectorRevoked { message },
+            )),
+        },
+        None => {
+            match crate::tunnel_policy::connector_config(db, tunnel_id).await {
+                Ok(Some(config)) => TunnelConnectorCommand {
+                    kind: Some(tunnel_connector_command::Kind::Config(config)),
+                },
+                Ok(None) => TunnelConnectorCommand {
+                    kind: Some(tunnel_connector_command::Kind::Revoked(
+                        TunnelConnectorRevoked {
+                            message: "the tunnel was deleted".to_string(),
+                        },
+                    )),
+                },
+                Err(err) => {
+                    tracing::warn!(%tunnel_id, error = %err, "failed to build the tunnel policy");
+                    return false;
+                },
+            }
+        },
+    };
+    TUNNEL_CONNECTORS.push(tunnel_id, command).await
+}
+
+/// Pushes the current policy to every connected connector (global settings
+/// changed, ingress list changed).
+pub async fn notify_all_tunnel_connectors(db: &DatabaseConnection) {
+    let online: Vec<Uuid> =
+        TUNNEL_CONNECTORS.online().await.keys().copied().collect();
+    for tunnel_id in online {
+        notify_tunnel_connectors(db, tunnel_id, None).await;
+    }
+}
+
 /// Sends one agent the authoritative bundle of the sites it serves.
 ///
 /// An empty visibility set is meaningful too: once an agent's last site is
 /// gone it needs the empty bundle rather than silence, or it keeps serving the
 /// deleted site. Returns whether the command reached a live stream.
 async fn push_visible_bundle(
-    state: &AppState,
+    db: &DatabaseConnection,
+    registry: &AgentRegistry,
     row: &agent::Model,
     visible: &[Uuid],
     bundle_cache: &mut HashMap<Vec<Uuid>, SiteConfig>,
 ) -> bool {
-    let payload = match bundle_cache.get(visible) {
+    let mut payload = match bundle_cache.get(visible) {
         Some(config) => config.clone(),
         None => {
-            let config = match build_site_config(&state.db, Some(visible)).await
-            {
+            let config = match build_site_config(db, Some(visible)).await {
                 Ok(config) => config,
                 Err(err) => {
                     tracing::warn!(
@@ -387,8 +538,8 @@ async fn push_visible_bundle(
             config
         },
     };
-    state
-        .agents
+    scope_acme_for_agent(&mut payload, row.id, row.acme_issuer);
+    registry
         .send_command(&row.id, update_site_command(payload))
         .await
 }
@@ -455,7 +606,15 @@ pub async fn notify_site_deleted(
                 continue;
             },
         };
-        if push_visible_bundle(state, row, &visible, &mut bundle_cache).await {
+        if push_visible_bundle(
+            &state.db,
+            &state.agents,
+            row,
+            &visible,
+            &mut bundle_cache,
+        )
+        .await
+        {
             delivered += 1;
         }
     }
@@ -466,4 +625,114 @@ pub async fn notify_site_deleted(
         delivered,
         "site removal pushed to agents"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pingwaf_proto::control_plane::{RuleBundle, SslConfig};
+
+    fn bundle(acme: bool) -> SiteConfig {
+        SiteConfig {
+            sites: vec![pingwaf_proto::control_plane::Site {
+                id: "site-1".to_string(),
+                rules: Some(RuleBundle {
+                    ssl: Some(SslConfig {
+                        cert_pem: "CERT".to_string(),
+                        key_pem: "KEY".to_string(),
+                        acme_enabled: acme,
+                        acme_email: "ops@example.com".to_string(),
+                        acme_challenge_type: 1,
+                        acme_dns_provider: "cf".to_string(),
+                        acme_dns_config: [(
+                            "token".to_string(),
+                            "secret".to_string(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn consumer_bundle_keeps_pem_and_drops_acme_credentials() {
+        let mut config = bundle(true);
+        scope_acme_for_agent(&mut config, Uuid::new_v4(), false);
+        let ssl = config.sites[0]
+            .rules
+            .as_ref()
+            .and_then(|rules| rules.ssl.as_ref())
+            .expect("the test bundle carries TLS material");
+        assert_eq!(ssl.cert_pem, "CERT");
+        assert_eq!(ssl.key_pem, "KEY");
+        assert!(!ssl.acme_enabled);
+        assert!(ssl.acme_email.is_empty());
+        assert!(ssl.acme_dns_provider.is_empty());
+        assert!(ssl.acme_dns_config.is_empty());
+    }
+
+    #[test]
+    fn issuer_bundle_keeps_acme_credentials() {
+        let mut config = bundle(true);
+        scope_acme_for_agent(&mut config, Uuid::new_v4(), true);
+        let ssl = config.sites[0]
+            .rules
+            .as_ref()
+            .and_then(|rules| rules.ssl.as_ref())
+            .expect("the test bundle carries TLS material");
+        assert!(ssl.acme_enabled);
+        assert_eq!(ssl.acme_dns_provider, "cf");
+        assert_eq!(
+            ssl.acme_dns_config.get("token"),
+            Some(&"secret".to_string())
+        );
+    }
+
+    #[test]
+    fn per_certificate_issuer_wins_over_the_agent_flag() {
+        let designated = Uuid::new_v4();
+        let other = Uuid::new_v4();
+
+        // A flagged issuer that is not the designated one gets a consumer
+        // bundle for this certificate.
+        let mut config = bundle(true);
+        config.sites[0]
+            .rules
+            .as_mut()
+            .and_then(|rules| rules.ssl.as_mut())
+            .expect("the test bundle carries TLS material")
+            .acme_issuer_agent_id = designated.to_string();
+        scope_acme_for_agent(&mut config, other, true);
+        let ssl = config.sites[0]
+            .rules
+            .as_ref()
+            .and_then(|rules| rules.ssl.as_ref())
+            .expect("the test bundle carries TLS material");
+        assert!(!ssl.acme_enabled);
+        assert!(ssl.acme_dns_config.is_empty());
+
+        // The designated agent keeps the material even without the agent-level
+        // flag: the designation is the narrower permission.
+        let mut config = bundle(true);
+        config.sites[0]
+            .rules
+            .as_mut()
+            .and_then(|rules| rules.ssl.as_mut())
+            .expect("the test bundle carries TLS material")
+            .acme_issuer_agent_id = designated.to_string();
+        scope_acme_for_agent(&mut config, designated, false);
+        let ssl = config.sites[0]
+            .rules
+            .as_ref()
+            .and_then(|rules| rules.ssl.as_ref())
+            .expect("the test bundle carries TLS material");
+        assert!(ssl.acme_enabled);
+        assert_eq!(ssl.acme_dns_provider, "cf");
+    }
 }

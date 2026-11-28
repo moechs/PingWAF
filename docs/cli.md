@@ -50,22 +50,57 @@ Releases also ship `pingwaf-agent`, built from the same source with the
 control plane compiled out (`--bin pingwaf-agent --features edge`). It is the
 data plane and nothing else: no PostgreSQL, no REST API, no embedded
 dashboard, so an edge node downloads and maps far less code. `install.sh
---mode agent` fetches that archive and installs it as `/usr/local/bin/pingwaf`,
-so the unit and every command below stay unchanged; `pingwaf --version` marks
-it with `edge`. Both spellings work:
+--mode agent` fetches that archive and installs it under its own name —
+`/usr/local/bin/pingwaf-agent`, unit `pingwaf-agent.service`, still reading
+`/etc/pingwaf/pingwaf.toml` — so an edge node does not carry a binary called
+`pingwaf` that looks like it could serve the console. `--version` marks the
+build with `edge`. Both spellings work:
 
 ```bash
 pingwaf-agent agent --server-url https://control-plane:9090 --api-key KEY
 pingwaf-agent --server-url https://control-plane:9090 --api-key KEY
 ```
 
-The `agent` subcommand is accepted because a self-upgrade replaces the file
-with the control plane's all-in-one build, which still needs it. That also
-means `auto_upgrade` trades the smaller build for the full one: it follows the
-control plane's executable, so re-run the installer in agent mode to get the
-agent-only artifact back. The agent-only build has no
-`server`/`all-in-one`/maintenance subcommands; run those from the full
+The `agent` subcommand is accepted because a control-plane-driven upgrade
+(`agent.auto_upgrade`) replaces the file with the control plane's all-in-one
+build, which still needs it. That upgrade follows the control plane's
+executable, so it trades the smaller build for the full one; the release-feed
+upgrade below installs the agent-only artifact instead. The agent-only build
+has no `server`/`all-in-one`/maintenance subcommands; run those from the full
 `pingwaf` binary.
+
+### Version and upgrade
+
+Both binaries answer `version` and `upgrade` (the agent used to have no way to
+ask for either):
+
+```bash
+pingwaf-agent version            # version, build commit, TLS backend, target
+pingwaf-agent version --check    # …and the newest published release
+pingwaf-agent upgrade --check    # is there a newer release?
+pingwaf-agent upgrade            # install it and restart pingwaf-agent.service
+pingwaf upgrade --version 0.33.4 --no-restart   # the full binary, pinned version
+```
+
+`upgrade` downloads `pingwaf-agent-linux-{amd64,arm64}.tar.gz` (or
+`pingwaf-linux-…` for the full binary) from the GitHub release, verifies the
+`.sha256` sidecar **before** extracting, asks the extracted binary for its
+version before replacing anything, keeps the current file as `<binary>.prev`,
+and stages the replacement next to the target so an interrupted upgrade leaves
+the old binary in place. It needs `curl` (the installer already requires it) and
+write access to the target directory — run it with `sudo` on a normal install.
+`--repo owner/name` points it at a fork or mirror; `--binary PATH` replaces a
+file other than the running one; `--no-restart` skips the systemd restart.
+
+This is the release-feed path: it installs the **agent-only** build for
+`pingwaf-agent`. The opt-in `agent.auto_upgrade` remains the fleet path — it
+follows whatever build the control plane is serving, which is the full binary.
+
+An edge installed before the binary was renamed still has `/usr/local/bin/pingwaf`
+and `pingwaf.service`. Re-run `install.sh --mode agent` once: it installs
+`pingwaf-agent`, writes `pingwaf-agent.service`, and retires the old agent unit
+(stopped, disabled and removed) so the two cannot fight over the ports and the
+config file.
 
 > An agent-only node is currently **unbound**: it receives every site owned by
 > the API key's owner, not one site. The control plane must be **0.32.40 or
@@ -124,6 +159,56 @@ Agent-only options (`agent` / the agent half of `all-in-one`): `--server-url`
 (`PINGWAF_HEARTBEAT_INTERVAL`, default `30`), `--metrics-ship-interval`
 (`PINGWAF_METRICS_SHIP_INTERVAL`, default `30`), plus `--log-batch-size`,
 `--log-flush-interval-secs` and `--max-body-log-size` (command line only).
+
+The connector can reach both the control plane and the edge ingresses through a
+SOCKS5 proxy, for a host with no direct egress: `--socks5-proxy <host:port>`
+(`PINGWAF_TUNNEL_SOCKS5_PROXY`), plus `--socks5-username` /
+`--socks5-password` (prefer `PINGWAF_TUNNEL_SOCKS5_PASSWORD` over the flag, which
+`ps` can read). The same keys live in `/etc/pingwaf/tunnel.toml` as
+`socks5_proxy`, `socks5_username` and `socks5_password`. Target names are
+resolved by the proxy (SOCKS5 ATYP 3), and the handshake has its own timeout.
+
+The tunnel listener is an agent/all-in-one option as well: `--tunnel-addr`
+(`PINGWAF_TUNNEL_ADDR`, default empty = off) binds the address a
+`pingwaf-tunnel` connector dials. Only an edge that terminates tunnels sets it;
+see [user-guide.md](user-guide.md#tunnels-internal-services-without-an-inbound-port).
+
+The standalone connector is its own binary, `pingwaf-tunnel`:
+
+```
+pingwaf-tunnel pair   --token <pairing-token> --server-url https://cp:9090 [--config PATH]
+pingwaf-tunnel run    [--config PATH]
+pingwaf-tunnel status [--config PATH]
+```
+
+`pair` redeems the one-time token (from **Agents → Tunnels**) for a long-lived
+credential and writes `/etc/pingwaf/tunnel.toml` (`0600`); `run` serves until
+SIGTERM (or until the tunnel is revoked); `status` prints the stored
+configuration plus the live state `run` publishes to
+`/var/lib/pingwaf/tunnel/status.json` — the connected ingress endpoints, the
+targets in force, the SOCKS5 proxy when one is configured, and the last
+revocation reason. `status` never opens a control-plane stream: doing so would
+take the session slot of the connector that is actually serving traffic.
+
+`pair` and `run` take the same global flags; anything not on the command line is
+read from the config file:
+
+| Flag | Env | Meaning |
+| --- | --- | --- |
+| `--config PATH` | — | `tunnel.toml` (default `/etc/pingwaf/tunnel.toml`) |
+| `--token`, `--token-file` | `PINGWAF_TUNNEL_TOKEN`, `PINGWAF_TUNNEL_TOKEN_FILE` | the one-time pairing token |
+| `--server-url` | `PINGWAF_TUNNEL_SERVER_URL` | control-plane gRPC URL (`https://…:9090`) |
+| `--server-ca-cert` | `PINGWAF_TUNNEL_SERVER_CA_CERT` | CA bundle for a self-signed control plane |
+| `--server-tls-name` | `PINGWAF_TUNNEL_SERVER_TLS_NAME` | override the TLS server name |
+| `--ingress` | `PINGWAF_TUNNEL_INGRESS` | pin edge endpoints (`host:port[=sha256],…`) |
+| `--allowed-targets` | `PINGWAF_TUNNEL_ALLOWED_TARGETS` | local allowlist, intersected with the policy |
+| `--socks5-proxy`, `--socks5-username`, `--socks5-password` | `PINGWAF_TUNNEL_SOCKS5_*` | egress through a SOCKS5 proxy |
+
+The config file carries the same keys in snake_case (`server_url`,
+`server_ca_cert`, `server_tls_name`, `ingress`, `allowed_targets`,
+`socks5_proxy`, `socks5_username`, `socks5_password`, plus the `tunnel_id`,
+`credential` and `session_token` that `pair` writes). A malformed value is an
+error, never a silent fallback to a direct dial.
 
 ### Passing secrets safely
 
